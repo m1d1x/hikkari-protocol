@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.7
-	github.com/m1d1x/hikkari-protocol v0.0.0-00010101000000-000000000000
+	github.com/m1d1x/hikkari-protocol v0.0.0-20261108154814-f7f2cb6cad66
 	go.uber.org/zap v1.28.0
 	golang.org/x/net v0.60.0
 )
@@ -163,5 +163,3 @@ require (
 )
 
 replace github.com/caddyserver/caddy/v2 => github.com/m1d1x/caddy/v2 v2.11.8-0.20261107181814-6481dda01571
-
-replace github.com/m1d1x/hikkari-protocol => ../..
