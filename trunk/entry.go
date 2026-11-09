@@ -32,7 +32,9 @@ type Entry struct {
 }
 
 // NewEntry makes an entry for members members. logf gets one line per
-// member that could not come up or died (no client data in it).
+// member that could not come up or died, and one per epoch of the exit (the
+// first, and every change: the exit restarted and the streams were reset);
+// no client data in any.
 func NewEntry(cfg Config, members int, dial Dial, ports *PortBook, logf func(string, ...any)) (*Entry, error) {
 	if members < 1 {
 		return nil, errors.New("trunk: an entry needs at least one member")
@@ -106,8 +108,12 @@ func (e *Entry) slot(ctx context.Context, n int) {
 			continue
 		}
 		e.mu.Lock()
-		if e.known && epoch != e.epoch {
+		switch {
+		case !e.known:
+			e.logf("trunk: exit epoch %x", epoch[:])
+		case epoch != e.epoch:
 			// The exit restarted: what it held of our streams is gone.
+			e.logf("trunk: exit epoch %x after %x: streams reset", epoch[:], e.epoch[:])
 			e.s.Reset()
 		}
 		e.epoch, e.known = epoch, true

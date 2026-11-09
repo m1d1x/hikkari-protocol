@@ -322,6 +322,47 @@ func TestDatagrams(t *testing.T) {
 	}
 }
 
+// TestOneCopyDatagrams: a flow opened with one copy (its sender copies its
+// datagrams itself, as Hikkari v1.02 does) travels once each way: the exit
+// answers it as the entry sends it.
+func TestOneCopyDatagrams(t *testing.T) {
+	h := newHarness(t, Config{}, 4, nil, nil)
+	got := make(chan []byte, 100)
+	f := h.entry.Session().OpenFlowCopies(443, 1, func(p []byte) { got <- append([]byte(nil), p...) }, nil)
+	for i := 0; i < 50; i++ {
+		if !f.Send([]byte{byte(i), 1, 2, 3}) {
+			t.Fatal("flow ended")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	seen := map[byte]bool{}
+	timeout := time.After(10 * time.Second)
+	for len(seen) < 50 {
+		select {
+		case p := <-got:
+			seen[p[0]] = true
+		case <-timeout:
+			t.Fatalf("%d of 50 datagrams came back", len(seen))
+		}
+	}
+	_, x := h.exit.Stats()
+	if st := h.entry.Session().Stats(); st.DgramsCopy != 0 || x.DgramsCopy != 0 || x.DgramsIn != 50 || st.DgramsIn != 50 {
+		t.Fatalf("one copy each way, want 50 in and none dropped: entry %+v exit %+v", st, x)
+	}
+}
+
+// TestMemberRTTs: every member that answered a ping has a round trip.
+func TestMemberRTTs(t *testing.T) {
+	h := newHarness(t, Config{Keepalive: 50 * time.Millisecond}, 3, nil, nil)
+	waitFor(t, func() bool { return len(h.entry.Session().MemberRTTs()) == 3 })
+	rtts := h.entry.Session().MemberRTTs()
+	for i, r := range rtts {
+		if r <= 0 || (i > 0 && r < rtts[i-1]) {
+			t.Fatalf("round trips %v, want positive and sorted", rtts)
+		}
+	}
+}
+
 // TestExitRestart: a new exit under the same entry (new epoch) resets the
 // streams it lost instead of leaving them hanging.
 func TestExitRestart(t *testing.T) {

@@ -211,6 +211,21 @@ func (s *Session) Stats() Stats {
 	}
 }
 
+// MemberRTTs is the smoothed round trip of every member up now that has had
+// a ping answered, shortest first.
+func (s *Session) MemberRTTs() []time.Duration {
+	s.mu.Lock()
+	out := make([]time.Duration, 0, len(s.members))
+	for m := range s.members {
+		if m.srtt > 0 {
+			out = append(out, m.srtt)
+		}
+	}
+	s.mu.Unlock()
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
 // IdleFor says how long the session has had no member (0 while one is up).
 func (s *Session) IdleFor() time.Duration {
 	s.mu.Lock()

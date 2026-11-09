@@ -69,3 +69,8 @@ on a new port opened at once. An idle member is pinged every second.
 A flow is one client UDP association (entry: one client address on one listened port; exit: one socket to the loopback port).
 Every datagram goes as a dgram frame on the 2 members carrying least; no ack, no resend. The receiver drops copies by `seq`
 in a window of 1024. A flow ends after 2 minutes unused.
+
+A flow whose sender already copies its datagrams goes on one member: Hikkari v1.02 sends a call over both its channels, and a
+second copy on the trunk would make four of every packet. The entry chooses per listened port (the hub sets one copy on ports
+that reach the exit's Hikkari relay). The exit answers a flow as the entry sends it: on one member until a copy of the flow's
+datagrams arrives, then on 2.

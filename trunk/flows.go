@@ -8,7 +8,9 @@ import (
 // A flow is one client UDP association: on the entry, one client address on
 // one forwarded port; on the exit, one socket to the relay. Its datagrams go
 // over Copies members at once and are never sent again: a call wants the
-// first copy now, not a late one.
+// first copy now, not a late one. A flow whose sender copies its datagrams
+// itself (Hikkari v1.02 sends a call over both its channels) is opened with
+// one copy: a second copy here would make four of every packet.
 
 type flow struct {
 	id      uint32
@@ -20,6 +22,9 @@ type flow struct {
 	used    time.Time
 	ended   bool
 	onEnd   func()
+	// copies is how many members carry each datagram of the flow. The
+	// entry's is chosen at open; the exit's follows the entry's (dgramLocked).
+	copies int
 }
 
 // Flow is the entry's handle on one datagram flow.
@@ -33,10 +38,19 @@ type Flow struct {
 // block (a write to a UDP socket). onEnd runs when the flow ends (idle, or
 // the session closes). Entry only.
 func (s *Session) OpenFlow(port uint16, deliver func([]byte), onEnd func()) *Flow {
+	return s.OpenFlowCopies(port, 0, deliver, onEnd)
+}
+
+// OpenFlowCopies is OpenFlow with each datagram carried by copies members;
+// 0 is the session's Copies.
+func (s *Session) OpenFlowCopies(port uint16, copies int, deliver func([]byte), onEnd func()) *Flow {
+	if copies <= 0 {
+		copies = s.cfg.Copies
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd}
+	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies}
 	if s.shutdown {
 		f.ended = true
 	} else {
@@ -68,8 +82,12 @@ func (s *Session) sendDgramLocked(f *flow, p []byte) {
 	b := appendDgram(make([]byte, 0, 13+len(p)), f.id, f.seq, f.port, p)
 	// The Copies least loaded members; a datagram is never owed, so a member
 	// carrying it is not held to account for it.
+	copies := f.copies
+	if copies <= 0 {
+		copies = s.cfg.Copies
+	}
 	var used []*member
-	for len(used) < s.cfg.Copies {
+	for len(used) < copies {
 		var best *member
 		for m := range s.members {
 			taken := false
@@ -100,12 +118,17 @@ func (s *Session) dgramLocked(fr frame) {
 		if err != nil {
 			return
 		}
-		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now()}
+		// The exit answers a flow as the entry sends it: on one member
+		// until a copy arrives, then on Copies.
+		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1}
 		s.flows[f.id] = f
 		go s.readFlow(f)
 	}
 	if f.replay.seen(fr.seq) {
 		s.dgramsCopy.Add(1)
+		if s.local != nil {
+			f.copies = s.cfg.Copies
+		}
 		return
 	}
 	f.used = time.Now()
