@@ -50,8 +50,13 @@ type Options struct {
 	// package dup): by the datagram channel, and by the stream channel too
 	// while the flow looks like a call or the datagram channel is down. The
 	// relay must serve dup.Host; the link says so.
-	Dup    bool
-	Logger logger.ContextLogger
+	Dup bool
+	// VoiceDatagram is a second datagram channel to the same relay, a QUIC
+	// connection of its own, for calls' voice (v1.03): in one connection
+	// voice waits in the same queue as the video and bulk beside it. Used
+	// only with Dup and a relay that keeps lanes; nil keeps voice on Datagram.
+	VoiceDatagram Channel
+	Logger        logger.ContextLogger
 }
 
 type Client struct {

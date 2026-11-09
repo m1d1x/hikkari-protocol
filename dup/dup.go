@@ -20,6 +20,15 @@
 //	address  SOCKS address and port (packet only): the destination going up,
 //	         the source coming down
 //	payload  the rest (packet only)
+//	lane     uint8 (attach only, v1.03, optional): which packets the carrier
+//	         takes, LaneAll when absent
+//
+// v1.03 lanes: a carrier attaches to the lane of every packet (LaneAll) or to
+// the voice lane, which takes only packets of at most VoicePacketMax bytes, so
+// a call's voice never waits behind its own video or anyone's bulk. A relay
+// that knows lanes answers every attach with an attach naming the carrier's
+// lane; a v1.02 relay never sends an attach, and v1.02 ends ignore the lane
+// byte, so the frame keeps version 1.
 //
 // On the datagram channel a frame is one UDP message addressed to Host; on the
 // stream channel frames follow a CONNECT to Host:0, each after a uint16 big
@@ -47,6 +56,20 @@ const (
 	KindAttach uint8 = 1
 )
 
+// Lanes of a carrier (v1.03).
+const (
+	LaneAll   uint8 = 0
+	LaneVoice uint8 = 1
+)
+
+// VoicePacketMax is the largest UDP payload the voice lane takes. A voice
+// frame (Opus in RTP and SRTP) is 60 to 300 bytes; a video packet fills the
+// path MTU, about 1100 to 1200 bytes.
+const VoicePacketMax = 400
+
+// IsVoiceSized reports whether a payload of n bytes belongs to the voice lane.
+func IsVoiceSized(n int) bool { return n <= VoicePacketMax }
+
 // headerLen is version, kind, session and seq.
 const headerLen = 1 + 1 + 16 + 8
 
@@ -64,6 +87,8 @@ type Frame struct {
 	Seq     uint64
 	Addr    M.Socksaddr
 	Payload []byte
+	// Lane is the carrier's lane in an attach (v1.03).
+	Lane uint8
 }
 
 var (
@@ -84,7 +109,7 @@ func Append(dst []byte, f Frame) ([]byte, error) {
 	dst = append(dst, f.Session[:]...)
 	dst = binary.BigEndian.AppendUint64(dst, f.Seq)
 	if f.Kind == KindAttach {
-		return dst, nil
+		return append(dst, f.Lane), nil
 	}
 	b := buf.NewSize(M.SocksaddrSerializer.AddrPortLen(f.Addr))
 	defer b.Release()
@@ -114,6 +139,9 @@ func Decode(data []byte) (Frame, error) {
 	rest := data[headerLen:]
 	switch f.Kind {
 	case KindAttach:
+		if len(rest) > 0 {
+			f.Lane = rest[0]
+		}
 		return f, nil
 	case KindPacket:
 		if f.Seq == 0 {

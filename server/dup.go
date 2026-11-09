@@ -128,8 +128,11 @@ func (h *DupHub) serve(ctx context.Context, key string, c carrier) error {
 		if f.Session != s.id.id {
 			return dup.ErrFrame
 		}
-		if f.Kind == dup.KindPacket {
+		switch f.Kind {
+		case dup.KindPacket:
 			s.up(ctx, f)
+		case dup.KindAttach:
+			leg.join(s.id.id, f.Lane)
 		}
 		if f, err = c.readFrame(); err != nil {
 			return nil
@@ -164,8 +167,40 @@ func (h *DupHub) attach(ctx context.Context, key string, id dup.Session, c carri
 type dupLeg struct {
 	c     carrier
 	queue chan []byte
-	once  sync.Once
+	// mu orders put against stop: the session sends answers to a leg that
+	// may be detaching.
+	mu   sync.Mutex
+	done bool
+	// lane is the carrier's lane (dup.LaneAll or dup.LaneVoice); an attach
+	// on the carrier sets it, a v1.02 client never names one.
+	lane atomic.Uint32
 }
+
+// join sets the carrier's lane and answers the attach with one naming it: the
+// client learns that this relay keeps lanes (v1.03).
+func (l *dupLeg) join(id dup.Session, lane uint8) {
+	if lane != dup.LaneVoice {
+		lane = dup.LaneAll
+	}
+	l.lane.Store(uint32(lane))
+	ack, _ := dup.Append(nil, dup.Frame{Kind: dup.KindAttach, Session: id, Lane: lane})
+	l.put(ack)
+}
+
+// put queues a frame without waiting; a full or stopped leg loses it.
+func (l *dupLeg) put(frame []byte) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.done {
+		return
+	}
+	select {
+	case l.queue <- frame:
+	default:
+	}
+}
+
+func (l *dupLeg) voice() bool { return uint8(l.lane.Load()) == dup.LaneVoice }
 
 func (l *dupLeg) write() {
 	for frame := range l.queue {
@@ -178,7 +213,14 @@ func (l *dupLeg) write() {
 	}
 }
 
-func (l *dupLeg) stop() { l.once.Do(func() { close(l.queue) }) }
+func (l *dupLeg) stop() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.done {
+		l.done = true
+		close(l.queue)
+	}
+}
 
 type dupSession struct {
 	hub  *DupHub
@@ -227,7 +269,13 @@ func (s *dupSession) up(ctx context.Context, f dup.Frame) {
 	_, _ = s.sock.WriteToUDPAddrPort(f.Payload, ap)
 }
 
-// down numbers every answer once and queues it on every leg.
+// down numbers every answer once and queues it on the legs of its lane. A
+// voice-sized answer goes by every voice leg and, unless one of them is a
+// datagram carrier, by the whole-lane legs too: voice always has a datagram
+// copy beside the stream copy, as the client sends it. Anything larger goes
+// by the whole-lane legs, or by every leg while only voice legs are left (a
+// client re-attaches its stream carrier to the whole lane when its datagram
+// carrier dies).
 func (s *dupSession) down() {
 	b := make([]byte, 65535)
 	for {
@@ -240,24 +288,40 @@ func (s *dupSession) down() {
 		if name, ok := s.names.Load(from); ok {
 			src = name.(M.Socksaddr)
 		}
+		voiceSized := dup.IsVoiceSized(n)
 		s.mu.Lock()
 		s.downSeq++
 		seq := s.downSeq
 		s.timer.Reset(s.hub.idle)
-		legs := make([]*dupLeg, 0, len(s.legs))
+		var voice, whole []*dupLeg
+		voiceDatagram := false
 		for leg := range s.legs {
-			legs = append(legs, leg)
+			if leg.voice() {
+				voice = append(voice, leg)
+				_, isPacket := leg.c.(*packetCarrier)
+				voiceDatagram = voiceDatagram || isPacket
+			} else {
+				whole = append(whole, leg)
+			}
 		}
 		s.mu.Unlock()
+		var lane []*dupLeg
+		switch {
+		case voiceSized && voiceDatagram:
+			lane = voice
+		case voiceSized:
+			lane = append(voice, whole...)
+		case len(whole) > 0:
+			lane = whole
+		default:
+			lane = voice
+		}
 		frame, err := dup.Append(nil, dup.Frame{Kind: dup.KindPacket, Session: s.id.id, Seq: seq, Addr: src, Payload: b[:n]})
 		if err != nil {
 			continue
 		}
-		for _, leg := range legs {
-			select {
-			case leg.queue <- frame:
-			default:
-			}
+		for _, leg := range lane {
+			leg.put(frame)
 		}
 	}
 }

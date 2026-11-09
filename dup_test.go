@@ -134,6 +134,13 @@ func (c *stallConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+func (c *stallConn) Write(p []byte) (int, error) {
+	for c.stall.Load() {
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.Conn.Write(p)
+}
+
 // lossyDatagram drops everything on the datagram channel while drop is set.
 type lossyDatagram struct {
 	inner client.Channel
