@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/m1d1x/hikkari-protocol/dup"
+	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -44,7 +46,12 @@ type Options struct {
 	// RetryAfter is how long UDP stays on Stream after the datagram channel
 	// failed.
 	RetryAfter time.Duration
-	Logger     logger.ContextLogger
+	// Dup carries every UDP association as a duplicated session (v1.02,
+	// package dup): by the datagram channel, and by the stream channel too
+	// while the flow looks like a call or the datagram channel is down. The
+	// relay must serve dup.Host; the link says so.
+	Dup    bool
+	Logger logger.ContextLogger
 }
 
 type Client struct {
@@ -71,6 +78,9 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 	case N.NetworkTCP:
 		return c.opts.Stream.DialContext(ctx, network, destination)
 	case N.NetworkUDP:
+		if conn, ok := c.listenDup(ctx); ok {
+			return bufio.NewBindPacketConn(conn, destination), nil
+		}
 		if c.datagramUp() {
 			var conn net.Conn
 			err := c.tryDatagram(ctx, func(ctx context.Context) (err error) {
@@ -88,6 +98,9 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 }
 
 func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if conn, ok := c.listenDup(ctx); ok {
+		return conn, nil
+	}
 	if c.datagramUp() {
 		var conn net.PacketConn
 		err := c.tryDatagram(ctx, func(ctx context.Context) (err error) {
@@ -99,6 +112,23 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 		}
 	}
 	return c.opts.Stream.ListenPacket(ctx, destination)
+}
+
+// listenDup opens a duplicated session when the link asks for one and the
+// datagram channel connects; otherwise UDP takes the v1.01 path.
+func (c *Client) listenDup(ctx context.Context) (net.PacketConn, bool) {
+	if !c.opts.Dup || !c.datagramUp() {
+		return nil, false
+	}
+	var primary net.PacketConn
+	err := c.tryDatagram(ctx, func(ctx context.Context) (err error) {
+		primary, err = c.opts.Datagram.ListenPacket(ctx, dup.HostAddr())
+		return
+	})
+	if err != nil {
+		return nil, false
+	}
+	return newDupConn(ctx, c, primary), true
 }
 
 // NetworkChanged forgets a failed datagram channel: a new network may pass

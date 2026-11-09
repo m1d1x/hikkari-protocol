@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/wire/datagram"
 	"github.com/sagernet/sing/common/auth"
 	M "github.com/sagernet/sing/common/metadata"
@@ -45,6 +46,10 @@ type DatagramOptions struct {
 	Idle     time.Duration
 	Admitter Admitter
 	Exit     Exit
+	// Dup, when set, serves duplicated associations (v1.02): a UDP
+	// association addressed to dup.Host is a carrier of a session the stream
+	// channel may carry too. Share one hub with the stream channel (WithDup).
+	Dup *DupHub
 }
 
 // Datagram is the datagram channel: QUIC with HTTP/3 auth, UDP as QUIC
@@ -141,7 +146,7 @@ func (d *Datagram) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 }
 
 // NewPacketConnectionEx serves one UDP association.
-func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, _ M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, dest M.Socksaddr, onClose N.CloseHandlerFunc) {
 	key, _ := auth.UserFromContext[string](ctx)
 	go func() {
 		defer closeWith(onClose)
@@ -152,6 +157,10 @@ func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
 		}
 		defer done()
 		d.flows.Add(1)
+		if d.opts.Dup != nil && dup.IsHost(dest.AddrString()) {
+			_ = d.opts.Dup.ServePacket(ctx, key, conn, count)
+			return
+		}
 		_ = RelayPackets(ctx, conn, uot.Request{}, d.opts.Exit, d.opts.Idle, count)
 	}()
 }
