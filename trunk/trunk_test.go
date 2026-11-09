@@ -344,23 +344,6 @@ func TestExitRestart(t *testing.T) {
 	}
 }
 
-func TestPadding(t *testing.T) {
-	var wire bytes.Buffer
-	w := &padWriter{w: &wire}
-	var want []byte
-	for i := 0; i < 12; i++ {
-		p := bytes.Repeat([]byte{byte(i)}, 100+i*1000)
-		want = append(want, p...)
-		if _, err := w.Write(p); err != nil {
-			t.Fatal(err)
-		}
-	}
-	got, err := io.ReadAll(&unpadReader{r: &wire})
-	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("padding round trip: %v, %d of %d bytes", err, len(got), len(want))
-	}
-}
-
 func TestReplay(t *testing.T) {
 	var r replay
 	for _, s := range []uint32{1, 2, 5, 3} {

@@ -15,8 +15,9 @@ client ─TCP/UDP─► entry (RU) ═ pool of members ═► exit relay :443 �
 
 One long tunnel over its own TCP connection and source port, as the stream channel's wire:
 
-- TLS to the relay with a browser ClientHello chosen by the hub (`EDGE_TRUNK_FP`; the entry uses utls presets), ALPN `h2`,
-  the relay's certificate checked against its domain.
+- TLS by Chromium's network stack (cronet, the build the client core links: package `trunk/chromium`), so the ClientHello,
+  HTTP/2 and padding are the Hikkari client's own, not an imitation. One Chromium engine per member, its TCP socket dialled by
+  the trunk from the source port the pool chose. The relay's certificate is checked against its domain.
 - HTTP/2 `CONNECT trunk.hikkari.arpa:443`, `proxy-authorization: Basic base64("trunk:<trunk key>")`, the `padding` header,
   and Naive padding of the first 8 writes each way (`u16 length, u8 padding, bytes, zeros`).
 - The relay serves a member only for a trunk key on `trunk.hikkari.arpa`. A trunk key on any other host, or a subscriber key
