@@ -435,6 +435,10 @@ func changePort(inputAddr, toPort string) string {
 
 // FIN and RST both terminate the request before an HTTP response. Their
 // ordering depends on whether net/http consumed the unread CONNECT bytes.
+// closedRedirect: the server closed the connection. net/http reports a close
+// that races its read as "server closed idle connection" (an unexported
+// error) instead of EOF; both are the same close.
 func closedRedirect(err error) bool {
-	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)
+	return errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) ||
+		(err != nil && strings.Contains(err.Error(), "server closed idle connection"))
 }
