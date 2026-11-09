@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/connect"
@@ -32,6 +33,8 @@ type DupHub struct {
 
 	mu       sync.Mutex
 	sessions map[dupKey]*dupSession
+
+	streamLegs, datagramLegs atomic.Int64
 }
 
 // A session belongs to the key that opened it: another key naming the same
@@ -57,6 +60,11 @@ func (h *DupHub) Sessions() int {
 	return len(h.sessions)
 }
 
+// Carriers is how many carriers each channel has brought, ever.
+func (h *DupHub) Carriers() (stream, datagram int64) {
+	return h.streamLegs.Load(), h.datagramLegs.Load()
+}
+
 // carrier is one channel's leg of a session.
 type carrier interface {
 	readFrame() (dup.Frame, error)
@@ -67,12 +75,14 @@ type carrier interface {
 // ServePacket serves a datagram-channel carrier: a UDP association whose
 // packets are addressed to dup.Host. count receives the carrier's own bytes.
 func (h *DupHub) ServePacket(ctx context.Context, key string, conn N.PacketConn, count func(up, down int)) error {
+	h.datagramLegs.Add(1)
 	return h.serve(ctx, key, &packetCarrier{conn: conn, count: count})
 }
 
 // ServeStream serves a stream-channel carrier on conn, the CONNECT tunnel's
 // bytes.
 func (h *DupHub) ServeStream(ctx context.Context, key string, conn net.Conn) error {
+	h.streamLegs.Add(1)
 	return h.serve(ctx, key, &streamCarrier{conn: conn, buf: make([]byte, dup.MaxFrame)})
 }
 
