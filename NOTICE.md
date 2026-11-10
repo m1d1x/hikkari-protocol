@@ -7,7 +7,7 @@
 
 Changes against the sources:
 
-- `wire/datagram`: realm (NAT punching), gecko obfuscation, port hopping and Brutal congestion control removed; BBR always; the server roster is swapped atomically (`UpdateUsers` raced with authentication).
+- `wire/datagram`: realm (NAT punching), gecko obfuscation, port hopping and Brutal congestion control removed; BBR always; the server roster is swapped atomically (`UpdateUsers` raced with authentication). `OnAuth` on both sides hands the admitted QUIC connection to v1.04 observability.
 - `server/naive`: Caddyfile support removed (JSON config only); the Caddy module is `http.handlers.hikkari_proxy`; `ContextKeyDial` moved to `connect/`.
 
 Libraries, not carried: Chromium's network stack (`sagernet/cronet-go`, used by the client engine), QUIC (`sagernet/quic-go`, `sagernet/sing-quic` for TLS glue and BBR), Caddy (`m1d1x/caddy`).

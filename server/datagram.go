@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/dup"
+	"github.com/m1d1x/hikkari-protocol/observe"
 	"github.com/m1d1x/hikkari-protocol/wire/datagram"
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing/common/auth"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -50,6 +52,9 @@ type DatagramOptions struct {
 	// association addressed to dup.Host is a carrier of a session the stream
 	// channel may carry too. Share one hub with the stream channel (WithDup).
 	Dup *DupHub
+	// Book, when set, counts the channel's QUIC connections by access key
+	// (v1.04 observability); the probe credential's under the empty key.
+	Book *observe.Book
 }
 
 // Datagram is the datagram channel: QUIC with HTTP/3 auth, UDP as QUIC
@@ -59,6 +64,7 @@ type Datagram struct {
 	service *datagram.Service[string]
 	conn    net.PacketConn
 	flows   atomic.Int64
+	closing atomic.Bool
 }
 
 // ListenDatagram opens the channel; SetKeys gives it the roster.
@@ -81,6 +87,10 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 		UDPTimeout:         opts.Idle,
 		Handler:            d,
 		MasqueradeHandler:  opts.Masquerade,
+		OnAuth: func(user any, conn *quic.Conn) {
+			key, _ := user.(string)
+			observe.WatchQUIC(opts.Book, key, "datagram", conn, d.closing.Load)
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -110,6 +120,7 @@ func (d *Datagram) Flows() int64 { return d.flows.Load() }
 
 // Close stops the channel.
 func (d *Datagram) Close() error {
+	d.closing.Store(true)
 	err := d.service.Close()
 	if d.conn != nil {
 		_ = d.conn.Close()

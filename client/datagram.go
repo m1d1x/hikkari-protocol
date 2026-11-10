@@ -5,7 +5,9 @@ import (
 	"net"
 	"os"
 
+	"github.com/m1d1x/hikkari-protocol/observe"
 	"github.com/m1d1x/hikkari-protocol/wire/datagram"
+	"github.com/sagernet/quic-go"
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -32,6 +34,11 @@ type DatagramOptions struct {
 	// NoChromeParrot sends the plain QUIC Initial instead of Chrome's.
 	NoChromeParrot bool
 	Logger         logger.Logger
+	// Book, when set, counts the channel's QUIC connections under Name
+	// ("datagram", or "voice" for the voice connection of v1.03) in the
+	// client's group (v1.04 observability).
+	Book *observe.Book
+	Name string
 }
 
 // Datagram is the client of the datagram channel. It is a Channel: UDP rides
@@ -55,6 +62,13 @@ func NewDatagram(opts DatagramOptions) (*Datagram, error) {
 		TLSConfig:          opts.TLS,
 		QUICOptions:        opts.QUIC,
 		ChromeParrot:       !opts.NoChromeParrot,
+		OnAuth: func(conn *quic.Conn) {
+			name := opts.Name
+			if name == "" {
+				name = "datagram"
+			}
+			observe.WatchQUIC(opts.Book, Group, name, conn, nil)
+		},
 	})
 	if err != nil {
 		return nil, err

@@ -18,6 +18,7 @@ Wire description: [spec/v1.md](spec/v1.md).
 | `server` | the datagram channel, UDP-over-TCP, the exit policy and admission interfaces a relay implements |
 | `server/naive` | the stream channel's server: a Caddy handler (own module, so the client side never pulls Caddy) |
 | `wire/datagram` | the datagram wire (Hysteria2 framing), carried from sing-quic |
+| `observe` | v1.04 observability: each end's book of its sessions (QUIC connections, dup copies by channel, calls), handed out as periods |
 | `connect` | the hand-off between the CONNECT front and handlers before it |
 | `trunk` | the cascade's trunk between our entry in Russia and a relay abroad, both ends ([spec/trunk.md](spec/trunk.md)); own module, no client uses it |
 | `trunk/chromium` | the entry's members dialled by Chromium (cronet), as the client dials its stream channel; own module, so cronet stays out of the relay |

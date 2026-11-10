@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/dup"
+	"github.com/m1d1x/hikkari-protocol/observe"
 	"github.com/sagernet/sing/common/bufio"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -57,7 +58,15 @@ type Options struct {
 	// only with Dup and a relay that keeps lanes; nil keeps voice on Datagram.
 	VoiceDatagram Channel
 	Logger        logger.ContextLogger
+	// Book, when set, counts the client's duplicated sessions and calls
+	// (v1.04 observability) under Group; give the same book to the datagram
+	// channels (DatagramOptions.Book) for their QUIC connections.
+	Book *observe.Book
 }
+
+// Group is the one group a client's book counts under: a client is one user,
+// it needs no key.
+const Group = ""
 
 type Client struct {
 	opts     Options

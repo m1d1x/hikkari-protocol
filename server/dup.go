@@ -11,6 +11,7 @@ import (
 
 	"github.com/m1d1x/hikkari-protocol/connect"
 	"github.com/m1d1x/hikkari-protocol/dup"
+	"github.com/m1d1x/hikkari-protocol/observe"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -33,6 +34,7 @@ type DupHub struct {
 
 	mu       sync.Mutex
 	sessions map[dupKey]*dupSession
+	book     *observe.Book
 
 	streamLegs, datagramLegs atomic.Int64
 }
@@ -53,6 +55,14 @@ func NewDupHub(exit Exit, idle time.Duration) *DupHub {
 	return &DupHub{exit: exit, idle: idle, grace: DupGrace, sessions: map[dupKey]*dupSession{}}
 }
 
+// Observe counts the hub's sessions into b by access key (v1.04): the up
+// direction's copies, by channel. Call it before the hub serves.
+func (h *DupHub) Observe(b *observe.Book) {
+	h.mu.Lock()
+	h.book = b
+	h.mu.Unlock()
+}
+
 // Sessions is how many sessions hold an exit socket now.
 func (h *DupHub) Sessions() int {
 	h.mu.Lock()
@@ -67,6 +77,7 @@ func (h *DupHub) Carriers() (stream, datagram int64) {
 
 // carrier is one channel's leg of a session.
 type carrier interface {
+	via() dup.Via
 	readFrame() (dup.Frame, error)
 	writeFrame([]byte) error
 	close()
@@ -130,7 +141,7 @@ func (h *DupHub) serve(ctx context.Context, key string, c carrier) error {
 		}
 		switch f.Kind {
 		case dup.KindPacket:
-			s.up(ctx, f)
+			s.up(ctx, f, c.via())
 		case dup.KindAttach:
 			leg.join(s.id.id, f.Lane)
 		}
@@ -154,6 +165,7 @@ func (h *DupHub) attach(ctx context.Context, key string, id dup.Session, c carri
 		s = &dupSession{hub: h, id: k, sock: sock, legs: map[*dupLeg]struct{}{}, resolved: map[string]netip.AddrPort{}}
 		s.timer = time.AfterFunc(h.idle, s.end)
 		h.sessions[k] = s
+		s.unbook = h.book.Add(key, s.take)
 		go s.down()
 	}
 	leg := &dupLeg{c: c, queue: make(chan []byte, dupQueue)}
@@ -229,7 +241,10 @@ type dupSession struct {
 
 	mu       sync.Mutex
 	legs     map[*dupLeg]struct{}
-	window   dup.Window
+	ledger   dup.Ledger
+	booked   bool   // counted in a period already
+	endedBy  string // why it ended, for its last period
+	unbook   func()
 	downSeq  uint64
 	timer    *time.Timer
 	ended    bool
@@ -238,9 +253,9 @@ type dupSession struct {
 }
 
 // up sends the first copy of a client packet out of the exit socket.
-func (s *dupSession) up(ctx context.Context, f dup.Frame) {
+func (s *dupSession) up(ctx context.Context, f dup.Frame, via dup.Via) {
 	s.mu.Lock()
-	fresh := s.window.Accept(f.Seq)
+	fresh := s.ledger.Accept(f.Seq, via, time.Now())
 	if fresh {
 		s.timer.Reset(s.hub.idle)
 	}
@@ -349,12 +364,36 @@ func (s *dupSession) end() {
 	s.ended = true
 	legs := s.legs
 	s.legs = map[*dupLeg]struct{}{}
+	s.endedBy = observe.EndIdle
+	if len(legs) == 0 {
+		s.endedBy = observe.EndGone
+	}
+	s.ledger.Close()
 	s.mu.Unlock()
+	s.unbook()
 	_ = s.sock.Close()
 	for leg := range legs {
 		leg.c.close()
 		leg.stop()
 	}
+}
+
+// take adds the session's period to p; the Book calls it.
+func (s *dupSession) take(p *observe.Period) {
+	if p.Dup == nil {
+		p.Dup = &observe.Dup{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.Dup.Sessions++
+	if !s.booked {
+		p.Dup.Opened++
+		s.booked = true
+	}
+	if s.endedBy != "" {
+		p.Dup.Ends.Add(s.endedBy)
+	}
+	s.ledger.Take(p.Dup)
 }
 
 type packetCarrier struct {
@@ -398,6 +437,8 @@ func (p *packetCarrier) writeFrame(frame []byte) error {
 
 func (p *packetCarrier) close() { _ = p.conn.Close() }
 
+func (p *packetCarrier) via() dup.Via { return dup.ViaDatagram }
+
 type streamCarrier struct {
 	conn net.Conn
 	buf  []byte
@@ -419,3 +460,5 @@ func (s *streamCarrier) writeFrame(frame []byte) error {
 }
 
 func (s *streamCarrier) close() { _ = s.conn.Close() }
+
+func (s *streamCarrier) via() dup.Via { return dup.ViaStream }

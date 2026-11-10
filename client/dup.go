@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/dup"
+	"github.com/m1d1x/hikkari-protocol/observe"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -72,7 +73,10 @@ type dupConn struct {
 
 	mu           sync.Mutex
 	seq          uint64
-	window       dup.Window
+	ledger       dup.Ledger
+	booked       bool // counted in a period already
+	closed       bool
+	unbook       func()
 	primary      *dupLeg // nil while down
 	voice        *dupLeg // nil while off
 	mirror       *dupLeg // nil while off
@@ -135,7 +139,36 @@ func newDupConn(ctx context.Context, c *Client, primary net.PacketConn) *dupConn
 	d := &dupConn{c: c, ctx: ctx, cancel: cancel, in: make(chan inbound, 256), deadlineWake: make(chan struct{})}
 	_, _ = rand.Read(d.id[:])
 	d.primary = d.packetLeg(primary, dup.LaneAll)
+	d.unbook = c.opts.Book.Add(Group, d.take)
 	return d
+}
+
+// take adds the session's period to p; the Book calls it.
+func (d *dupConn) take(p *observe.Period) {
+	if p.Dup == nil {
+		p.Dup = &observe.Dup{}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.closed {
+		d.det.settle(time.Now())
+	}
+	p.Dup.Sessions++
+	if !d.booked {
+		p.Dup.Opened++
+		d.booked = true
+	}
+	if d.closed {
+		p.Dup.Ends.Add(observe.EndEOF)
+	}
+	d.ledger.Take(p.Dup)
+	if d.det.done.N > 0 {
+		if p.Calls == nil {
+			p.Calls = &observe.Calls{}
+		}
+		p.Calls.Merge(&d.det.done)
+		d.det.done = observe.Calls{}
+	}
 }
 
 // packetLeg starts a carrier on a datagram connection, attached to lane.
@@ -312,7 +345,7 @@ func (d *dupConn) readStream(leg *dupLeg, conn net.Conn) {
 			d.legDown(leg, err)
 			return
 		}
-		d.deliver(data)
+		d.deliver(data, dup.ViaStream)
 	}
 }
 
@@ -324,7 +357,7 @@ func (d *dupConn) readPacket(leg *dupLeg, p net.PacketConn) {
 			d.legDown(leg, err)
 			return
 		}
-		d.deliver(b[:n])
+		d.deliver(b[:n], dup.ViaDatagram)
 	}
 }
 
@@ -395,7 +428,7 @@ func (d *dupConn) redialPrimary() {
 
 // deliver hands the first copy of an answer to the application. An attach
 // from the relay says it keeps lanes.
-func (d *dupConn) deliver(data []byte) {
+func (d *dupConn) deliver(data []byte, via dup.Via) {
 	f, err := dup.Decode(data)
 	if err != nil || f.Session != d.id {
 		return
@@ -408,7 +441,10 @@ func (d *dupConn) deliver(data []byte) {
 		return
 	}
 	d.mu.Lock()
-	fresh := d.window.Accept(f.Seq)
+	fresh := d.ledger.Accept(f.Seq, via, time.Now())
+	if fresh {
+		d.det.answer()
+	}
 	d.mu.Unlock()
 	if !fresh {
 		return
@@ -455,7 +491,16 @@ func (d *dupConn) Close() error {
 	d.mu.Lock()
 	legs := []*dupLeg{d.primary, d.voice, d.mirror}
 	d.primary, d.voice, d.mirror = nil, nil, nil
+	first := !d.closed
+	if first {
+		d.closed = true
+		d.det.finish()
+		d.ledger.Close()
+	}
 	d.mu.Unlock()
+	if first {
+		d.unbook()
+	}
 	for _, leg := range legs {
 		if leg != nil {
 			leg.close()
@@ -496,8 +541,19 @@ type detector struct {
 	packets   int
 	bytes     int
 	small     int // voice-sized packets
+	smallLen  int // their bytes
 	voiceTill time.Time
+	// The call now, from its first voice-shaped second (v1.04).
+	in                      bool
+	start, last             time.Time // first and last voice-shaped second
+	up, upSmall, upSmallLen int
+	down                    int
+	done                    observe.Calls // calls ended since the book's last take
 }
+
+// ShortCall is the shortest call a person makes: a call detected for less is
+// likely something else (a game, a burst of small packets).
+const ShortCall = 10 * time.Second
 
 // add counts one packet and reports whether the flow is a call now. lanes
 // counts only voice-sized packets (v1.03), otherwise the whole flow must be
@@ -507,17 +563,75 @@ func (t *detector) add(now time.Time, size int, lanes bool) bool {
 		t.second = now
 	}
 	if now.Sub(t.second) >= time.Second {
+		t.settle(now)
 		if now.Sub(t.second) < 2*time.Second && t.call(lanes) {
 			t.voiceTill = now.Add(VoiceOff)
+			if !t.in {
+				// The call began with the second that showed it.
+				t.in, t.start = true, t.second
+				t.up, t.upSmall, t.upSmallLen, t.down = t.packets, t.small, t.smallLen, 0
+			}
+			t.last = t.second
 		}
-		t.second, t.packets, t.bytes, t.small = now, 0, 0, 0
+		t.second, t.packets, t.bytes, t.small, t.smallLen = now, 0, 0, 0, 0
 	}
 	t.packets++
 	t.bytes += size
-	if dup.IsVoiceSized(size) {
+	small := dup.IsVoiceSized(size)
+	if small {
 		t.small++
+		t.smallLen += size
+	}
+	if t.in {
+		t.up++
+		if small {
+			t.upSmall++
+			t.upSmallLen += size
+		}
 	}
 	return now.Before(t.voiceTill)
+}
+
+// answer counts a packet delivered to the application during a call.
+func (t *detector) answer() {
+	if t.in {
+		t.down++
+	}
+}
+
+// settle ends the call when it is over by now.
+func (t *detector) settle(now time.Time) {
+	if t.in && !now.Before(t.voiceTill) {
+		t.finish()
+	}
+}
+
+// finish ends the call now, if there is one. A call lasts from its first
+// voice-shaped second to the end of its last one.
+func (t *detector) finish() {
+	if !t.in {
+		return
+	}
+	c := &t.done
+	t.in = false
+	length := t.last.Sub(t.start) + time.Second
+	secs := length.Seconds()
+	c.N++
+	if length < ShortCall {
+		c.Short++
+	}
+	if t.down*3 < t.up {
+		c.OneSided++
+	}
+	c.Seconds.Add(secs)
+	c.PPSUp.Add(float64(t.up) / secs)
+	c.PPSDown.Add(float64(t.down) / secs)
+	if t.upSmall > 0 {
+		c.BytesUp.Add(float64(t.upSmallLen) / float64(t.upSmall))
+	}
+	if t.up > 0 {
+		c.Voice.Add(float64(t.upSmall) * 100 / float64(t.up))
+	}
 }
 
 func (t *detector) call(lanes bool) bool {

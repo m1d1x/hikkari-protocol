@@ -38,6 +38,9 @@ type ServiceOptions struct {
 	Handler            ServerHandler
 	MasqueradeHandler  http.Handler
 	BBRProfile         string
+	// OnAuth, when set, is told of every connection that authenticates, as
+	// it does (v1.04 observability).
+	OnAuth func(user any, conn *quic.Conn)
 }
 
 type ServerHandler interface {
@@ -57,6 +60,7 @@ type Service[U comparable] struct {
 	masqueradeHandler  http.Handler
 	quicListener       io.Closer
 	bbrProfile         congestion_meta2.Profile
+	onAuth             func(user any, conn *quic.Conn)
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -96,6 +100,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:         options.UDPTimeout,
 		handler:            options.Handler,
 		masqueradeHandler:  options.MasqueradeHandler,
+		onAuth:             options.OnAuth,
 		bbrProfile:         bbrProfile,
 	}
 	service.userMap.Store(&map[string]U{})
@@ -195,6 +200,9 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		s.authUser = user
 		s.authenticated = true
+		if s.onAuth != nil {
+			s.onAuth(user, s.quicConn)
+		}
 		// BBR always, whatever bandwidth the client claims: Brutal's fixed
 		// rate makes no bandwidth and costs latency.
 		s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(

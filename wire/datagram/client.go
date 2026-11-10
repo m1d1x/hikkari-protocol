@@ -38,6 +38,9 @@ type ClientOptions struct {
 	QUICOptions        qtls.QUICOptions
 	BBRProfile         string
 	ChromeParrot       bool
+	// OnAuth, when set, is told of every connection the relay admits (v1.04
+	// observability).
+	OnAuth func(conn *quic.Conn)
 }
 
 type Client struct {
@@ -50,6 +53,7 @@ type Client struct {
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	bbrProfile         congestion_meta2.Profile
+	onAuth             func(conn *quic.Conn)
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -91,6 +95,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
 		bbrProfile:         bbrProfile,
+		onAuth:             options.OnAuth,
 	}, nil
 }
 
@@ -247,6 +252,9 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		udpDisabled: !authResponse.UDPEnabled,
 		udpConnMap:  make(map[uint32]*udpPacketConn),
 		closeIdle:   &c.closeIdle,
+	}
+	if c.onAuth != nil {
+		c.onAuth(quicConn)
 	}
 	go c.loopMessages(conn)
 	go func() {
