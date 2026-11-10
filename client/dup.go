@@ -542,6 +542,7 @@ type detector struct {
 	bytes     int
 	small     int // voice-sized packets
 	smallLen  int // their bytes
+	answers   int // packets delivered to the application in this second
 	voiceTill time.Time
 	// The call now, from its first voice-shaped second (v1.04).
 	in                      bool
@@ -569,11 +570,11 @@ func (t *detector) add(now time.Time, size int, lanes bool) bool {
 			if !t.in {
 				// The call began with the second that showed it.
 				t.in, t.start = true, t.second
-				t.up, t.upSmall, t.upSmallLen, t.down = t.packets, t.small, t.smallLen, 0
+				t.up, t.upSmall, t.upSmallLen, t.down = t.packets, t.small, t.smallLen, t.answers
 			}
 			t.last = t.second
 		}
-		t.second, t.packets, t.bytes, t.small, t.smallLen = now, 0, 0, 0, 0
+		t.second, t.packets, t.bytes, t.small, t.smallLen, t.answers = now, 0, 0, 0, 0, 0
 	}
 	t.packets++
 	t.bytes += size
@@ -594,6 +595,7 @@ func (t *detector) add(now time.Time, size int, lanes bool) bool {
 
 // answer counts a packet delivered to the application during a call.
 func (t *detector) answer() {
+	t.answers++
 	if t.in {
 		t.down++
 	}

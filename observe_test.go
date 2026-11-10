@@ -105,7 +105,7 @@ func TestObserveCall(t *testing.T) {
 		t.Fatalf("settled %d of %d", down.OnlyStream+down.OnlyDatagram+down.Both, down.Fresh)
 	}
 	calls := own.Calls
-	if calls.N != 1 || calls.Short != 1 || calls.OneSided != 0 {
+	if calls.N != 1 || calls.Short != 1 || calls.OneSided != 0 || calls.PPSDown.Summary().Max < calls.PPSUp.Summary().Max*0.9 {
 		t.Fatalf("calls: %+v", calls)
 	}
 	// 250 packets in about 6 s: the test's own pause between its two parts
