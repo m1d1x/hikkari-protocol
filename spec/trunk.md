@@ -84,6 +84,13 @@ second copy on the trunk would make four of every packet. The entry chooses per 
 that reach the exit's Hikkari relay). The exit answers a flow as the entry sends it: on one member until a copy of the flow's
 datagrams arrives, then on 2.
 
+A flow to port 0 is the trunk's own call (`call.go`): the exit sends every datagram straight back, with no socket, as it
+came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, a datagram every 20 ms, and
+reports each minute of the wall clock: sent, answered within 2 s, round trips, and the pauses between answers a call hears
+(over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with their time). Neither end counts the call
+among its clients' flows and datagrams, and it never keeps a retired session open. An exit older than this answers nothing on
+port 0: the call reports every datagram lost.
+
 ## Observation
 
 Testers are observed in full, other users not at all (owner's decision 10.11; hikkari-client

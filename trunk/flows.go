@@ -11,6 +11,13 @@ import (
 // first copy now, not a late one. A flow whose sender copies its datagrams
 // itself (Hikkari v1.02 sends a call over both its channels) is opened with
 // one copy: a second copy here would make four of every packet.
+//
+// A flow to EchoPort is the trunk's own synthetic call (call.go): the exit
+// sends every datagram straight back, without a socket, and neither end
+// counts it among its clients' flows and datagrams.
+
+// EchoPort is the port of the exit's echo: no loopback service has port 0.
+const EchoPort uint16 = 0
 
 type flow struct {
 	id      uint32
@@ -25,6 +32,8 @@ type flow struct {
 	// copies is how many members carry each datagram of the flow. The
 	// entry's is chosen at open; the exit's follows the entry's (dgramLocked).
 	copies int
+	// echo is a flow to EchoPort: the trunk's own call, not a client's.
+	echo bool
 
 	// What an observed flow reports (observe.go).
 	opened          time.Time
@@ -57,7 +66,7 @@ func (s *Session) OpenFlowCopies(port uint16, copies int, deliver func([]byte), 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now()}
+	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now(), echo: port == EchoPort}
 	if s.shutdown {
 		f.ended = true
 	} else {
@@ -79,9 +88,18 @@ func (h *Flow) Send(p []byte) bool {
 		return false
 	}
 	h.f.used = time.Now()
-	s.dgramsOut.Add(1)
+	if !h.f.echo {
+		s.dgramsOut.Add(1)
+	}
 	s.sendDgramLocked(h.f, p)
 	return true
+}
+
+// Close ends the flow on this end; the other end's lets it idle out.
+func (h *Flow) Close() {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	h.s.endFlowLocked(h.f)
 }
 
 func (s *Session) sendDgramLocked(f *flow, p []byte) {
@@ -122,6 +140,12 @@ func (s *Session) dgramLocked(fr frame) {
 		if s.local == nil {
 			return // the entry's flow is over
 		}
+		if fr.port == EchoPort {
+			f = &flow{id: fr.stream, port: fr.port, used: time.Now(), copies: 1, opened: time.Now(), echo: true}
+			s.flows[f.id] = f
+			s.dgramLocked(fr)
+			return
+		}
 		conn, err := s.local.DialFlow(withTarget(s.ctx, Target{s, ObsFlow, fr.stream}), fr.port)
 		if err != nil {
 			return
@@ -133,7 +157,9 @@ func (s *Session) dgramLocked(fr frame) {
 		go s.readFlow(f)
 	}
 	if f.replay.seen(fr.seq) {
-		s.dgramsCopy.Add(1)
+		if !f.echo {
+			s.dgramsCopy.Add(1)
+		}
 		f.copied++
 		if s.local != nil {
 			f.copies = s.cfg.Copies
@@ -141,8 +167,14 @@ func (s *Session) dgramLocked(fr frame) {
 		return
 	}
 	f.used = time.Now()
-	s.dgramsIn.Add(1)
 	f.in++
+	if f.echo && s.local != nil {
+		s.sendDgramLocked(f, fr.payload) // the exit's echo: straight back
+		return
+	}
+	if !f.echo {
+		s.dgramsIn.Add(1)
+	}
 	if f.conn != nil {
 		_, _ = f.conn.Write(fr.payload)
 	} else if f.deliver != nil {
@@ -226,4 +258,15 @@ func (r *replay) seen(seq uint32) bool {
 	}
 	r.bits[word] |= bit
 	return false
+}
+
+// clientFlowsLocked is how many flows are clients', not the trunk's own call.
+func (s *Session) clientFlowsLocked() int {
+	n := 0
+	for _, f := range s.flows {
+		if !f.echo {
+			n++
+		}
+	}
+	return n
 }

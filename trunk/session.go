@@ -128,7 +128,7 @@ type Stats struct {
 	StreamsOpened int64
 	StreamsReset  int64
 	Up, Down      int64 // stream bytes read from / written to local connections
-	Flows         int   // datagram flows open now
+	Flows         int   // clients' datagram flows open now (not the trunk's call)
 	DgramsOut     int64 // datagrams read from local sockets
 	DgramsIn      int64 // datagrams written to local sockets
 	DgramsCopy    int64 // datagram copies dropped as already seen
@@ -258,7 +258,7 @@ func (s *Session) Reset() {
 // Stats reads the counters.
 func (s *Session) Stats() Stats {
 	s.mu.Lock()
-	members, streams, flows, paused := len(s.members), len(s.streams), len(s.flows), s.paused
+	members, streams, flows, paused := len(s.members), len(s.streams), s.clientFlowsLocked(), s.paused
 	s.mu.Unlock()
 	return Stats{
 		Members: members, MembersJoined: s.joined.Load(), MembersStall: s.stalls.Load(),
@@ -663,7 +663,7 @@ func (s *Session) Drain() {
 func (s *Session) Busy() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.streams) > 0 || len(s.flows) > 0
+	return len(s.streams) > 0 || s.clientFlowsLocked() > 0
 }
 
 // ── streams ──
