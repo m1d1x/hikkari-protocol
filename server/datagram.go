@@ -35,6 +35,13 @@ type Admitter interface {
 type DatagramOptions struct {
 	// Listen is the UDP address, normally the Naive channel's host:port.
 	Listen string
+	// Conn, when set, is the socket to serve instead of binding Listen: a
+	// relay's generation (generation.go), handed over across rollouts. The
+	// channel closes it on Close.
+	Conn net.PacketConn
+	// ConnectionIDs, when set, issues the channel's connection IDs
+	// (GenerationIDs, so packets find their generation).
+	ConnectionIDs quic.ConnectionIDGenerator
 	// Certificate serves the TLS certificate (the relay domain's, the same the
 	// Naive channel shows).
 	Certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -68,6 +75,7 @@ type Datagram struct {
 	service *datagram.Service[string]
 	conn    net.PacketConn
 	flows   atomic.Int64
+	conns   atomic.Int64
 	closing atomic.Bool
 }
 
@@ -91,7 +99,10 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 		UDPTimeout:         opts.Idle,
 		Handler:            d,
 		MasqueradeHandler:  opts.Masquerade,
+		ConnectionIDs:      opts.ConnectionIDs,
 		OnAuth: func(user any, conn *quic.Conn) {
+			d.conns.Add(1)
+			context.AfterFunc(conn.Context(), func() { d.conns.Add(-1) })
 			key, _ := user.(string)
 			observe.WatchQUIC(opts.Book, d.group(key, M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()), "datagram", conn, d.closing.Load)
 		},
@@ -101,8 +112,10 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 	}
 	d.service = service
 	d.SetKeys(nil)
-	if d.conn, err = net.ListenPacket("udp", opts.Listen); err != nil {
-		return nil, err
+	if d.conn = opts.Conn; d.conn == nil {
+		if d.conn, err = net.ListenPacket("udp", opts.Listen); err != nil {
+			return nil, err
+		}
 	}
 	if err = service.Start(d.conn); err != nil {
 		_ = d.conn.Close()
@@ -128,6 +141,11 @@ func (d *Datagram) group(key string, remote M.Socksaddr) string {
 
 // Flows is how many UDP associations the channel has carried.
 func (d *Datagram) Flows() int64 { return d.flows.Load() }
+
+// Conns is how many authenticated QUIC connections the channel holds now: a
+// generation that hands over finishes when this, and the stream channel's
+// sessions, reach zero.
+func (d *Datagram) Conns() int64 { return d.conns.Load() }
 
 // Close stops the channel.
 func (d *Datagram) Close() error {
