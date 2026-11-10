@@ -55,6 +55,10 @@ type DatagramOptions struct {
 	// Book, when set, counts the channel's QUIC connections by access key
 	// (v1.04 observability); the probe credential's under the empty key.
 	Book *observe.Book
+	// Group, when set, names the book's group for a key's connection from
+	// remote (a relay tells the cascade's entry from clients); the key
+	// itself otherwise.
+	Group func(key string, remote M.Socksaddr) string
 }
 
 // Datagram is the datagram channel: QUIC with HTTP/3 auth, UDP as QUIC
@@ -89,7 +93,7 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 		MasqueradeHandler:  opts.Masquerade,
 		OnAuth: func(user any, conn *quic.Conn) {
 			key, _ := user.(string)
-			observe.WatchQUIC(opts.Book, key, "datagram", conn, d.closing.Load)
+			observe.WatchQUIC(opts.Book, d.group(key, M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()), "datagram", conn, d.closing.Load)
 		},
 	})
 	if err != nil {
@@ -113,6 +117,13 @@ func (d *Datagram) SetKeys(keys []string) {
 	users := append([]string{""}, keys...)
 	passwords := append([]string{d.opts.ProbePassword}, keys...)
 	d.service.UpdateUsers(users, passwords)
+}
+
+func (d *Datagram) group(key string, remote M.Socksaddr) string {
+	if d.opts.Group == nil {
+		return key
+	}
+	return d.opts.Group(key, remote)
 }
 
 // Flows is how many UDP associations the channel has carried.
@@ -157,7 +168,7 @@ func (d *Datagram) NewConnectionEx(ctx context.Context, conn net.Conn, _ M.Socks
 }
 
 // NewPacketConnectionEx serves one UDP association.
-func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, _ M.Socksaddr, dest M.Socksaddr, onClose N.CloseHandlerFunc) {
+func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, dest M.Socksaddr, onClose N.CloseHandlerFunc) {
 	key, _ := auth.UserFromContext[string](ctx)
 	go func() {
 		defer closeWith(onClose)
@@ -169,7 +180,7 @@ func (d *Datagram) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn,
 		defer done()
 		d.flows.Add(1)
 		if d.opts.Dup != nil && dup.IsHost(dest.AddrString()) {
-			_ = d.opts.Dup.ServePacket(ctx, key, conn, count)
+			_ = d.opts.Dup.ServePacket(observe.WithGroup(ctx, d.group(key, source)), key, conn, count)
 			return
 		}
 		_ = RelayPackets(ctx, conn, uot.Request{}, d.opts.Exit, d.opts.Idle, count)

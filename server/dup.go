@@ -87,14 +87,19 @@ type carrier interface {
 // packets are addressed to dup.Host. count receives the carrier's own bytes.
 func (h *DupHub) ServePacket(ctx context.Context, key string, conn N.PacketConn, count func(up, down int)) error {
 	h.datagramLegs.Add(1)
-	return h.serve(ctx, key, &packetCarrier{conn: conn, count: count})
+	return h.serve(ctx, key, observe.GroupFrom(ctx, key), &packetCarrier{conn: conn, count: count})
 }
 
 // ServeStream serves a stream-channel carrier on conn, the CONNECT tunnel's
-// bytes.
+// bytes. A session the carrier opens counts in ctx's group
+// (observe.WithGroup), key's when it names none.
 func (h *DupHub) ServeStream(ctx context.Context, key string, conn net.Conn) error {
+	return h.serveStream(ctx, key, observe.GroupFrom(ctx, key), conn)
+}
+
+func (h *DupHub) serveStream(ctx context.Context, key, group string, conn net.Conn) error {
 	h.streamLegs.Add(1)
-	return h.serve(ctx, key, &streamCarrier{conn: conn, buf: make([]byte, dup.MaxFrame)})
+	return h.serve(ctx, key, group, &streamCarrier{conn: conn, buf: make([]byte, dup.MaxFrame)})
 }
 
 // IsDupHost reports whether a CONNECT asks for a duplicated-association
@@ -109,28 +114,30 @@ func IsDupHost(hostPort string) bool {
 
 // WithDup puts a stream carrier on a CONNECT request's context, as WithUoT
 // does: the Naive proxy answers the CONNECT behind its own auth and padding,
-// the hub serves the other end of the pipe under key.
+// the hub serves the other end of the pipe under key, in ctx's group
+// (observe.WithGroup).
 func WithDup(ctx context.Context, hub *DupHub, key string) context.Context {
+	group := observe.GroupFrom(ctx, key)
 	return context.WithValue(ctx, connect.ContextKeyDial{}, func(ctx context.Context) (net.Conn, error) {
 		proxySide, relaySide := net.Pipe()
 		go func() {
 			defer relaySide.Close()
 			stop := context.AfterFunc(ctx, func() { _ = relaySide.Close() })
 			defer stop()
-			_ = hub.ServeStream(ctx, key, relaySide)
+			_ = hub.serveStream(ctx, key, group, relaySide)
 		}()
 		return proxySide, nil
 	})
 }
 
-func (h *DupHub) serve(ctx context.Context, key string, c carrier) error {
+func (h *DupHub) serve(ctx context.Context, key, group string, c carrier) error {
 	defer c.close()
 	context.AfterFunc(ctx, c.close)
 	first, err := c.readFrame()
 	if err != nil {
 		return err
 	}
-	s, leg, err := h.attach(ctx, key, first.Session, c)
+	s, leg, err := h.attach(ctx, key, group, first.Session, c)
 	if err != nil {
 		return err
 	}
@@ -151,8 +158,9 @@ func (h *DupHub) serve(ctx context.Context, key string, c carrier) error {
 	}
 }
 
-// attach finds or opens the session and adds c as a leg.
-func (h *DupHub) attach(ctx context.Context, key string, id dup.Session, c carrier) (*dupSession, *dupLeg, error) {
+// attach finds or opens the session and adds c as a leg. A session counts in
+// the group of the carrier that opened it.
+func (h *DupHub) attach(ctx context.Context, key, group string, id dup.Session, c carrier) (*dupSession, *dupLeg, error) {
 	k := dupKey{key, id}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -165,7 +173,7 @@ func (h *DupHub) attach(ctx context.Context, key string, id dup.Session, c carri
 		s = &dupSession{hub: h, id: k, sock: sock, legs: map[*dupLeg]struct{}{}, resolved: map[string]netip.AddrPort{}}
 		s.timer = time.AfterFunc(h.idle, s.end)
 		h.sessions[k] = s
-		s.unbook = h.book.Add(key, s.take)
+		s.unbook = h.book.Add(group, s.take)
 		go s.down()
 	}
 	leg := &dupLeg{c: c, queue: make(chan []byte, dupQueue)}
