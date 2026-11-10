@@ -25,6 +25,7 @@ type Entry struct {
 	dial    Dial
 	ports   *PortBook
 	logf    func(string, ...any)
+	spread  time.Duration
 
 	mu    sync.Mutex
 	epoch Epoch
@@ -32,17 +33,20 @@ type Entry struct {
 }
 
 // NewEntry makes an entry for members members. logf gets one line per
-// member that could not come up or died, and one per epoch of the exit (the
-// first, and every change: the exit restarted and the streams were reset);
-// no client data in any.
+// member that could not come up or died, one per epoch of the exit (the
+// first, and every change: the exit restarted and the streams were reset),
+// and one per pause of the entry itself (the box did not run it); no client
+// data in any.
 func NewEntry(cfg Config, members int, dial Dial, ports *PortBook, logf func(string, ...any)) (*Entry, error) {
 	if members < 1 {
 		return nil, errors.New("trunk: an entry needs at least one member")
 	}
-	e := &Entry{s: NewSession(cfg, nil), members: members, dial: dial, ports: ports, logf: logf}
+	e := &Entry{s: newSession(cfg, nil), members: members, dial: dial, ports: ports, logf: logf, spread: replaceSpread}
 	if _, err := rand.Read(e.id[:]); err != nil {
 		return nil, err
 	}
+	e.s.onPause = func(d time.Duration) { logf("trunk: paused %s", d.Round(time.Millisecond)) }
+	go e.s.clock()
 	return e, nil
 }
 
@@ -64,13 +68,24 @@ func (e *Entry) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+// replaceSpread spreads the dials that replace dead members: members that
+// die together come back one by one, not as one burst of new flows from one
+// address in one second.
+var replaceSpread = time.Second
+
 func (e *Entry) slot(ctx context.Context, n int) {
 	backoff := time.Duration(0)
 	stalls := 0 // in a row
+	replace := false
 	for ctx.Err() == nil {
-		if backoff > 0 {
+		wait := backoff
+		if replace && e.spread > 0 {
+			r, _ := rand.Int(rand.Reader, big.NewInt(int64(e.spread)))
+			wait += time.Duration(r.Int64())
+		}
+		if wait > 0 {
 			select {
-			case <-time.After(backoff):
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return
 			}
@@ -121,6 +136,7 @@ func (e *Entry) slot(ctx context.Context, n int) {
 		started := time.Now()
 		err = e.s.Serve(conn)
 		release()
+		replace = true
 		if err != nil && ctx.Err() == nil {
 			e.logf("trunk: member %d: down after %s: %v", n, time.Since(started).Round(time.Second), err)
 		}

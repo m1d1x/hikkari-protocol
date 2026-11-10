@@ -54,6 +54,15 @@ type Config struct {
 	// Keepalive pings an idle member this often; an unanswered ping is
 	// progress owed like a chunk.
 	Keepalive time.Duration
+	// Quiet is how long every member may owe progress and stay silent
+	// together before they are declared dead. Stall alone judges a member
+	// only while another one shows the other end is alive: when all go
+	// silent at once, it is the other end that paused (a box starved of CPU
+	// by its neighbours, plans/research/2026-11-10-trunk-member-deaths.md)
+	// or the whole path, and new members would land on the same pause.
+	// Zero is DefaultQuiet on the entry, ExitQuiet on the exit (only the
+	// entry can dial a member, so the exit waits for it).
+	Quiet time.Duration
 }
 
 const (
@@ -64,8 +73,13 @@ const (
 	DefaultCopies    = 2
 	DefaultFlowIdle  = 2 * time.Minute
 	DefaultKeepalive = time.Second
+	DefaultQuiet     = time.Second
+	ExitQuiet        = 30 * time.Second
 	// tick is the session's clock for stalls, pings and idle flows.
 	tick = 25 * time.Millisecond
+	// lateTick is how late a tick may come before the session counts the
+	// gap as its own pause: the box did not run it.
+	lateTick = 4 * tick
 	// closedMemory is how long a finished stream's id is remembered, so its
 	// late copies are answered instead of reopening it.
 	closedMemory = 2 * time.Minute
@@ -98,12 +112,14 @@ func (c Config) withDefaults() Config {
 
 // Stats are a session's counters since it started.
 type Stats struct {
-	Members       int   // members up now
-	MembersJoined int64 // members ever attached
-	MembersStall  int64 // members closed for no progress
-	MembersBroken int64 // members closed by an error on their connection
-	Resent        int64 // chunks sent again on another member
-	Streams       int   // streams open now
+	Members       int           // members up now
+	MembersJoined int64         // members ever attached
+	MembersStall  int64         // members closed for no progress
+	MembersBroken int64         // members closed by an error on their connection
+	Pauses        int64         // times this end was not run for longer than lateTick
+	Paused        time.Duration // how long in all
+	Resent        int64         // chunks sent again on another member
+	Streams       int           // streams open now
 	StreamsOpened int64
 	StreamsReset  int64
 	Up, Down      int64 // stream bytes read from / written to local connections
@@ -142,22 +158,43 @@ type Session struct {
 	nextID     uint32
 	shutdown   bool
 	empty      time.Time // when the last member left (zero while one is up)
+	// proof is the latest progress any member showed: a member is only
+	// judged by Stall against members that kept going.
+	proof time.Time
+	// lastTick and resumed are the clock's: when it last ran, and when it
+	// last came back from a pause of its own.
+	lastTick, resumed time.Time
+	onPause           func(time.Duration)
+	paused            time.Duration
 
 	joined, stalls, broken, resent       atomic.Int64
+	pauses                               atomic.Int64
 	opened, resets, up, down             atomic.Int64
 	dgramsOut, dgramsIn, dgramsCopy, tok atomic.Int64
 }
 
 // NewSession starts a session. local is nil on the entry.
 func NewSession(cfg Config, local Local) *Session {
+	s := newSession(cfg, local)
+	go s.clock()
+	return s
+}
+
+func newSession(cfg Config, local Local) *Session {
 	ctx, stop := context.WithCancel(context.Background())
+	cfg = cfg.withDefaults()
+	if cfg.Quiet <= 0 {
+		cfg.Quiet = DefaultQuiet
+		if local != nil {
+			cfg.Quiet = ExitQuiet
+		}
+	}
 	s := &Session{
-		cfg: cfg.withDefaults(), local: local, ctx: ctx, stop: stop,
+		cfg: cfg, local: local, ctx: ctx, stop: stop,
 		members: map[*member]struct{}{}, streams: map[uint32]*stream{},
 		closed: map[uint32]time.Time{}, flows: map[uint32]*flow{}, early: map[uint32]*earlyStream{},
 	}
 	s.cond = sync.NewCond(&s.mu)
-	go s.clock()
 	return s
 }
 
@@ -200,11 +237,11 @@ func (s *Session) Reset() {
 // Stats reads the counters.
 func (s *Session) Stats() Stats {
 	s.mu.Lock()
-	members, streams, flows := len(s.members), len(s.streams), len(s.flows)
+	members, streams, flows, paused := len(s.members), len(s.streams), len(s.flows), s.paused
 	s.mu.Unlock()
 	return Stats{
 		Members: members, MembersJoined: s.joined.Load(), MembersStall: s.stalls.Load(),
-		MembersBroken: s.broken.Load(), Resent: s.resent.Load(),
+		MembersBroken: s.broken.Load(), Pauses: s.pauses.Load(), Paused: paused, Resent: s.resent.Load(),
 		Streams: streams, StreamsOpened: s.opened.Load(), StreamsReset: s.resets.Load(),
 		Up: s.up.Load(), Down: s.down.Load(),
 		Flows: flows, DgramsOut: s.dgramsOut.Load(), DgramsIn: s.dgramsIn.Load(), DgramsCopy: s.dgramsCopy.Load(),
@@ -441,56 +478,84 @@ func (s *Session) clock() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case now := <-t.C:
-			s.mu.Lock()
-			for m := range s.members {
-				limit := s.cfg.Stall
-				if r := 4 * m.srtt; r > limit {
-					limit = r
-				}
-				// Owed progress is counted from the later of the last proof
-				// and the moment the debt began: an idle member is not late
-				// for a chunk it was handed a moment ago.
-				owes := false
-				since := m.progress
-				if len(m.segs) > 0 {
-					owes = true
-					if m.busySince.After(since) {
-						since = m.busySince
-					}
-				} else if m.ping != 0 {
-					owes = true
-					if m.pingSent.After(since) {
-						since = m.pingSent
-					}
-				}
-				if owes && now.Sub(since) > limit {
-					s.dropMemberLocked(m, true)
-					continue
-				}
-				if m.ping == 0 && len(m.segs) == 0 && now.Sub(m.lastSend) > s.cfg.Keepalive {
-					m.ping = uint64(s.tok.Add(1))
-					m.pingSent, m.lastSend = now, now
-					m.send(appendPing(nil, fPing, m.ping), true)
-				}
+		case <-t.C:
+			// The time we ran, not the time the ticker fired: a box that
+			// was not run shows here as a late tick.
+			s.tick(time.Now())
+		}
+	}
+}
+
+// tick is one turn of the clock at now.
+func (s *Session) tick(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.lastTick.IsZero() {
+		if gap := now.Sub(s.lastTick); gap > lateTick {
+			// This end was not run: nothing its members owed could have
+			// been read. Each gets a fresh Stall from now, as if the pause
+			// had not happened, and the pause is told.
+			s.resumed = now
+			s.pauses.Add(1)
+			s.paused += gap
+			if s.onPause != nil {
+				go s.onPause(gap)
 			}
-			for _, f := range s.flows {
-				if now.Sub(f.used) > s.cfg.FlowIdle {
-					s.endFlowLocked(f)
-				}
+		}
+	}
+	s.lastTick = now
+	for m := range s.members {
+		limit := s.cfg.Stall
+		if r := 4 * m.srtt; r > limit {
+			limit = r
+		}
+		// Owed progress is counted from the later of the last proof
+		// and the moment the debt began: an idle member is not late
+		// for a chunk it was handed a moment ago.
+		owes := false
+		since := m.progress
+		if len(m.segs) > 0 {
+			owes = true
+			if m.busySince.After(since) {
+				since = m.busySince
 			}
-			for id, e := range s.early {
-				if now.Sub(e.since) > earlyFor {
-					delete(s.early, id)
-					s.earlyBytes -= e.bytes
-				}
+		} else if m.ping != 0 {
+			owes = true
+			if m.pingSent.After(since) {
+				since = m.pingSent
 			}
-			for id, at := range s.closed {
-				if now.Sub(at) > closedMemory {
-					delete(s.closed, id)
-				}
-			}
-			s.mu.Unlock()
+		}
+		if s.resumed.After(since) {
+			since = s.resumed
+		}
+		// Late by Stall while another member proved the other end alive
+		// after this one's debt began: this flow is dead, not the end.
+		// Late with everyone silent: the other end or the whole path, and
+		// only Quiet ends it.
+		if owes && (now.Sub(since) > limit && s.proof.After(since) || now.Sub(since) > s.cfg.Quiet) {
+			s.dropMemberLocked(m, true)
+			continue
+		}
+		if m.ping == 0 && len(m.segs) == 0 && now.Sub(m.lastSend) > s.cfg.Keepalive {
+			m.ping = uint64(s.tok.Add(1))
+			m.pingSent, m.lastSend = now, now
+			m.send(appendPing(nil, fPing, m.ping), true)
+		}
+	}
+	for _, f := range s.flows {
+		if now.Sub(f.used) > s.cfg.FlowIdle {
+			s.endFlowLocked(f)
+		}
+	}
+	for id, e := range s.early {
+		if now.Sub(e.since) > earlyFor {
+			delete(s.early, id)
+			s.earlyBytes -= e.bytes
+		}
+	}
+	for id, at := range s.closed {
+		if now.Sub(at) > closedMemory {
+			delete(s.closed, id)
 		}
 	}
 }
@@ -516,6 +581,7 @@ func (s *Session) handle(m *member, f frame) {
 			}
 			m.ping = 0
 			m.progress = now
+			s.proof = now
 		}
 	case fOpen:
 		s.openLocked(m, f)
@@ -726,6 +792,7 @@ func (s *Session) releaseLocked(seg *segment) {
 		delete(m.segs, seg)
 		m.inflight -= len(seg.data)
 		m.progress = time.Now()
+		s.proof = m.progress
 	}
 	seg.m = nil
 }

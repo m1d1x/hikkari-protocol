@@ -60,9 +60,15 @@ comes. Late frames of an ended stream get `rst`.
 
 A member owes progress while it carries unconfirmed chunks or an unanswered ping. It proves progress only by the confirmation
 of its own chunks or the pong of its own ping: frames that merely arrive on it prove nothing about its way out. A member that
-owes progress and proves none for max(300 ms, 4 × smoothed RTT) is dead: closed, its chunks sent again on the other members
-oldest first as they have room (256 KiB unconfirmed per member), its source port kept out of use for an hour, and a member
-on a new port opened at once. An idle member is pinged every second.
+owes progress and proves none for max(300 ms, 4 × smoothed RTT) while another member proved progress after its debt began is
+dead: closed, its chunks sent again on the other members oldest first as they have room (256 KiB unconfirmed per member), its
+source port kept out of use for an hour, and a member on a new port opened within a second (replacements are spread over that
+second, so members that die together do not come back as one burst). An idle member is pinged every second.
+
+When every member is silent at once, no member is to blame: the other end paused (a box starved of CPU by its neighbours) or
+the whole path did. Then members die only after Quiet: 1 s on the entry, 30 s on the exit, which cannot open members and waits
+for the entry to. A clock tick more than 100 ms late is the side's own pause: every member's debt counts from the end of it,
+and the entry logs `trunk: paused <duration>`.
 
 ## Datagrams
 

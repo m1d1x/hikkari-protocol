@@ -123,12 +123,13 @@ func newHarness(t *testing.T, cfg Config, members int, budget func(int64) int64,
 	if err != nil {
 		t.Fatal(err)
 	}
+	replaceSpread = 20 * time.Millisecond
 	dial := func(ctx context.Context, port int) (io.ReadWriteCloser, error) {
 		n := h.dials.Add(1)
 		a, b := net.Pipe()
 		go func() { _ = h.exit.ServeMember(b) }()
 		if h.budget == nil {
-			return a, nil
+			return wire.wrap(a), nil
 		}
 		f := &faulty{Conn: a, dead: make(chan struct{}), gone: make(chan struct{})}
 		f.budget.Store(h.budget(n))
@@ -443,5 +444,181 @@ func TestOneWayDeath(t *testing.T) {
 	wg.Wait()
 	if st := h.entry.Session().Stats(); st.MembersStall == 0 {
 		t.Fatalf("no one-way death was found: %+v", st)
+	}
+}
+
+// wireGate stands for the whole path and the entry's box at once: freeze
+// stops every entry-side member read and write (the entry's box is not run),
+// cut black-holes every member up now both ways (the path dropped them all).
+type wireGate struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	frozen bool
+	gen    int64 // members dialed now are of this generation
+	cutGen int64 // members of a generation below this are cut
+}
+
+var wire = func() *wireGate { g := &wireGate{}; g.cond = sync.NewCond(&g.mu); return g }()
+
+func (g *wireGate) freeze(on bool) {
+	g.mu.Lock()
+	g.frozen = on
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
+func (g *wireGate) cut() {
+	g.mu.Lock()
+	g.gen++
+	g.cutGen = g.gen
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
+func (g *wireGate) reset() {
+	g.mu.Lock()
+	g.frozen, g.gen, g.cutGen = false, 0, 0
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
+func (g *wireGate) wrap(c net.Conn) io.ReadWriteCloser {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return &gated{Conn: c, g: g, gen: g.gen, closed: make(chan struct{})}
+}
+
+type gated struct {
+	net.Conn
+	g      *wireGate
+	gen    int64
+	closed chan struct{}
+	once   sync.Once
+}
+
+// pass waits while the entry is frozen; false once the path cut this member.
+func (c *gated) pass() bool {
+	c.g.mu.Lock()
+	defer c.g.mu.Unlock()
+	for c.g.frozen && c.gen >= c.g.cutGen {
+		c.g.cond.Wait()
+	}
+	return c.gen >= c.g.cutGen
+}
+
+func (c *gated) Write(p []byte) (int, error) {
+	if !c.pass() {
+		return len(p), nil // swallowed by the path
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *gated) Read(p []byte) (int, error) {
+	if !c.pass() {
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	n, err := c.Conn.Read(p)
+	if err == nil && !c.pass() {
+		<-c.closed // what came in as the path died is lost with it
+		return 0, net.ErrClosed
+	}
+	return n, err
+}
+
+func (c *gated) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// TestOtherEndPaused: the entry's box is not run for 1.5 s in the middle of
+// a transfer (its own clock stopped with it, which Quiet stands for here).
+// The exit sees every member silent at once: that is the other end, not
+// the members, and none is buried; the transfer goes on after the pause.
+func TestOtherEndPaused(t *testing.T) {
+	defer wire.reset()
+	h := newHarness(t, Config{Stall: 100 * time.Millisecond, Quiet: 10 * time.Second}, 6, nil, nil)
+	c := h.carry()
+	defer c.Close()
+	roundTrip(t, c, 1<<20)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		roundTrip(t, c, 8<<20)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	wire.freeze(true)
+	time.Sleep(1500 * time.Millisecond)
+	wire.freeze(false)
+	<-done
+	if st := h.entry.Session().Stats(); st.MembersStall != 0 || st.MembersBroken != 0 {
+		t.Fatalf("the entry buried members: %+v", st)
+	}
+	if _, st := h.exit.Stats(); st.MembersStall != 0 {
+		t.Fatalf("the exit buried members for the entry's pause: %+v", st)
+	}
+	if d := h.dials.Load(); d != 6 {
+		t.Fatalf("%d dials for 6 members: some were replaced", d)
+	}
+}
+
+// TestPathCut: the path drops every member at once. Nobody shows progress,
+// so it is Quiet, not Stall, that ends them; the entry dials new ones and
+// the transfer completes on them.
+func TestPathCut(t *testing.T) {
+	defer wire.reset()
+	h := newHarness(t, Config{Stall: 100 * time.Millisecond, Quiet: 300 * time.Millisecond}, 4, nil, nil)
+	c := h.carry()
+	defer c.Close()
+	roundTrip(t, c, 1<<20)
+	wire.cut()
+	roundTrip(t, c, 4<<20)
+	// Idle members owe nothing until their next keepalive ping, so the last
+	// of them end up to Keepalive + Quiet after the cut.
+	waitFor(t, func() bool { return h.entry.Session().Stats().MembersStall >= 4 })
+	waitFor(t, func() bool { return h.entry.Session().Stats().Members == 4 })
+	if d := h.dials.Load(); d < 8 {
+		t.Fatalf("%d dials: the cut members were not replaced", d)
+	}
+}
+
+// TestOwnPause: a late tick is the session's own pause. Members that owe
+// get a fresh start from it instead of being buried for the time the box
+// did not run; one that stays silent after it ends by Quiet as usual.
+func TestOwnPause(t *testing.T) {
+	s := newSession(Config{Stall: 100 * time.Millisecond, Quiet: time.Second}, nil)
+	defer s.Close()
+	var told atomic.Int64
+	s.onPause = func(d time.Duration) { told.Store(int64(d)) }
+	a, b := net.Pipe()
+	go func() { _, _ = io.Copy(io.Discard, b) }() // the other end reads, never answers
+	go func() { _ = s.Serve(a) }()
+	waitFor(t, func() bool { return s.Stats().Members == 1 })
+
+	t0 := time.Now()
+	s.mu.Lock()
+	for m := range s.members {
+		m.ping, m.pingSent = 1, t0 // a ping owed since t0
+	}
+	s.mu.Unlock()
+	// run ticks the clock on time from one moment to another.
+	run := func(from, to time.Duration) {
+		for d := from; d <= to; d += tick {
+			s.tick(t0.Add(d))
+		}
+	}
+	run(0, 50*time.Millisecond)
+	s.tick(t0.Add(2 * time.Second)) // the box was not run for 2 s
+	if st := s.Stats(); st.Members != 1 || st.Pauses != 1 || st.Paused != 1950*time.Millisecond {
+		t.Fatalf("after its own pause: %+v", st)
+	}
+	waitFor(t, func() bool { return told.Load() == int64(1950*time.Millisecond) })
+	run(2*time.Second, 2*time.Second+900*time.Millisecond)
+	if st := s.Stats(); st.Members != 1 {
+		t.Fatalf("buried within Quiet of the pause: %+v", st)
+	}
+	run(2*time.Second+925*time.Millisecond, 2*time.Second+1100*time.Millisecond)
+	if st := s.Stats(); st.Members != 0 || st.MembersStall != 1 {
+		t.Fatalf("silent past Quiet and still up: %+v", st)
 	}
 }
