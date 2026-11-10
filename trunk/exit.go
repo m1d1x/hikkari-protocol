@@ -17,6 +17,7 @@ type Exit struct {
 
 	mu       sync.Mutex
 	sessions map[SessionID]*exitSession
+	draining bool
 }
 
 type exitSession struct {
@@ -61,6 +62,9 @@ func (x *Exit) ServeMember(conn io.ReadWriteCloser) error {
 			return err
 		}
 		x.sessions[id] = es
+		if x.draining {
+			es.s.Drain()
+		}
 	}
 	x.mu.Unlock()
 	if _, err := conn.Write(appendHello(nil, id, es.epoch)); err != nil {
@@ -99,6 +103,29 @@ func (x *Exit) Run(ctx context.Context) {
 			x.mu.Unlock()
 		}
 	}
+}
+
+// Drain tells every session's entry that this process is being replaced
+// (Session.Drain): they keep what they carry here and open new sessions for
+// everything new, which reach the next process.
+func (x *Exit) Drain() {
+	x.mu.Lock()
+	x.draining = true
+	list := make([]*Session, 0, len(x.sessions))
+	for _, es := range x.sessions {
+		list = append(list, es.s)
+	}
+	x.mu.Unlock()
+	for _, s := range list {
+		s.Drain()
+	}
+}
+
+// Sessions is how many sessions the exit holds now.
+func (x *Exit) Sessions() int {
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	return len(x.sessions)
 }
 
 // Stats sums the counters of the sessions up now.

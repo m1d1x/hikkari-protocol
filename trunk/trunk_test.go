@@ -622,3 +622,41 @@ func TestOwnPause(t *testing.T) {
 		t.Fatalf("silent past Quiet and still up: %+v", st)
 	}
 }
+
+// TestExitDrain: the exit's process is replaced without a cut. Its drain
+// moves everything new to a new session that reaches the new process, the
+// old session's stream goes on to its end, and then the old session closes,
+// which lets the old process go.
+func TestExitDrain(t *testing.T) {
+	retireEvery = 20 * time.Millisecond
+	defer func() { retireEvery = 5 * time.Second }()
+	h := newHarness(t, Config{}, 4, nil, nil)
+	c1 := h.carry()
+	defer c1.Close()
+	roundTrip(t, c1, 1<<20)
+
+	old := h.exit
+	next := NewExit(Config{}, h.local)
+	exitCtx, exitCancel := context.WithCancel(context.Background())
+	defer exitCancel()
+	go next.Run(exitCtx)
+	h.exit = next // new members reach the new process
+	old.Drain()
+	waitFor(t, func() bool { return h.entry.Retired() == 1 && h.entry.Session().Stats().Members == 4 })
+
+	roundTrip(t, c1, 1<<20) // the old session's stream goes on
+	c2 := h.carry()
+	defer c2.Close()
+	roundTrip(t, c2, 1<<20)
+	if _, st := next.Stats(); st.Streams != 1 {
+		t.Fatalf("new process carries %d streams, want the new one", st.Streams)
+	}
+	if _, st := old.Stats(); st.Streams != 1 || st.StreamsReset != 0 {
+		t.Fatalf("old process: %+v", st)
+	}
+
+	c1.Close()
+	waitFor(t, func() bool { return h.entry.Retired() == 0 })
+	waitFor(t, func() bool { _, st := old.Stats(); return st.Members == 0 })
+	roundTrip(t, c2, 1<<20)
+}

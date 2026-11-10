@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -18,54 +19,173 @@ type Dial func(ctx context.Context, localPort int) (io.ReadWriteCloser, error)
 
 // Entry keeps an entry's pool: Members members up at all times, each on a
 // source port the path has not killed before.
+//
+// # Generations
+//
+// When the exit says it drains (its process is being replaced without a cut,
+// fDrain), the entry opens a new session, with a new id and a full pool of its
+// own, whose members reach the exit's new process; every new stream and flow
+// goes there (Session). The old session is retired: it keeps the members it
+// has, replaces none, and is closed when it carries nothing more or after
+// RetireLimit. Its members ending is what lets the exit's old process go.
 type Entry struct {
-	s       *Session
-	id      SessionID
+	cfg     Config
 	members int
 	dial    Dial
 	ports   *PortBook
 	logf    func(string, ...any)
 	spread  time.Duration
 
+	mu      sync.Mutex
+	cur     *generation
+	run     context.Context
+	slots   sync.WaitGroup
+	retired []*generation
+}
+
+// generation is one session of the entry and its pool.
+type generation struct {
+	s       *Session
+	id      SessionID
+	retired atomic.Bool
+	since   time.Time // when it was retired
+
 	mu    sync.Mutex
 	epoch Epoch
 	known bool
 }
 
+// RetireLimit closes a retired session that still carries something: the
+// exit's old process gives up its sessions after as long (edge handoff.go).
+var RetireLimit = 30 * time.Minute
+
+// retireEvery is how often retired sessions are looked at.
+var retireEvery = 5 * time.Second
+
 // NewEntry makes an entry for members members. logf gets one line per
 // member that could not come up or died, one per epoch of the exit (the
 // first, and every change: the exit restarted and the streams were reset),
-// and one per pause of the entry itself (the box did not run it); no client
-// data in any.
+// one per drain of the exit, and one per pause of the entry itself (the box
+// did not run it); no client data in any.
 func NewEntry(cfg Config, members int, dial Dial, ports *PortBook, logf func(string, ...any)) (*Entry, error) {
 	if members < 1 {
 		return nil, errors.New("trunk: an entry needs at least one member")
 	}
-	e := &Entry{s: newSession(cfg, nil), members: members, dial: dial, ports: ports, logf: logf, spread: replaceSpread}
-	if _, err := rand.Read(e.id[:]); err != nil {
+	e := &Entry{cfg: cfg, members: members, dial: dial, ports: ports, logf: logf, spread: replaceSpread}
+	g, err := e.newGeneration()
+	if err != nil {
 		return nil, err
 	}
-	e.s.onPause = func(d time.Duration) { logf("trunk: paused %s", d.Round(time.Millisecond)) }
-	go e.s.clock()
+	e.cur = g
 	return e, nil
 }
 
-// Session is where clients' connections and datagrams go.
-func (e *Entry) Session() *Session { return e.s }
+func (e *Entry) newGeneration() (*generation, error) {
+	g := &generation{s: newSession(e.cfg, nil)}
+	if _, err := rand.Read(g.id[:]); err != nil {
+		return nil, err
+	}
+	g.s.onPause = func(d time.Duration) { e.logf("trunk: paused %s", d.Round(time.Millisecond)) }
+	g.s.onDrain = func() { e.drained(g) }
+	go g.s.clock()
+	return g, nil
+}
+
+// Session is where new clients' connections and datagrams go: the current
+// generation's. Ask for each new connection or flow; one that started on a
+// retired session stays there.
+func (e *Entry) Session() *Session {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cur.s
+}
+
+// Retired is how many retired sessions still carry something.
+func (e *Entry) Retired() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.retired)
+}
 
 // Ports is the entry's book of source ports.
 func (e *Entry) Ports() *PortBook { return e.ports }
 
-// Run keeps the pool up until ctx ends, then closes the session.
+// Run keeps the pool up until ctx ends, then closes the sessions.
 func (e *Entry) Run(ctx context.Context) {
-	var wg sync.WaitGroup
-	for i := 0; i < e.members; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); e.slot(ctx, i) }()
+	e.mu.Lock()
+	e.run = ctx
+	g := e.cur
+	e.startLocked(g)
+	e.mu.Unlock()
+	t := time.NewTicker(retireEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			e.mu.Lock()
+			all := append([]*generation{e.cur}, e.retired...)
+			e.mu.Unlock()
+			for _, g := range all {
+				g.s.Close()
+			}
+			e.slots.Wait()
+			return
+		case <-t.C:
+			e.closeRetired(false)
+		}
 	}
-	<-ctx.Done()
-	e.s.Close()
-	wg.Wait()
+}
+
+func (e *Entry) startLocked(g *generation) {
+	for i := 0; i < e.members; i++ {
+		e.slots.Add(1)
+		go func() { defer e.slots.Done(); e.slot(e.run, g, i) }()
+	}
+}
+
+// drained answers the exit's fDrain on g: a new generation takes everything
+// new, and g retires.
+func (e *Entry) drained(g *generation) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if g != e.cur || e.run == nil || e.run.Err() != nil {
+		return
+	}
+	next, err := e.newGeneration()
+	if err != nil {
+		e.logf("trunk: exit drains, no new session: %v", err)
+		return
+	}
+	g.retired.Store(true)
+	g.since = time.Now()
+	e.retired = append(e.retired, g)
+	e.cur = next
+	e.startLocked(next)
+	st := g.s.Stats()
+	e.logf("trunk: exit drains: new session, the old one keeps %d stream(s) and %d flow(s)", st.Streams, st.Flows)
+}
+
+// closeRetired closes the retired sessions that carry nothing or have
+// outlived RetireLimit.
+func (e *Entry) closeRetired(force bool) {
+	e.mu.Lock()
+	keep := e.retired[:0]
+	var done []*generation
+	for _, g := range e.retired {
+		if force || !g.s.Busy() || time.Since(g.since) > RetireLimit {
+			done = append(done, g)
+		} else {
+			keep = append(keep, g)
+		}
+	}
+	e.retired = keep
+	e.mu.Unlock()
+	for _, g := range done {
+		if st := g.s.Stats(); st.Streams > 0 || st.Flows > 0 {
+			e.logf("trunk: retired session closed after %s with %d stream(s) and %d flow(s)", RetireLimit, st.Streams, st.Flows)
+		}
+		g.s.Close()
+	}
 }
 
 // replaceSpread spreads the dials that replace dead members: members that
@@ -73,11 +193,11 @@ func (e *Entry) Run(ctx context.Context) {
 // address in one second.
 var replaceSpread = time.Second
 
-func (e *Entry) slot(ctx context.Context, n int) {
+func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 	backoff := time.Duration(0)
 	stalls := 0 // in a row
 	replace := false
-	for ctx.Err() == nil {
+	for ctx.Err() == nil && !g.retired.Load() {
 		wait := backoff
 		if replace && e.spread > 0 {
 			r, _ := rand.Int(rand.Reader, big.NewInt(int64(e.spread)))
@@ -87,6 +207,9 @@ func (e *Entry) slot(ctx context.Context, n int) {
 			select {
 			case <-time.After(wait):
 			case <-ctx.Done():
+				return
+			}
+			if g.retired.Load() {
 				return
 			}
 		}
@@ -111,7 +234,7 @@ func (e *Entry) slot(ctx context.Context, n int) {
 			grow()
 			continue
 		}
-		epoch, err := exchangeHello(conn, e.id)
+		epoch, err := exchangeHello(conn, g.id)
 		if err != nil {
 			conn.Close()
 			release()
@@ -122,22 +245,22 @@ func (e *Entry) slot(ctx context.Context, n int) {
 			grow()
 			continue
 		}
-		e.mu.Lock()
+		g.mu.Lock()
 		switch {
-		case !e.known:
+		case !g.known:
 			e.logf("trunk: exit epoch %x", epoch[:])
-		case epoch != e.epoch:
+		case epoch != g.epoch:
 			// The exit restarted: what it held of our streams is gone.
-			e.logf("trunk: exit epoch %x after %x: streams reset", epoch[:], e.epoch[:])
-			e.s.Reset()
+			e.logf("trunk: exit epoch %x after %x: streams reset", epoch[:], g.epoch[:])
+			g.s.Reset()
 		}
-		e.epoch, e.known = epoch, true
-		e.mu.Unlock()
+		g.epoch, g.known = epoch, true
+		g.mu.Unlock()
 		started := time.Now()
-		err = e.s.Serve(conn)
+		err = g.s.Serve(conn)
 		release()
 		replace = true
-		if err != nil && ctx.Err() == nil {
+		if err != nil && ctx.Err() == nil && !g.retired.Load() {
 			e.logf("trunk: member %d: down after %s: %v", n, time.Since(started).Round(time.Second), err)
 		}
 		switch {

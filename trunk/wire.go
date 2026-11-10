@@ -20,6 +20,7 @@ import (
 //	dgram  7 | stream u32 | seq u32 | port u16 | n u16 | n bytes
 //	ping   8 | token u64
 //	pong   9 | token u64
+//	drain  10
 //
 // A stream is one client TCP connection: its bytes are numbered by offset, so
 // a chunk sent again on another member lands in the same place, and an ack
@@ -27,7 +28,10 @@ import (
 // go (credit), and which chunk it answers (got, the chunk's offset; all ones
 // for none). got confirms a chunk past a hole: the member that carried it did
 // its job, whatever happened to the chunk before it. A dgram is one client UDP packet with its own sequence: no
-// ack, no resend, the receiver drops copies.
+// ack, no resend, the receiver drops copies. A drain (exit to entry) says the
+// exit's process is being replaced: it keeps what it has, and the entry opens
+// a new session for everything new (Entry), whose members reach the new
+// process.
 
 const (
 	fHello byte = 1 + iota
@@ -39,6 +43,7 @@ const (
 	fDgram
 	fPing
 	fPong
+	fDrain
 )
 
 const (
@@ -124,6 +129,8 @@ func appendDgram(b []byte, stream, seq uint32, port uint16, p []byte) []byte {
 	return append(b, p...)
 }
 
+func appendDrain(b []byte) []byte { return append(b, fDrain) }
+
 func appendPing(b []byte, typ byte, token uint64) []byte {
 	b = append(b, typ)
 	return binary.BigEndian.AppendUint64(b, token)
@@ -139,6 +146,9 @@ func readFrame(r *bufio.Reader) (frame, error) {
 		return f, err
 	}
 	f.typ = typ
+	if typ == fDrain {
+		return f, nil
+	}
 	var head [29]byte
 	need := map[byte]int{fHello: 28, fOpen: 6, fData: 14, fAck: 29, fFin: 12, fRst: 4, fDgram: 12, fPing: 8, fPong: 8}[typ]
 	if need == 0 {

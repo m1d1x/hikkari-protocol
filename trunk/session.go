@@ -166,6 +166,12 @@ type Session struct {
 	lastTick, resumed time.Time
 	onPause           func(time.Duration)
 	paused            time.Duration
+	// draining is the exit's: its process is being replaced, and every
+	// member, now and joining, is told so. onDrain is the entry's: told,
+	// once, that the exit drains.
+	draining bool
+	onDrain  func()
+	drained  bool
 
 	joined, stalls, broken, resent       atomic.Int64
 	pauses                               atomic.Int64
@@ -325,6 +331,9 @@ func (s *Session) Serve(conn io.ReadWriteCloser) error {
 	s.drainPendingLocked()
 	for _, st := range s.streams {
 		s.ackLocked(st, m)
+	}
+	if s.draining {
+		m.send(appendDrain(nil), true)
 	}
 	s.cond.Broadcast()
 	s.mu.Unlock()
@@ -597,7 +606,34 @@ func (s *Session) handle(m *member, f frame) {
 		}
 	case fDgram:
 		s.dgramLocked(f)
+	case fDrain:
+		if s.onDrain != nil && !s.drained {
+			s.drained = true
+			go s.onDrain()
+		}
 	}
+}
+
+// Drain tells the other end, on every member, that this end's process is
+// being replaced (the exit's, in a hitless rollout): the session goes on
+// carrying what it has, and the entry sends nothing new to it.
+func (s *Session) Drain() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.draining {
+		return
+	}
+	s.draining = true
+	for m := range s.members {
+		m.send(appendDrain(nil), true)
+	}
+}
+
+// Busy says whether the session still carries a stream or a flow.
+func (s *Session) Busy() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.streams) > 0 || len(s.flows) > 0
 }
 
 // ── streams ──
