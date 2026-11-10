@@ -66,6 +66,11 @@ func (x *Exit) ServeMember(conn io.ReadWriteCloser) error {
 			es.s.Drain()
 		}
 	}
+	if b[21]&capObserve != 0 {
+		es.s.mu.Lock()
+		es.s.peerObserve = true
+		es.s.mu.Unlock()
+	}
 	x.mu.Unlock()
 	if _, err := conn.Write(appendHello(nil, id, es.epoch)); err != nil {
 		conn.Close()

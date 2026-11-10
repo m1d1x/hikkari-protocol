@@ -117,8 +117,18 @@ type harness struct {
 
 func newHarness(t *testing.T, cfg Config, members int, budget func(int64) int64, serve func(net.Conn)) *harness {
 	t.Helper()
-	h := &harness{local: newLoopLocal(t, serve), budget: budget}
-	h.exit = NewExit(cfg, h.local)
+	return newHarnessLocal(t, cfg, cfg, members, budget, newLoopLocal(t, serve))
+}
+
+// newHarnessLocal is newHarness with each end's own config and the exit's
+// Local given.
+func newHarnessLocal(t *testing.T, cfg, exitCfg Config, members int, budget func(int64) int64, local Local) *harness {
+	t.Helper()
+	h := &harness{budget: budget}
+	if l, ok := local.(*loopLocal); ok {
+		h.local = l
+	}
+	h.exit = NewExit(exitCfg, local)
 	ports, err := NewPortBook(20000, 30000, time.Minute)
 	if err != nil {
 		t.Fatal(err)

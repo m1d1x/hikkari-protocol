@@ -63,6 +63,11 @@ type Config struct {
 	// Zero is DefaultQuiet on the entry, ExitQuiet on the exit (only the
 	// entry can dial a member, so the exit waits for it).
 	Quiet time.Duration
+	// Observe gets the reports of observed streams and flows (observe.go):
+	// one at the mark, one at the end. Called from one goroutine of the
+	// session, in order; nil reports nothing. On the entry it also says
+	// to the exit, in the hello, that the entry reads observe frames.
+	Observe func(Report)
 }
 
 const (
@@ -127,6 +132,7 @@ type Stats struct {
 	DgramsOut     int64 // datagrams read from local sockets
 	DgramsIn      int64 // datagrams written to local sockets
 	DgramsCopy    int64 // datagram copies dropped as already seen
+	ObsDropped    int64 // reports dropped: Observe was too slow
 }
 
 // Local is how the exit reaches what a stream or a flow asks for: the relay
@@ -172,6 +178,11 @@ type Session struct {
 	draining bool
 	onDrain  func()
 	drained  bool
+	// peerObserve is the exit's: the entry's hello said it reads observe
+	// frames. reports queue Config.Observe's reports (observe.go).
+	peerObserve bool
+	reports     chan Report
+	obsDropped  atomic.Int64
 
 	joined, stalls, broken, resent       atomic.Int64
 	pauses                               atomic.Int64
@@ -216,9 +227,11 @@ func (s *Session) Close() {
 		s.dropMemberLocked(m, false)
 	}
 	for _, st := range s.streams {
+		st.endWhy = EndSession
 		s.endStreamLocked(st, false)
 	}
 	for _, f := range s.flows {
+		f.endWhy = EndSession
 		s.endFlowLocked(f)
 	}
 	s.cond.Broadcast()
@@ -232,9 +245,11 @@ func (s *Session) Reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, st := range s.streams {
+		st.endWhy = EndEpoch
 		s.endStreamLocked(st, false)
 	}
 	for _, f := range s.flows {
+		f.endWhy = EndEpoch
 		s.endFlowLocked(f)
 	}
 	s.pending = nil
@@ -251,6 +266,7 @@ func (s *Session) Stats() Stats {
 		Streams: streams, StreamsOpened: s.opened.Load(), StreamsReset: s.resets.Load(),
 		Up: s.up.Load(), Down: s.down.Load(),
 		Flows: flows, DgramsOut: s.dgramsOut.Load(), DgramsIn: s.dgramsIn.Load(), DgramsCopy: s.dgramsCopy.Load(),
+		ObsDropped: s.obsDropped.Load(),
 	}
 }
 
@@ -448,8 +464,16 @@ func (s *Session) dropMemberLocked(m *member, stalled bool) {
 		}
 		return owed[i].off < owed[j].off || owed[i].off == owed[j].off && owed[i].kind < owed[j].kind
 	})
+	hit := map[*stream]bool{}
 	for _, seg := range owed {
 		seg.m = nil
+		if seg.kind == fData {
+			seg.st.resent++
+		}
+		if !hit[seg.st] {
+			hit[seg.st] = true
+			seg.st.deaths++
+		}
 	}
 	s.resent.Add(int64(len(owed)))
 	s.pending = append(owed, s.pending...)
@@ -553,6 +577,7 @@ func (s *Session) tick(now time.Time) {
 	}
 	for _, f := range s.flows {
 		if now.Sub(f.used) > s.cfg.FlowIdle {
+			f.endWhy = EndIdle
 			s.endFlowLocked(f)
 		}
 	}
@@ -602,10 +627,15 @@ func (s *Session) handle(m *member, f frame) {
 		s.finLocked(m, f)
 	case fRst:
 		if st := s.streams[f.stream]; st != nil {
+			st.endWhy = EndPeer
 			s.endStreamLocked(st, false)
 		}
 	case fDgram:
 		s.dgramLocked(f)
+	case fObserve:
+		if s.local == nil {
+			s.observedLocked(f)
+		}
 	case fDrain:
 		if s.onDrain != nil && !s.drained {
 			s.drained = true
@@ -647,6 +677,9 @@ type segment struct {
 	data []byte
 	m    *member // the member carrying it now; nil while pending
 	done bool
+	// first is when a chunk first left: how long it waits for its
+	// confirmation is the trunk's delay for this stream.
+	first time.Time
 }
 
 type stream struct {
@@ -674,11 +707,24 @@ type stream struct {
 	writeDone bool // local has seen everything (and the FIN) the other end sent
 
 	ended bool
+
+	// What an observed stream reports (observe.go); kept for every stream,
+	// told only for one marked.
+	opened   time.Time
+	obs      uint64
+	chunks   int64
+	resent   int64
+	carriers map[*member]struct{}
+	deaths   int
+	maxWait  time.Duration
+	endWhy   string
+	tag      string
 }
 
 func (s *Session) newStreamLocked(id uint32, port uint16, local net.Conn) *stream {
 	st := &stream{id: id, port: port, local: local, ready: make(chan struct{}), gone: make(chan struct{}), credit: uint64(s.cfg.Window),
-		ahead: map[uint64][]byte{}, finAt: -1, advertise: uint64(s.cfg.Window), wake: make(chan struct{}, 1)}
+		ahead: map[uint64][]byte{}, finAt: -1, advertise: uint64(s.cfg.Window), wake: make(chan struct{}, 1),
+		opened: time.Now(), carriers: map[*member]struct{}{}}
 	if local != nil {
 		close(st.ready)
 	}
@@ -732,13 +778,14 @@ func (s *Session) openLocked(m *member, f frame) {
 	}
 	s.ackLocked(st, m)
 	go func() {
-		c, err := s.local.DialStream(s.ctx, f.port)
+		c, err := s.local.DialStream(withTarget(s.ctx, Target{s, ObsStream, f.stream}), f.port)
 		s.mu.Lock()
 		if err != nil || st.ended {
 			if c != nil {
 				c.Close()
 			}
 			if !st.ended {
+				st.endWhy = EndOpenFail
 				s.endStreamLocked(st, true)
 			}
 			s.mu.Unlock()
@@ -806,6 +853,11 @@ func (s *Session) transmitLocked(seg *segment, m *member) {
 		b = appendOpen(nil, st.id, st.port)
 	case fData:
 		b = appendData(make([]byte, 0, 15+len(seg.data)), st.id, seg.off, seg.data)
+		if seg.first.IsZero() {
+			seg.first = time.Now()
+			st.chunks++
+		}
+		st.carriers[m] = struct{}{}
 	case fFin:
 		b = appendFin(nil, st.id, seg.off)
 	}
@@ -824,6 +876,11 @@ func (s *Session) releaseLocked(seg *segment) {
 		return
 	}
 	seg.done = true
+	if !seg.first.IsZero() {
+		if w := time.Since(seg.first); w > seg.st.maxWait {
+			seg.st.maxWait = w
+		}
+	}
 	if m := seg.m; m != nil && !m.dead {
 		delete(m.segs, seg)
 		m.inflight -= len(seg.data)
@@ -1069,6 +1126,7 @@ func (s *Session) maybeFinishLocked(st *stream) {
 	if st.ended || !st.finDone || !st.writeDone {
 		return
 	}
+	st.endWhy = EndFin
 	s.endStreamLocked(st, false)
 }
 
@@ -1078,6 +1136,12 @@ func (s *Session) endStreamLocked(st *stream, reset bool) {
 		return
 	}
 	st.ended = true
+	if st.endWhy == "" {
+		st.endWhy = EndSession
+		if reset {
+			st.endWhy = EndLocal
+		}
+	}
 	if reset {
 		s.resets.Add(1)
 		sent := 0
@@ -1104,6 +1168,10 @@ func (s *Session) endStreamLocked(st *stream, reset bool) {
 	}
 	delete(s.streams, st.id)
 	s.closed[st.id] = time.Now()
+	if st.obs != 0 {
+		s.reportLocked(s.streamReportLocked(st, PhaseEnd))
+	}
+	st.carriers = nil
 	s.cond.Broadcast()
 }
 

@@ -21,6 +21,7 @@ import (
 //	ping   8 | token u64
 //	pong   9 | token u64
 //	drain  10
+//	observe 11 | kind u8 | stream u32 | id u64   (exit → entry)
 //
 // A stream is one client TCP connection: its bytes are numbered by offset, so
 // a chunk sent again on another member lands in the same place, and an ack
@@ -31,7 +32,9 @@ import (
 // ack, no resend, the receiver drops copies. A drain (exit to entry) says the
 // exit's process is being replaced: it keeps what it has, and the entry opens
 // a new session for everything new (Entry), whose members reach the new
-// process.
+// process. An observe (exit to entry) marks a stream or flow of a tester for
+// both ends to report (observe.go); the exit sends it only to an entry whose
+// hello said it reads it.
 
 const (
 	fHello byte = 1 + iota
@@ -44,6 +47,7 @@ const (
 	fPing
 	fPong
 	fDrain
+	fObserve
 )
 
 const (
@@ -51,6 +55,10 @@ const (
 	// MaxPayload bounds a data or dgram frame's bytes (n is u16).
 	MaxPayload = 65535
 	ackFin     = 1
+	// capObserve, in the first byte of the epoch an entry's hello carries
+	// (the entry has no epoch of its own; an exit that predates it reads none
+	// of the field), says the entry reads observe frames.
+	capObserve = 1
 )
 
 // SessionID names one entry's trunk to one exit; every member of the pool
@@ -131,6 +139,12 @@ func appendDgram(b []byte, stream, seq uint32, port uint16, p []byte) []byte {
 
 func appendDrain(b []byte) []byte { return append(b, fDrain) }
 
+func appendObserve(b []byte, kind ObsKind, id uint32, obs uint64) []byte {
+	b = append(b, fObserve, byte(kind))
+	b = binary.BigEndian.AppendUint32(b, id)
+	return binary.BigEndian.AppendUint64(b, obs)
+}
+
 func appendPing(b []byte, typ byte, token uint64) []byte {
 	b = append(b, typ)
 	return binary.BigEndian.AppendUint64(b, token)
@@ -150,7 +164,7 @@ func readFrame(r *bufio.Reader) (frame, error) {
 		return f, nil
 	}
 	var head [29]byte
-	need := map[byte]int{fHello: 28, fOpen: 6, fData: 14, fAck: 29, fFin: 12, fRst: 4, fDgram: 12, fPing: 8, fPong: 8}[typ]
+	need := map[byte]int{fHello: 28, fOpen: 6, fData: 14, fAck: 29, fFin: 12, fRst: 4, fDgram: 12, fPing: 8, fPong: 8, fObserve: 13}[typ]
 	if need == 0 {
 		return f, fmt.Errorf("trunk: unknown frame %d", typ)
 	}
@@ -173,6 +187,11 @@ func readFrame(r *bufio.Reader) (frame, error) {
 	switch typ {
 	case fPing, fPong:
 		f.token = binary.BigEndian.Uint64(h)
+		return f, nil
+	case fObserve:
+		f.flags = h[0]
+		f.stream = binary.BigEndian.Uint32(h[1:])
+		f.token = binary.BigEndian.Uint64(h[5:])
 		return f, nil
 	}
 	f.stream = binary.BigEndian.Uint32(h)

@@ -234,7 +234,7 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 			grow()
 			continue
 		}
-		epoch, err := exchangeHello(conn, g.id)
+		epoch, err := exchangeHello(conn, g.id, e.cfg.Observe != nil)
 		if err != nil {
 			conn.Close()
 			release()
@@ -290,11 +290,17 @@ var ErrSilent = errors.New("trunk: no answer")
 const helloTimeout = 5 * time.Second
 
 // exchangeHello says the session's id and reads the exit's epoch.
-func exchangeHello(conn io.ReadWriteCloser, id SessionID) (Epoch, error) {
+// observe says the entry reads observe frames (capObserve in the epoch it
+// sends, which is otherwise zero: an entry has no epoch).
+func exchangeHello(conn io.ReadWriteCloser, id SessionID, observe bool) (Epoch, error) {
 	var epoch Epoch
 	timer := time.AfterFunc(helloTimeout, func() { conn.Close() })
 	defer timer.Stop()
-	if _, err := conn.Write(appendHello(nil, id, Epoch{})); err != nil {
+	var caps Epoch
+	if observe {
+		caps[0] = capObserve
+	}
+	if _, err := conn.Write(appendHello(nil, id, caps)); err != nil {
 		return epoch, err
 	}
 	var b [29]byte

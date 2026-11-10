@@ -39,9 +39,12 @@ Both ways, big-endian:
 | rst 6 | stream u32 |
 | dgram 7 | stream u32, seq u32, port u16, n u16, n bytes |
 | ping 8, pong 9 | token u64 |
+| drain 10 | (exit to entry) |
+| observe 11 | kind u8 (1 stream, 2 flow), stream u32, id u64 (exit to entry) |
 
 The entry's first frame on a member is hello with its session id (random per entry run) and a zero epoch; the exit answers
-hello with the same id and the epoch of its session (random per exit session). An epoch that changes under a session means the
+hello with the same id and the epoch of its session (random per exit session). The entry has no epoch: the first byte of
+the one it sends carries its capabilities (bit 1: it reads observe frames), the rest is zero. An epoch that changes under a session means the
 exit lost its streams: the entry resets its own.
 
 ## Streams
@@ -80,3 +83,15 @@ A flow whose sender already copies its datagrams goes on one member: Hikkari v1.
 second copy on the trunk would make four of every packet. The entry chooses per listened port (the hub sets one copy on ports
 that reach the exit's Hikkari relay). The exit answers a flow as the entry sends it: on one member until a copy of the flow's
 datagrams arrives, then on 2.
+
+## Observation
+
+Testers are observed in full, other users not at all (owner's decision 10.11; hikkari-client
+`plans/2026-11-10-hikkari-observability-plan.md`, этап 1б). Neither end knows whose a stream or flow is: the client's TLS
+crosses the entry. The exit's relay knows the key. For a tester's key it marks the stream or flow its connection came by:
+the exit draws a random observation id, reports the stream itself and sends `observe` on two members, only to an entry
+whose hello said it reads them. Each end reports a marked stream or flow at the mark (what it did so far) and at its end:
+bytes each way, chunks, chunks sent again, members that carried and that died owing it, the longest wait for a chunk's
+confirmation, datagrams each way and copies dropped, how it ended. The entry adds its client's TCP numbers. The hub joins
+the ends by the id. Every stream keeps these counters in memory for its own sake; one never marked is reported by neither
+end.

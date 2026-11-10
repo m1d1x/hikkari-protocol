@@ -25,6 +25,13 @@ type flow struct {
 	// copies is how many members carry each datagram of the flow. The
 	// entry's is chosen at open; the exit's follows the entry's (dgramLocked).
 	copies int
+
+	// What an observed flow reports (observe.go).
+	opened          time.Time
+	obs             uint64
+	out, in, copied int64
+	endWhy          string
+	tag             string
 }
 
 // Flow is the entry's handle on one datagram flow.
@@ -50,7 +57,7 @@ func (s *Session) OpenFlowCopies(port uint16, copies int, deliver func([]byte), 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies}
+	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now()}
 	if s.shutdown {
 		f.ended = true
 	} else {
@@ -79,6 +86,7 @@ func (h *Flow) Send(p []byte) bool {
 
 func (s *Session) sendDgramLocked(f *flow, p []byte) {
 	f.seq++
+	f.out++
 	b := appendDgram(make([]byte, 0, 13+len(p)), f.id, f.seq, f.port, p)
 	// The Copies least loaded members; a datagram is never owed, so a member
 	// carrying it is not held to account for it.
@@ -114,18 +122,19 @@ func (s *Session) dgramLocked(fr frame) {
 		if s.local == nil {
 			return // the entry's flow is over
 		}
-		conn, err := s.local.DialFlow(s.ctx, fr.port)
+		conn, err := s.local.DialFlow(withTarget(s.ctx, Target{s, ObsFlow, fr.stream}), fr.port)
 		if err != nil {
 			return
 		}
 		// The exit answers a flow as the entry sends it: on one member
 		// until a copy arrives, then on Copies.
-		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1}
+		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1, opened: time.Now()}
 		s.flows[f.id] = f
 		go s.readFlow(f)
 	}
 	if f.replay.seen(fr.seq) {
 		s.dgramsCopy.Add(1)
+		f.copied++
 		if s.local != nil {
 			f.copies = s.cfg.Copies
 		}
@@ -133,6 +142,7 @@ func (s *Session) dgramLocked(fr frame) {
 	}
 	f.used = time.Now()
 	s.dgramsIn.Add(1)
+	f.in++
 	if f.conn != nil {
 		_, _ = f.conn.Write(fr.payload)
 	} else if f.deliver != nil {
@@ -147,6 +157,9 @@ func (s *Session) readFlow(f *flow) {
 		n, err := f.conn.Read(buf)
 		if err != nil {
 			s.mu.Lock()
+			if f.endWhy == "" {
+				f.endWhy = EndLocal
+			}
 			s.endFlowLocked(f)
 			s.mu.Unlock()
 			return
@@ -169,6 +182,12 @@ func (s *Session) endFlowLocked(f *flow) {
 	}
 	f.ended = true
 	delete(s.flows, f.id)
+	if f.endWhy == "" {
+		f.endWhy = EndSession
+	}
+	if f.obs != 0 {
+		s.reportLocked(s.flowReportLocked(f, PhaseEnd))
+	}
 	if f.conn != nil {
 		_ = f.conn.Close()
 	}
