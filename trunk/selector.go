@@ -36,7 +36,7 @@ type SelectorConfig struct {
 	RedSilence time.Duration // 500 ms
 	VoiceSpan  time.Duration // 10 min of calls
 	BulkSpan   time.Duration // 1 h of downloads
-	Hold       time.Duration // 3 min a challenger must stay better
+	Hold       time.Duration // 5 min a challenger must stay better
 	// VoiceMargin is how many red minutes plus pauses over 60 ms a
 	// challenger must have fewer of, over VoiceSpan, to take voice.
 	VoiceMargin int
@@ -49,8 +49,13 @@ const (
 	DefaultRedSilence  = 500 * time.Millisecond
 	DefaultVoiceSpan   = 10 * time.Minute
 	DefaultBulkSpan    = time.Hour
-	DefaultHold        = 3 * time.Minute
-	DefaultVoiceMargin = 3
+	// The margins and the hold from the stand's night (11.11 01:00–05:46
+	// UTC, hikkari-client plans/research/2026-11-11-trunk-selector-thresholds.md):
+	// voice moved between wires as good as each other did not lower its red
+	// minutes, only shook the call; a 1 MiB download measures a round trip
+	// or two of slow start, its medians of equal wires differ by up to 12%.
+	DefaultHold        = 5 * time.Minute
+	DefaultVoiceMargin = 5
 	DefaultBulkMargin  = 0.25
 	// A minute of a call is red when it lost more than this share of its
 	// datagrams or paused longer than callGapWord (a word).

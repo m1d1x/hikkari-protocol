@@ -142,8 +142,24 @@ owed progress for 500 ms while another wire proved the path alive in that time; 
 owing together is a pause of the entry or a cut of the whole path: nothing is red for it and nothing moves. Otherwise the
 rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
 its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
-carries it only when it is better by a margin (3 heard pauses; a quarter faster) for 3 minutes. Bulk goes only on wires
+carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Bulk goes only on wires
 that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
+
+The numbers are from the stand's night (11.11, 01:00–05:46 UTC, nekko-spb → unl1, the four candidate wires and the pool's
+own call side by side), to be checked against the stand's full day and the peak:
+
+- Red after 500 ms. A wire's own silence of 500 ms while another wire heard came 30 times on the pool (members dying)
+  and 3 times on QUIC (820–840 ms, alone), never on the random-byte wires (none even of 300 ms). The entry's own pauses
+  (the box not run on :x0) silenced every wire at once for 157–320 ms: nobody red. 1000 ms would miss the QUIC stalls
+  and 22 of the pool's. A voice wire's death costs the call at most this long only if its other copy is lost too: the
+  client's stream copy of a voice packet rides the bulk wire, of another shape.
+- Voice margin 5, hold 5 minutes. Replayed over the night's minutes: with the bare UDP wire present, margin 3 moved
+  voice twice in 4.6 h (to salamander for 9 minutes and back), margin 5 never, red minutes under voice 0 either way.
+  Between QUIC and salamander alone, margin 3 and a 3-minute hold moved it 9 times, margin 5 and 5 minutes 3 times, and
+  the minutes voice spent on a red minute were 7 and 6: moving between wires as good as each other buys nothing.
+- Bulk margin a quarter. A 1 MiB download takes one or two round trips of slow start (QUIC 59–68 or 101–118 ms); the
+  hourly medians were QUIC 127 and salamander 113 Mbit/s, while 12 MiB ranked them the other way (264 and 271). Within a
+  quarter they are the same wire; no move over the night at 10, 25 or 50%.
 
 The trunk's own download: a stream to port 0, held to one wire, carries 8 bytes (u64, the length asked, at most 64 MiB);
 the exit answers it from the trunk itself, with no socket, with that many zero bytes and its end. The entry resets the
