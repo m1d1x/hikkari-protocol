@@ -85,6 +85,8 @@ type dupConn struct {
 	voiceErr     time.Time // last failed voice dial
 	mirrorErr    time.Time // last failed stream dial, or one running
 	det          detector
+	// Frames a carrier's queue had no room for, by the carrier's channel.
+	fullDatagram, fullStream int64
 
 	deadline     time.Time
 	deadlineWake chan struct{}
@@ -93,6 +95,7 @@ type dupConn struct {
 // dupLeg is one carrier: a queue and the goroutine that drains it.
 type dupLeg struct {
 	lane  uint8 // guarded by dupConn.mu
+	via   dup.Via
 	send  func([]byte) error
 	shut  func()
 	mu    sync.Mutex
@@ -100,22 +103,29 @@ type dupLeg struct {
 	queue chan []byte
 }
 
-func newLeg(lane uint8, send func([]byte) error, shut func()) *dupLeg {
-	return &dupLeg{lane: lane, send: send, shut: shut, queue: make(chan []byte, legQueue)}
+func newLeg(lane uint8, via dup.Via, send func([]byte) error, shut func()) *dupLeg {
+	return &dupLeg{lane: lane, via: via, send: send, shut: shut, queue: make(chan []byte, legQueue)}
 }
 
 // put queues a frame without waiting; false when the carrier is gone or full.
 func (l *dupLeg) put(frame []byte) bool {
+	ok, _ := l.offer(frame)
+	return ok
+}
+
+// offer is put that also says whether a refused frame found the queue full,
+// so it never reached the wire.
+func (l *dupLeg) offer(frame []byte) (ok, full bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.done {
-		return false
+		return false, false
 	}
 	select {
 	case l.queue <- frame:
-		return true
+		return true, false
 	default:
-		return false
+		return false, true
 	}
 }
 
@@ -162,6 +172,9 @@ func (d *dupConn) take(p *observe.Period) {
 		p.Dup.Ends.Add(observe.EndEOF)
 	}
 	d.ledger.Take(p.Dup)
+	p.Dup.FullDatagram += d.fullDatagram
+	p.Dup.FullStream += d.fullStream
+	d.fullDatagram, d.fullStream = 0, 0
 	if d.det.done.N > 0 {
 		if p.Calls == nil {
 			p.Calls = &observe.Calls{}
@@ -173,7 +186,7 @@ func (d *dupConn) take(p *observe.Period) {
 
 // packetLeg starts a carrier on a datagram connection, attached to lane.
 func (d *dupConn) packetLeg(p net.PacketConn, lane uint8) *dupLeg {
-	leg := newLeg(lane, func(frame []byte) error {
+	leg := newLeg(lane, dup.ViaDatagram, func(frame []byte) error {
 		_, err := p.WriteTo(frame, dup.HostAddr())
 		return err
 	}, func() { _ = p.Close() })
@@ -240,10 +253,21 @@ func (d *dupConn) send(frame []byte, voice bool) bool {
 	}
 	d.mu.Unlock()
 	sent := false
+	var fullDatagram, fullStream int64
 	for _, leg := range legs {
-		if leg.put(frame) {
-			sent = true
+		ok, full := leg.offer(frame)
+		sent = sent || ok
+		if full && leg.via == dup.ViaDatagram {
+			fullDatagram++
+		} else if full {
+			fullStream++
 		}
+	}
+	if fullDatagram+fullStream > 0 {
+		d.mu.Lock()
+		d.fullDatagram += fullDatagram
+		d.fullStream += fullStream
+		d.mu.Unlock()
 	}
 	return sent
 }
@@ -297,7 +321,7 @@ func (d *dupConn) openMirror(lane uint8) {
 		d.c.opts.Logger.DebugContext(d.ctx, "dup: stream copy failed: ", err)
 		return
 	}
-	leg := newLeg(lane, func(frame []byte) error { return dup.WriteStream(conn, frame) }, func() { _ = conn.Close() })
+	leg := newLeg(lane, dup.ViaStream, func(frame []byte) error { return dup.WriteStream(conn, frame) }, func() { _ = conn.Close() })
 	leg.put(attachFrame(d.id, lane))
 	d.mu.Lock()
 	if d.mirror != nil || d.ctx.Err() != nil {
@@ -331,6 +355,11 @@ func (d *dupConn) openVoice() {
 		d.mu.Unlock()
 		_ = p.Close()
 		return
+	}
+	// The voice connection carries nothing but calls: it must not hold one
+	// back for a long round trip (wire/datagram voiceSender).
+	if v, ok := p.(interface{ CarryVoice() }); ok {
+		v.CarryVoice()
 	}
 	d.voice = d.packetLeg(p, dup.LaneVoice)
 	d.mu.Unlock()

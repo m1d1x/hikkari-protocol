@@ -12,6 +12,7 @@ import (
 	"github.com/m1d1x/hikkari-protocol/connect"
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/observe"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -197,26 +198,41 @@ type dupLeg struct {
 }
 
 // join sets the carrier's lane and answers the attach with one naming it: the
-// client learns that this relay keeps lanes (v1.03).
+// client learns that this relay keeps lanes (v1.03). A datagram carrier on the
+// voice lane is the client's voice connection: its QUIC connection gets the
+// voice sender (datagram.VoiceWindow), so a long round trip on the user's
+// line never holds the call back.
 func (l *dupLeg) join(id dup.Session, lane uint8) {
 	if lane != dup.LaneVoice {
 		lane = dup.LaneAll
 	}
 	l.lane.Store(uint32(lane))
+	if p, ok := l.c.(*packetCarrier); ok && lane == dup.LaneVoice {
+		if v, ok := common.Cast[voiceCarrier](p.conn); ok {
+			v.CarryVoice()
+		}
+	}
 	ack, _ := dup.Append(nil, dup.Frame{Kind: dup.KindAttach, Session: id, Lane: lane})
 	l.put(ack)
 }
 
-// put queues a frame without waiting; a full or stopped leg loses it.
-func (l *dupLeg) put(frame []byte) {
+// voiceCarrier is a datagram association that can say its QUIC connection
+// carries voice (wire/datagram).
+type voiceCarrier interface{ CarryVoice() }
+
+// put queues a frame without waiting; a stopped leg loses it, and so does a
+// full one, which says so: the frame never reached the wire.
+func (l *dupLeg) put(frame []byte) (full bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.done {
-		return
+		return false
 	}
 	select {
 	case l.queue <- frame:
+		return false
 	default:
+		return true
 	}
 }
 
@@ -258,6 +274,8 @@ type dupSession struct {
 	ended    bool
 	resolved map[string]netip.AddrPort // only the up path touches it
 	names    sync.Map                  // netip.AddrPort -> M.Socksaddr
+	// Answers a leg's queue had no room for, by the leg's channel.
+	fullDatagram, fullStream int64
 }
 
 // up sends the first copy of a client packet out of the exit socket.
@@ -343,8 +361,21 @@ func (s *dupSession) down() {
 		if err != nil {
 			continue
 		}
+		var fullDatagram, fullStream int64
 		for _, leg := range lane {
-			leg.put(frame)
+			if leg.put(frame) {
+				if leg.c.via() == dup.ViaDatagram {
+					fullDatagram++
+				} else {
+					fullStream++
+				}
+			}
+		}
+		if fullDatagram+fullStream > 0 {
+			s.mu.Lock()
+			s.fullDatagram += fullDatagram
+			s.fullStream += fullStream
+			s.mu.Unlock()
 		}
 	}
 }
@@ -402,6 +433,9 @@ func (s *dupSession) take(p *observe.Period) {
 		p.Dup.Ends.Add(s.endedBy)
 	}
 	s.ledger.Take(p.Dup)
+	p.Dup.FullDatagram += s.fullDatagram
+	p.Dup.FullStream += s.fullStream
+	s.fullDatagram, s.fullStream = 0, 0
 }
 
 type packetCarrier struct {

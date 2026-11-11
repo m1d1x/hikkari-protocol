@@ -135,6 +135,11 @@ type Dup struct {
 	Both         int64 `json:"both"`
 	// Late are copies that came after their number left the window.
 	Late int64 `json:"late"`
+	// FullDatagram and FullStream are copies this end never sent: the
+	// carrier's queue had no room, its channel was behind (v1.04, the sending
+	// side's count; the far end sees them as only_stream or missing).
+	FullDatagram int64 `json:"full_dgram,omitempty"`
+	FullStream   int64 `json:"full_stream,omitempty"`
 	// LeadDatagram and LeadStream: by how many ms the first copy beat the
 	// second, by the first copy's channel.
 	LeadDatagram Dist `json:"lead_dgram"`
@@ -152,6 +157,8 @@ func (d *Dup) merge(o *Dup) {
 	d.OnlyStream += o.OnlyStream
 	d.Both += o.Both
 	d.Late += o.Late
+	d.FullDatagram += o.FullDatagram
+	d.FullStream += o.FullStream
 	d.LeadDatagram.Merge(&o.LeadDatagram)
 	d.LeadStream.Merge(&o.LeadStream)
 }
