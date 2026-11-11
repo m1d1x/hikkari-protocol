@@ -28,6 +28,10 @@ type Dial func(ctx context.Context, localPort int) (io.ReadWriteCloser, error)
 // goes there (Session). The old session is retired: it keeps the members it
 // has, replaces none, and is closed when it carries nothing more or after
 // RetireLimit. Its members ending is what lets the exit's old process go.
+//
+// An entry whose own process is being replaced (Retire) retires its current
+// session too, and opens none after it: an fDrain from the exit then changes
+// nothing, since a process that takes no new clients has no use for a pool.
 type Entry struct {
 	cfg     Config
 	members int
@@ -41,6 +45,7 @@ type Entry struct {
 	run     context.Context
 	slots   sync.WaitGroup
 	retired []*generation
+	leaving bool // Retire: no new generation, ever
 }
 
 // generation is one session of the entry and its pool.
@@ -107,10 +112,57 @@ func (e *Entry) Retired() int {
 	return len(e.retired)
 }
 
+// Retire makes the current session a retired one, for an entry whose own
+// process is being replaced: it keeps what it carries and the members it has,
+// replaces none, and closes when it carries nothing more or after
+// RetireLimit; no new session follows, not even on the exit's fDrain. Session
+// still answers with it, for what a client already started there.
+func (e *Entry) Retire() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.leaving {
+		return
+	}
+	e.leaving = true
+	g := e.cur
+	if g.retired.Load() {
+		return
+	}
+	g.retired.Store(true)
+	g.since = time.Now()
+	e.retired = append(e.retired, g)
+}
+
+// Carrying is what all the entry's sessions carry now, the current one and
+// the retired ones: open streams and clients' datagram flows.
+func (e *Entry) Carrying() (streams, flows int) {
+	e.mu.Lock()
+	all := e.allLocked()
+	e.mu.Unlock()
+	for _, g := range all {
+		st := g.s.Stats()
+		streams += st.Streams
+		flows += st.Flows
+	}
+	return streams, flows
+}
+
+// allLocked is every session the entry has not closed, each once.
+func (e *Entry) allLocked() []*generation {
+	all := append([]*generation(nil), e.retired...)
+	for _, g := range all {
+		if g == e.cur {
+			return all
+		}
+	}
+	return append(all, e.cur)
+}
+
 // Ports is the entry's book of source ports.
 func (e *Entry) Ports() *PortBook { return e.ports }
 
-// Run keeps the pool up until ctx ends, then closes the sessions.
+// Run keeps the pool up until ctx ends, then closes the sessions, and says
+// what was cut with them.
 func (e *Entry) Run(ctx context.Context) {
 	e.mu.Lock()
 	e.run = ctx
@@ -123,10 +175,17 @@ func (e *Entry) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			e.mu.Lock()
-			all := append([]*generation{e.cur}, e.retired...)
+			all := e.allLocked()
 			e.mu.Unlock()
+			streams, flows := 0, 0
 			for _, g := range all {
+				st := g.s.Stats()
+				streams += st.Streams
+				flows += st.Flows
 				g.s.Close()
+			}
+			if streams > 0 || flows > 0 {
+				e.logf("trunk: closed with %d stream(s) and %d flow(s) cut", streams, flows)
 			}
 			e.slots.Wait()
 			return
@@ -144,11 +203,12 @@ func (e *Entry) startLocked(g *generation) {
 }
 
 // drained answers the exit's fDrain on g: a new generation takes everything
-// new, and g retires.
+// new, and g retires. A retired g, the entry's own included (Retire), opens
+// nothing: it takes nothing new.
 func (e *Entry) drained(g *generation) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if g != e.cur || e.run == nil || e.run.Err() != nil {
+	if g != e.cur || e.leaving || g.retired.Load() || e.run == nil || e.run.Err() != nil {
 		return
 	}
 	next, err := e.newGeneration()

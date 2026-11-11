@@ -47,6 +47,13 @@ hello with the same id and the epoch of its session (random per exit session). T
 the one it sends carries its capabilities (bit 1: it reads observe frames), the rest is zero. An epoch that changes under a session means the
 exit lost its streams: the entry resets its own.
 
+Drain is the exit's process being replaced without a cut. The entry answers it once per session: a new session with a new
+id and a full pool, which reaches the exit's new process, takes every new stream and flow; the old one is retired: it keeps
+its members, replaces none, and closes when it carries nothing more or after 30 minutes. An entry whose own process is being
+replaced retires its current session the same way and opens no session after it, so a drain that reaches the old entry
+process changes nothing: a process that takes no new clients has no use for a new pool. What an entry cuts when it stops
+counts every session it has, the retired ones too.
+
 ## Streams
 
 A stream is one client TCP connection to an exit loopback port, opened by the entry. Its bytes are numbered by offset; data

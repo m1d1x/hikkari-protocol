@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -113,6 +115,16 @@ type harness struct {
 	budget func(n int64) int64
 	dials  atomic.Int64
 	cancel context.CancelFunc
+
+	logMu sync.Mutex
+	logs  []string // the entry's lines
+}
+
+// journal is what the entry has logged so far.
+func (h *harness) journal() string {
+	h.logMu.Lock()
+	defer h.logMu.Unlock()
+	return strings.Join(h.logs, "\n")
 }
 
 func newHarness(t *testing.T, cfg Config, members int, budget func(int64) int64, serve func(net.Conn)) *harness {
@@ -145,7 +157,13 @@ func newHarnessLocal(t *testing.T, cfg, exitCfg Config, members int, budget func
 		f.budget.Store(h.budget(n))
 		return &closer{f, a}, nil
 	}
-	h.entry, err = NewEntry(cfg, members, dial, ports, t.Logf)
+	logf := func(format string, a ...any) {
+		h.logMu.Lock()
+		h.logs = append(h.logs, fmt.Sprintf(format, a...))
+		h.logMu.Unlock()
+		t.Logf(format, a...)
+	}
+	h.entry, err = NewEntry(cfg, members, dial, ports, logf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -669,4 +687,85 @@ func TestExitDrain(t *testing.T) {
 	waitFor(t, func() bool { return h.entry.Retired() == 0 })
 	waitFor(t, func() bool { _, st := old.Stats(); return st.Members == 0 })
 	roundTrip(t, c2, 1<<20)
+}
+
+// TestRetiredEntryIgnoresExitDrain: the entry's own process is being replaced
+// (Retire), and while it still carries a stream the exit drains too. The old
+// entry opens no new session and no new pool for it: it takes nothing new.
+// Its stream goes on to its end on the exit's old process, and then the
+// entry carries nothing and its session closes.
+func TestRetiredEntryIgnoresExitDrain(t *testing.T) {
+	retireEvery = 20 * time.Millisecond
+	defer func() { retireEvery = 5 * time.Second }()
+	h := newHarness(t, Config{}, 4, nil, nil)
+	c1 := h.carry()
+	defer c1.Close()
+	roundTrip(t, c1, 1<<20)
+
+	s := h.entry.Session()
+	h.entry.Retire()
+	if h.entry.Retired() != 1 || h.entry.Session() != s {
+		t.Fatalf("retire: %d retired, same session %v", h.entry.Retired(), h.entry.Session() == s)
+	}
+	dials := h.dials.Load()
+
+	old := h.exit
+	next := NewExit(Config{}, h.local)
+	exitCtx, exitCancel := context.WithCancel(context.Background())
+	defer exitCancel()
+	go next.Run(exitCtx)
+	h.exit = next
+	old.Drain()
+	time.Sleep(300 * time.Millisecond)
+	if strings.Contains(h.journal(), "exit drains") {
+		t.Fatalf("a retired entry answered the exit's drain:\n%s", h.journal())
+	}
+	if h.entry.Session() != s || h.dials.Load() != dials {
+		t.Fatalf("new session %v, dials %d after %d", h.entry.Session() != s, h.dials.Load(), dials)
+	}
+	if _, st := next.Stats(); st.Members != 0 {
+		t.Fatalf("the exit's new process got %d members from a retired entry", st.Members)
+	}
+
+	roundTrip(t, c1, 1<<20) // what it carries goes on
+	if streams, flows := h.entry.Carrying(); streams != 1 || flows != 0 {
+		t.Fatalf("carrying %d stream(s) %d flow(s), want 1 and 0", streams, flows)
+	}
+	c1.Close()
+	waitFor(t, func() bool { return h.entry.Retired() == 0 })
+	if streams, _ := h.entry.Carrying(); streams != 0 {
+		t.Fatalf("carrying %d stream(s) after the last one ended", streams)
+	}
+	waitFor(t, func() bool { _, st := old.Stats(); return st.Members == 0 })
+}
+
+// TestEntryCountsWhatItCuts: an entry that is stopped while it carries a
+// stream on its current session and one on a retired one counts both, in
+// Carrying and in the line it leaves on.
+func TestEntryCountsWhatItCuts(t *testing.T) {
+	h := newHarness(t, Config{}, 4, nil, nil)
+	c1 := h.carry()
+	defer c1.Close()
+	roundTrip(t, c1, 1<<16)
+
+	next := NewExit(Config{}, h.local)
+	exitCtx, exitCancel := context.WithCancel(context.Background())
+	defer exitCancel()
+	go next.Run(exitCtx)
+	old := h.exit
+	h.exit = next
+	old.Drain()
+	waitFor(t, func() bool { return h.entry.Retired() == 1 && h.entry.Session().Stats().Members == 4 })
+	c2 := h.carry()
+	defer c2.Close()
+	roundTrip(t, c2, 1<<16)
+
+	if s := h.entry.Session().Stats().Streams; s != 1 {
+		t.Fatalf("current session carries %d, want 1", s)
+	}
+	if streams, _ := h.entry.Carrying(); streams != 2 {
+		t.Fatalf("carrying %d stream(s), want both", streams)
+	}
+	h.cancel()
+	waitFor(t, func() bool { return strings.Contains(h.journal(), "trunk: closed with 2 stream(s) and 0 flow(s) cut") })
 }
