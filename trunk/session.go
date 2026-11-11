@@ -183,6 +183,9 @@ type Session struct {
 	peerObserve bool
 	reports     chan Report
 	obsDropped  atomic.Int64
+	// route is the entry's: which wire each class goes on (wires.go). The
+	// exit has none: it answers on the wire the entry last used.
+	route Route
 
 	joined, stalls, broken, resent       atomic.Int64
 	pauses                               atomic.Int64
@@ -210,6 +213,7 @@ func newSession(cfg Config, local Local) *Session {
 		cfg: cfg, local: local, ctx: ctx, stop: stop,
 		members: map[*member]struct{}{}, streams: map[uint32]*stream{},
 		closed: map[uint32]time.Time{}, flows: map[uint32]*flow{}, early: map[uint32]*earlyStream{},
+		route: AnyRoute,
 	}
 	s.cond = sync.NewCond(&s.mu)
 	return s
@@ -295,6 +299,72 @@ func (s *Session) IdleFor() time.Duration {
 	return time.Since(s.empty)
 }
 
+// SetRoute says which wire each class goes on from now (entry). What is
+// owed already stays where it is until it is confirmed or its member dies.
+func (s *Session) SetRoute(r Route) {
+	s.mu.Lock()
+	s.route = r
+	s.cond.Broadcast()
+	s.mu.Unlock()
+}
+
+// Route is the session's route now.
+func (s *Session) Route() Route {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.route
+}
+
+// Wires is what the session sees of each wire that has a member up now,
+// by wire id.
+func (s *Session) Wires() map[WireID]WireState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[WireID]WireState{}
+	now := time.Now()
+	for m := range s.members {
+		w, seen := out[m.kind.wire]
+		w.ID = m.kind.wire
+		w.Members++
+		w.Inflight += m.inflight
+		if m.proved && m.progress.After(w.Proof) {
+			w.Proof = m.progress
+		}
+		var owed time.Duration
+		if since, owes := s.debtLocked(m); owes {
+			owed = now.Sub(since)
+		}
+		if !seen || owed < w.Owed {
+			w.Owed = owed
+		}
+		out[m.kind.wire] = w
+	}
+	return out
+}
+
+// debtLocked is since when m has owed progress, counted as the clock counts
+// it: from the later of its last proof, the start of its debt and the end
+// of this end's own last pause.
+func (s *Session) debtLocked(m *member) (time.Time, bool) {
+	since := m.progress
+	switch {
+	case len(m.segs) > 0:
+		if m.busySince.After(since) {
+			since = m.busySince
+		}
+	case m.ping != 0:
+		if m.pingSent.After(since) {
+			since = m.pingSent
+		}
+	default:
+		return time.Time{}, false
+	}
+	if s.resumed.After(since) {
+		since = s.resumed
+	}
+	return since, true
+}
+
 // ── members ──
 
 // ErrStalled ends a member that owed progress and stayed silent.
@@ -303,6 +373,10 @@ var ErrStalled = errors.New("trunk: member stalled")
 type member struct {
 	s    *Session
 	conn io.ReadWriteCloser
+	kind memberKind
+	// answer is the exit's hello to a packet member, said again to every
+	// copy of the entry's hello: the first answer may be lost.
+	answer []byte
 
 	// under s.mu
 	segs      map[*segment]struct{}
@@ -313,12 +387,18 @@ type member struct {
 	// merely arrive on it prove nothing about the way out: a flow can die
 	// one way and keep carrying the other end's acks.
 	progress time.Time
+	proved   bool // progress is a real proof, not the moment it joined
 	lastSend time.Time
 	ping     uint64
 	pingSent time.Time
-	srtt     time.Duration
-	dead     bool
-	why      error
+	// A packet member pings every packetKeepalive whether or not the last
+	// one came back: ping is the oldest owed, pingLast the newest, and a
+	// pong of any of them is progress.
+	pingLast     uint64
+	pingLastSent time.Time
+	srtt         time.Duration
+	dead         bool
+	why          error
 
 	qmu    sync.Mutex
 	hi, lo [][]byte
@@ -330,7 +410,14 @@ type member struct {
 // frames until it dies: ErrStalled when it stopped making progress, the read
 // or write error otherwise, nil when the session closed.
 func (s *Session) Serve(conn io.ReadWriteCloser) error {
-	m := &member{s: s, conn: conn, segs: map[*segment]struct{}{}, wake: make(chan struct{}, 1), done: make(chan struct{})}
+	return s.serve(conn, bufio.NewReaderSize(conn, 64<<10), poolKind, nil)
+}
+
+// serve is Serve for a member of kind k whose frames are read from r (its
+// hello already taken from it). answer is the exit's hello to a packet
+// member.
+func (s *Session) serve(conn io.ReadWriteCloser, r *bufio.Reader, k memberKind, answer []byte) error {
+	m := &member{s: s, conn: conn, kind: k, answer: answer, segs: map[*segment]struct{}{}, wake: make(chan struct{}, 1), done: make(chan struct{})}
 	now := time.Now()
 	m.progress, m.lastSend = now, now
 	s.mu.Lock()
@@ -345,8 +432,10 @@ func (s *Session) Serve(conn io.ReadWriteCloser) error {
 	// What no member could carry goes out now, and every stream says again
 	// how far it is: acks sent on a member that died are lost.
 	s.drainPendingLocked()
-	for _, st := range s.streams {
-		s.ackLocked(st, m)
+	if k.streams {
+		for _, st := range s.streams {
+			s.ackLocked(st, m)
+		}
 	}
 	if s.draining {
 		m.send(appendDrain(nil), true)
@@ -355,7 +444,6 @@ func (s *Session) Serve(conn io.ReadWriteCloser) error {
 	s.mu.Unlock()
 
 	go m.writeLoop()
-	r := bufio.NewReaderSize(conn, 64<<10)
 	var err error
 	for {
 		var f frame
@@ -394,6 +482,10 @@ func (m *member) send(frame []byte, urgent bool) {
 }
 
 func (m *member) writeLoop() {
+	if m.kind.packet {
+		m.writePackets()
+		return
+	}
 	w := bufio.NewWriterSize(m.conn, 64<<10)
 	for {
 		m.qmu.Lock()
@@ -417,6 +509,33 @@ func (m *member) writeLoop() {
 			}
 		}
 		if _, err := w.Write(next); err != nil {
+			m.fail(err)
+			return
+		}
+	}
+}
+
+// writePackets is a packet member's writeLoop: every frame in a datagram of
+// its own, nothing buffered behind another.
+func (m *member) writePackets() {
+	for {
+		m.qmu.Lock()
+		var next []byte
+		if len(m.hi) > 0 {
+			next, m.hi = m.hi[0], m.hi[1:]
+		} else if len(m.lo) > 0 {
+			next, m.lo = m.lo[0], m.lo[1:]
+		}
+		m.qmu.Unlock()
+		if next == nil {
+			select {
+			case <-m.wake:
+				continue
+			case <-m.done:
+				return
+			}
+		}
+		if _, err := m.conn.Write(next); err != nil {
 			m.fail(err)
 			return
 		}
@@ -479,20 +598,41 @@ func (s *Session) dropMemberLocked(m *member, stalled bool) {
 	s.pending = append(owed, s.pending...)
 	s.drainPendingLocked()
 	// Acks this member carried may be lost: say them again elsewhere.
-	if next := s.pickLocked(nil, false); next != nil {
+	if m.kind.streams {
 		for _, st := range s.streams {
-			s.ackLocked(st, next)
+			s.ackLocked(st, s.pickLocked(st, false))
 		}
 	}
 	s.cond.Broadcast()
 }
 
-// pickLocked chooses the live member with the fewest bytes owed. With room
-// set it only takes a member under Inflight (or owing nothing).
-func (s *Session) pickLocked(not *member, room bool) *member {
+// pickLocked chooses, for a stream, the live member with the fewest bytes
+// owed among those that carry streams, on the stream's wire if that wire
+// has a member up (wireOfLocked). With room set it only takes a member under
+// Inflight (or owing nothing): a full wire is waited for, not spilled from.
+func (s *Session) pickLocked(st *stream, room bool) *member {
+	want := AnyWire
+	if st != nil {
+		want = s.wireOfLocked(st)
+	}
+	if want != AnyWire {
+		up := false
+		for m := range s.members {
+			if m.kind.streams && m.kind.wire == want {
+				up = true
+				break
+			}
+		}
+		if !up {
+			want = AnyWire
+		}
+	}
 	var best *member
 	for m := range s.members {
-		if m == not || (room && m.inflight > 0 && m.inflight+s.cfg.Chunk > s.cfg.Inflight) {
+		if !m.kind.streams || want != AnyWire && m.kind.wire != want {
+			continue
+		}
+		if room && m.inflight > 0 && m.inflight+s.cfg.Chunk > s.cfg.Inflight {
 			continue
 		}
 		if best == nil || m.inflight < best.inflight {
@@ -500,6 +640,15 @@ func (s *Session) pickLocked(not *member, room bool) *member {
 		}
 	}
 	return best
+}
+
+// wireOfLocked is the wire a stream's frames go on: the entry's route for
+// bulk, or on the exit the wire the entry last sent the stream on.
+func (s *Session) wireOfLocked(st *stream) WireID {
+	if s.local != nil {
+		return st.wire
+	}
+	return s.route.Bulk
 }
 
 // clock declares stalled members dead, pings idle ones, retires idle flows
@@ -542,31 +691,32 @@ func (s *Session) tick(now time.Time) {
 		if r := 4 * m.srtt; r > limit {
 			limit = r
 		}
+		if m.kind.packet {
+			// A lost datagram is not a dead member: it owes from its
+			// oldest unanswered ping, and pings go on meanwhile.
+			limit += packetKeepalive
+		}
 		// Owed progress is counted from the later of the last proof
 		// and the moment the debt began: an idle member is not late
 		// for a chunk it was handed a moment ago.
-		owes := false
-		since := m.progress
-		if len(m.segs) > 0 {
-			owes = true
-			if m.busySince.After(since) {
-				since = m.busySince
-			}
-		} else if m.ping != 0 {
-			owes = true
-			if m.pingSent.After(since) {
-				since = m.pingSent
-			}
-		}
-		if s.resumed.After(since) {
-			since = s.resumed
-		}
+		since, owes := s.debtLocked(m)
 		// Late by Stall while another member proved the other end alive
 		// after this one's debt began: this flow is dead, not the end.
 		// Late with everyone silent: the other end or the whole path, and
 		// only Quiet ends it.
 		if owes && (now.Sub(since) > limit && s.proof.After(since) || now.Sub(since) > s.cfg.Quiet) {
 			s.dropMemberLocked(m, true)
+			continue
+		}
+		if m.kind.packet {
+			if now.Sub(m.pingLastSent) >= packetKeepalive {
+				tok := uint64(s.tok.Add(1))
+				if m.ping == 0 {
+					m.ping, m.pingSent = tok, now
+				}
+				m.pingLast, m.pingLastSent, m.lastSend = tok, now, now
+				m.send(appendPing(nil, fPing, tok), true)
+			}
 			continue
 		}
 		if m.ping == 0 && len(m.segs) == 0 && now.Sub(m.lastSend) > s.cfg.Keepalive {
@@ -602,36 +752,61 @@ func (s *Session) handle(m *member, f frame) {
 		return
 	}
 	now := time.Now()
+	if !m.kind.streams {
+		switch f.typ {
+		case fOpen, fData, fAck, fFin, fRst:
+			return // not this member's to carry
+		}
+	}
 	switch f.typ {
+	case fHello:
+		// A copy of a packet member's hello: the answer may have been lost.
+		if m.answer != nil {
+			m.send(m.answer, true)
+		}
 	case fPing:
 		m.send(appendPing(nil, fPong, f.token), true)
 	case fPong:
-		if f.token == m.ping {
-			rtt := now.Sub(m.pingSent)
+		var sent time.Time
+		switch {
+		case m.kind.packet && m.ping != 0 && f.token >= m.ping && f.token <= m.pingLast:
+			if f.token == m.pingLast {
+				sent = m.pingLastSent
+			}
+		case f.token == m.ping:
+			sent = m.pingSent
+		default:
+			return
+		}
+		if !sent.IsZero() {
+			rtt := now.Sub(sent)
 			if m.srtt == 0 {
 				m.srtt = rtt
 			} else {
 				m.srtt = (7*m.srtt + rtt) / 8
 			}
-			m.ping = 0
-			m.progress = now
-			s.proof = now
 		}
+		m.ping, m.pingLast = 0, 0
+		m.progress, m.proved = now, true
+		s.proof = now
 	case fOpen:
 		s.openLocked(m, f)
+		s.followLocked(m, f.stream)
 	case fData:
 		s.dataLocked(m, f)
+		s.followLocked(m, f.stream)
 	case fAck:
 		s.ackedLocked(f)
 	case fFin:
 		s.finLocked(m, f)
+		s.followLocked(m, f.stream)
 	case fRst:
 		if st := s.streams[f.stream]; st != nil {
 			st.endWhy = EndPeer
 			s.endStreamLocked(st, false)
 		}
 	case fDgram:
-		s.dgramLocked(f)
+		s.dgramLocked(m, f)
 	case fObserve:
 		if s.local == nil {
 			s.observedLocked(f)
@@ -641,6 +816,17 @@ func (s *Session) handle(m *member, f frame) {
 			s.drained = true
 			go s.onDrain()
 		}
+	}
+}
+
+// followLocked: on the exit, a stream's frames go back on the wire the entry
+// last sent it on.
+func (s *Session) followLocked(m *member, id uint32) {
+	if s.local == nil {
+		return
+	}
+	if st := s.streams[id]; st != nil {
+		st.wire = m.kind.wire
 	}
 }
 
@@ -707,6 +893,8 @@ type stream struct {
 	writeDone bool // local has seen everything (and the FIN) the other end sent
 
 	ended bool
+	// wire is the exit's: the wire the entry last sent the stream on.
+	wire WireID
 
 	// What an observed stream reports (observe.go); kept for every stream,
 	// told only for one marked.
@@ -724,7 +912,7 @@ type stream struct {
 func (s *Session) newStreamLocked(id uint32, port uint16, local net.Conn) *stream {
 	st := &stream{id: id, port: port, local: local, ready: make(chan struct{}), gone: make(chan struct{}), credit: uint64(s.cfg.Window),
 		ahead: map[uint64][]byte{}, finAt: -1, advertise: uint64(s.cfg.Window), wake: make(chan struct{}, 1),
-		opened: time.Now(), carriers: map[*member]struct{}{}}
+		opened: time.Now(), carriers: map[*member]struct{}{}, wire: AnyWire}
 	if local != nil {
 		close(st.ready)
 	}
@@ -805,7 +993,7 @@ func (s *Session) openLocked(m *member, f frame) {
 func (s *Session) queueLocked(seg *segment, urgent bool) {
 	seg.st.owed = append(seg.st.owed, seg)
 	if urgent {
-		if m := s.pickLocked(nil, false); m != nil {
+		if m := s.pickLocked(seg.st, false); m != nil {
 			s.transmitLocked(seg, m)
 		} else {
 			s.pending = append(s.pending, seg)
@@ -818,7 +1006,7 @@ func (s *Session) queueLocked(seg *segment, urgent bool) {
 		}
 		// What is owed again goes before what is new.
 		if len(s.pending) == 0 {
-			if m := s.pickLocked(nil, true); m != nil {
+			if m := s.pickLocked(seg.st, true); m != nil {
 				s.transmitLocked(seg, m)
 				return
 			}
@@ -836,7 +1024,7 @@ func (s *Session) drainPendingLocked() {
 		if seg.done {
 			continue
 		}
-		m := s.pickLocked(nil, len(seg.data) > 0)
+		m := s.pickLocked(seg.st, len(seg.data) > 0)
 		if m == nil {
 			break
 		}
@@ -884,7 +1072,7 @@ func (s *Session) releaseLocked(seg *segment) {
 	if m := seg.m; m != nil && !m.dead {
 		delete(m.segs, seg)
 		m.inflight -= len(seg.data)
-		m.progress = time.Now()
+		m.progress, m.proved = time.Now(), true
 		s.proof = m.progress
 	}
 	seg.m = nil
@@ -1095,7 +1283,7 @@ func (s *Session) writeLocal(st *stream) {
 			s.mu.Lock()
 			st.written += uint64(len(p))
 			if st.written+uint64(s.cfg.Window) >= st.advertise+uint64(s.cfg.Window/4) {
-				s.ackLocked(st, s.pickLocked(nil, false))
+				s.ackLocked(st, s.pickLocked(st, false))
 			}
 			s.mu.Unlock()
 		}
@@ -1146,6 +1334,9 @@ func (s *Session) endStreamLocked(st *stream, reset bool) {
 		s.resets.Add(1)
 		sent := 0
 		for m := range s.members {
+			if !m.kind.streams {
+				continue
+			}
 			m.send(appendRst(nil, st.id), true)
 			if sent++; sent == s.cfg.Copies {
 				break

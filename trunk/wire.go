@@ -12,6 +12,7 @@ import (
 // TLS + HTTP/2 CONNECT tunnel. Every integer is big-endian.
 //
 //	hello  1 | magic "HKT1" | session [16] | epoch [8]
+//	hello  1 | magic "HKT2" | session [16] | epoch [8] | wire u8 | flags u8   (t2)
 //	open   2 | stream u32 | port u16
 //	data   3 | stream u32 | offset u64 | n u16 | n bytes
 //	ack    4 | stream u32 | received u64 | credit u64 | flags u8 (1: FIN received) | got u64
@@ -52,6 +53,11 @@ const (
 
 const (
 	magic = "HKT1"
+	// magic2 is a t2 hello: a member of a wire other than the pool, or one
+	// that carries no streams or sends each frame in its own datagram
+	// (wires.go). An exit that predates t2 refuses it as a stranger; the
+	// pool's members keep saying t1, so such an exit still serves them.
+	magic2 = "HKT2"
 	// MaxPayload bounds a data or dgram frame's bytes (n is u16).
 	MaxPayload = 65535
 	ackFin     = 1
@@ -81,6 +87,7 @@ type frame struct {
 	token   uint64
 	session SessionID
 	epoch   Epoch
+	kind    memberKind // hello: the member's wire and flags (t1: the pool's)
 	payload []byte
 }
 
@@ -89,6 +96,19 @@ func appendHello(b []byte, id SessionID, epoch Epoch) []byte {
 	b = append(b, magic...)
 	b = append(b, id[:]...)
 	return append(b, epoch[:]...)
+}
+
+// appendHelloFor is the hello of a member of kind k: t1 for the pool's
+// kind, t2 (the wire and its flags after the epoch) for any other.
+func appendHelloFor(b []byte, id SessionID, epoch Epoch, k memberKind) []byte {
+	if k.t1() {
+		return appendHello(b, id, epoch)
+	}
+	b = append(b, fHello)
+	b = append(b, magic2...)
+	b = append(b, id[:]...)
+	b = append(b, epoch[:]...)
+	return append(b, byte(k.wire), k.flags())
 }
 
 func appendOpen(b []byte, stream uint32, port uint16) []byte {
@@ -173,7 +193,16 @@ func readFrame(r *bufio.Reader) (frame, error) {
 		if _, err := io.ReadFull(r, h[:]); err != nil {
 			return f, err
 		}
-		if string(h[:4]) != magic {
+		switch string(h[:4]) {
+		case magic:
+			f.kind = poolKind
+		case magic2:
+			var k [2]byte
+			if _, err := io.ReadFull(r, k[:]); err != nil {
+				return f, err
+			}
+			f.kind = kindOf(WireID(k[0]), k[1])
+		default:
 			return f, errMagic
 		}
 		copy(f.session[:], h[4:20])

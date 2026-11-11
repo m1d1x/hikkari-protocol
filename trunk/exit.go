@@ -1,6 +1,7 @@
 package trunk
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -35,23 +36,25 @@ func NewExit(cfg Config, local Local) *Exit {
 }
 
 // ServeMember reads conn's hello, answers with the session's epoch and
-// carries the member until it dies.
+// carries the member until it dies. A t1 hello is a pool member; a t2 one
+// says its wire and form (wires.go), and is answered in kind.
 func (x *Exit) ServeMember(conn io.ReadWriteCloser) error {
 	timer := time.AfterFunc(helloTimeout, func() { conn.Close() })
-	var b [29]byte
-	_, err := io.ReadFull(conn, b[:])
+	// One reader for the hello and the frames after it: a packet member's
+	// hello is a datagram that must be read whole.
+	r := bufio.NewReaderSize(conn, 64<<10)
+	f, err := readFrame(r)
 	if !timer.Stop() {
 		return ErrSilent
+	}
+	if err == nil && f.typ != fHello {
+		err = errMagic
 	}
 	if err != nil {
 		conn.Close()
 		return err
 	}
-	if b[0] != fHello || string(b[1:5]) != magic {
-		conn.Close()
-		return errMagic
-	}
-	id := SessionID(b[5:21])
+	id := f.session
 	x.mu.Lock()
 	es := x.sessions[id]
 	if es == nil {
@@ -66,17 +69,22 @@ func (x *Exit) ServeMember(conn io.ReadWriteCloser) error {
 			es.s.Drain()
 		}
 	}
-	if b[21]&capObserve != 0 {
+	if f.epoch[0]&capObserve != 0 {
 		es.s.mu.Lock()
 		es.s.peerObserve = true
 		es.s.mu.Unlock()
 	}
 	x.mu.Unlock()
-	if _, err := conn.Write(appendHello(nil, id, es.epoch)); err != nil {
+	answer := appendHelloFor(nil, id, es.epoch, f.kind)
+	if _, err := conn.Write(answer); err != nil {
 		conn.Close()
 		return err
 	}
-	err = es.s.Serve(conn)
+	var again []byte
+	if f.kind.packet {
+		again = answer
+	}
+	err = es.s.serve(conn, r, f.kind, again)
 	if errors.Is(err, io.EOF) {
 		err = nil
 	}

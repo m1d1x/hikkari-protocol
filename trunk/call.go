@@ -30,6 +30,11 @@ type CallConfig struct {
 	// Grace is how long after its window an answer still counts. A later
 	// one is lost: no call plays a frame two seconds late.
 	Grace time.Duration
+	// OnWire holds the call to Wire whatever the session's route: the call
+	// of one wire, what the selector ranks it by (wires.go). Off, the call
+	// follows the route of the voice class.
+	OnWire bool
+	Wire   WireID
 }
 
 const (
@@ -152,7 +157,11 @@ func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, repor
 					flow.Close()
 				}
 				cur = s
-				flow = s.OpenFlowCopies(EchoPort, cfg.Copies, c.answer, nil)
+				o := FlowOptions{Copies: cfg.Copies, Class: ClassVoice, Pin: AnyWire}
+				if cfg.OnWire {
+					o.Pin = cfg.Wire
+				}
+				flow = s.OpenFlowWith(EchoPort, o, c.answer, nil)
 			}
 			seq++
 			binary.BigEndian.PutUint64(payload, seq)

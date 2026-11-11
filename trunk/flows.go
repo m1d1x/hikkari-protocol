@@ -34,6 +34,12 @@ type flow struct {
 	copies int
 	// echo is a flow to EchoPort: the trunk's own call, not a client's.
 	echo bool
+	// class and pin are the entry's: the route it follows, or the one wire
+	// it is held to (wires.go). wire is the exit's: the wire the entry last
+	// sent it on, where the answers go.
+	class Class
+	pin   WireID
+	wire  WireID
 
 	// What an observed flow reports (observe.go).
 	opened          time.Time
@@ -60,13 +66,20 @@ func (s *Session) OpenFlow(port uint16, deliver func([]byte), onEnd func()) *Flo
 // OpenFlowCopies is OpenFlow with each datagram carried by copies members;
 // 0 is the session's Copies.
 func (s *Session) OpenFlowCopies(port uint16, copies int, deliver func([]byte), onEnd func()) *Flow {
+	return s.OpenFlowWith(port, FlowOptions{Copies: copies, Pin: AnyWire}, deliver, onEnd)
+}
+
+// OpenFlowWith is OpenFlow shaped by o: its copies, its class, its pin.
+func (s *Session) OpenFlowWith(port uint16, o FlowOptions, deliver func([]byte), onEnd func()) *Flow {
+	copies := o.Copies
 	if copies <= 0 {
 		copies = s.cfg.Copies
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.nextID++
-	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now(), echo: port == EchoPort}
+	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now(), echo: port == EchoPort,
+		class: o.Class, pin: o.Pin, wire: AnyWire}
 	if s.shutdown {
 		f.ended = true
 	} else {
@@ -106,16 +119,29 @@ func (s *Session) sendDgramLocked(f *flow, p []byte) {
 	f.seq++
 	f.out++
 	b := appendDgram(make([]byte, 0, 13+len(p)), f.id, f.seq, f.port, p)
-	// The Copies least loaded members; a datagram is never owed, so a member
-	// carrying it is not held to account for it.
+	// The Copies least loaded members of the flow's wire; a datagram is
+	// never owed, so a member carrying it is not held to account for it.
 	copies := f.copies
 	if copies <= 0 {
 		copies = s.cfg.Copies
+	}
+	want, strict := s.dgramWireLocked(f)
+	if want != AnyWire && !strict {
+		up := false
+		for m := range s.members {
+			up = up || m.kind.wire == want
+		}
+		if !up {
+			want = AnyWire
+		}
 	}
 	var used []*member
 	for len(used) < copies {
 		var best *member
 		for m := range s.members {
+			if want != AnyWire && m.kind.wire != want {
+				continue
+			}
 			taken := false
 			for _, u := range used {
 				taken = taken || u == m
@@ -133,17 +159,30 @@ func (s *Session) sendDgramLocked(f *flow, p []byte) {
 	}
 }
 
-// dgramLocked: a datagram arrived.
-func (s *Session) dgramLocked(fr frame) {
+// dgramWireLocked is the wire a flow's datagrams go on, and whether only
+// that one: the entry's pin (strict) or its route for the flow's class; on
+// the exit the wire the entry last sent the flow on.
+func (s *Session) dgramWireLocked(f *flow) (WireID, bool) {
+	if s.local != nil {
+		return f.wire, false
+	}
+	if f.pin != AnyWire {
+		return f.pin, true
+	}
+	return s.route.of(f.class), false
+}
+
+// dgramLocked: a datagram arrived on m.
+func (s *Session) dgramLocked(m *member, fr frame) {
 	f := s.flows[fr.stream]
 	if f == nil {
 		if s.local == nil {
 			return // the entry's flow is over
 		}
 		if fr.port == EchoPort {
-			f = &flow{id: fr.stream, port: fr.port, used: time.Now(), copies: 1, opened: time.Now(), echo: true}
+			f = &flow{id: fr.stream, port: fr.port, used: time.Now(), copies: 1, opened: time.Now(), echo: true, wire: m.kind.wire}
 			s.flows[f.id] = f
-			s.dgramLocked(fr)
+			s.dgramLocked(m, fr)
 			return
 		}
 		conn, err := s.local.DialFlow(withTarget(s.ctx, Target{s, ObsFlow, fr.stream}), fr.port)
@@ -152,9 +191,12 @@ func (s *Session) dgramLocked(fr frame) {
 		}
 		// The exit answers a flow as the entry sends it: on one member
 		// until a copy arrives, then on Copies.
-		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1, opened: time.Now()}
+		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1, opened: time.Now(), wire: m.kind.wire}
 		s.flows[f.id] = f
 		go s.readFlow(f)
+	}
+	if s.local != nil {
+		f.wire = m.kind.wire // answers follow the entry's latest choice
 	}
 	if f.replay.seen(fr.seq) {
 		if !f.echo {

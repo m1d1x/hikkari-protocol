@@ -1,6 +1,7 @@
 package trunk
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -42,6 +43,9 @@ type Entry struct {
 	ports   *PortBook
 	logf    func(string, ...any)
 	spread  time.Duration
+	// wires are the wires besides the pool (AddWire); every generation
+	// keeps members of each.
+	wires []Wire
 
 	mu      sync.Mutex
 	cur     *generation
@@ -50,6 +54,7 @@ type Entry struct {
 	retired []*generation
 	next    *generation // drained: comes up, then takes over from cur
 	leaving bool        // Retire: no new generation, ever
+	route   Route       // every generation's, the next one's too
 }
 
 // generation is one session of the entry and its pool.
@@ -88,7 +93,7 @@ func NewEntry(cfg Config, members int, dial Dial, ports *PortBook, logf func(str
 	if members < 1 {
 		return nil, errors.New("trunk: an entry needs at least one member")
 	}
-	e := &Entry{cfg: cfg, members: members, dial: dial, ports: ports, logf: logf, spread: replaceSpread}
+	e := &Entry{cfg: cfg, members: members, dial: dial, ports: ports, logf: logf, spread: replaceSpread, route: AnyRoute}
 	g, err := e.newGeneration()
 	if err != nil {
 		return nil, err
@@ -97,8 +102,55 @@ func NewEntry(cfg Config, members int, dial Dial, ports *PortBook, logf func(str
 	return e, nil
 }
 
+// AddWire adds a wire besides the pool (wires.go), before Run. Its id must
+// be neither the pool's nor AnyWire, and one wire per id.
+func (e *Entry) AddWire(w Wire) error {
+	if w.ID == PoolWire || w.ID == AnyWire {
+		return fmt.Errorf("trunk: wire %q: id %d is reserved", w.Name, w.ID)
+	}
+	if w.Members < 1 || w.Dial == nil {
+		return fmt.Errorf("trunk: wire %q needs a dial and at least one member", w.Name)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.run != nil {
+		return fmt.Errorf("trunk: wire %q: the entry runs already", w.Name)
+	}
+	for _, o := range e.wires {
+		if o.ID == w.ID {
+			return fmt.Errorf("trunk: wire %q: id %d is %q's", w.Name, w.ID, o.Name)
+		}
+	}
+	if w.Ports == nil {
+		w.Ports = e.ports
+	}
+	e.wires = append(e.wires, w)
+	return nil
+}
+
+// SetRoute says which wire each class goes on, for the sessions up now and
+// the ones to come.
+func (e *Entry) SetRoute(r Route) {
+	e.mu.Lock()
+	e.route = r
+	all := e.allLocked()
+	e.mu.Unlock()
+	for _, g := range all {
+		g.s.SetRoute(r)
+	}
+}
+
+// Wires is what the current session sees of each wire.
+func (e *Entry) Wires() map[WireID]WireState { return e.Session().Wires() }
+
+// poolWire is the pool as a Wire.
+func (e *Entry) poolWire() Wire {
+	return Wire{ID: PoolWire, Name: "pool", Shape: "browser", Members: e.members, Dial: e.dial, Ports: e.ports, Streams: true}
+}
+
 func (e *Entry) newGeneration() (*generation, error) {
 	g := &generation{s: newSession(e.cfg, nil)}
+	g.s.route = e.route
 	if _, err := rand.Read(g.id[:]); err != nil {
 		return nil, err
 	}
@@ -215,9 +267,11 @@ func (e *Entry) Run(ctx context.Context) {
 }
 
 func (e *Entry) startLocked(g *generation) {
-	for i := 0; i < e.members; i++ {
-		e.slots.Add(1)
-		go func() { defer e.slots.Done(); e.slot(e.run, g, i) }()
+	for _, w := range append([]Wire{e.poolWire()}, e.wires...) {
+		for i := 0; i < w.Members; i++ {
+			e.slots.Add(1)
+			go func() { defer e.slots.Done(); e.slot(e.run, g, w, i) }()
+		}
 	}
 }
 
@@ -318,7 +372,11 @@ func (e *Entry) closeRetired(force bool) {
 // address in one second.
 var replaceSpread = time.Second
 
-func (e *Entry) slot(ctx context.Context, g *generation, n int) {
+func (e *Entry) slot(ctx context.Context, g *generation, w Wire, n int) {
+	name := fmt.Sprintf("member %d", n)
+	if w.ID != PoolWire {
+		name = fmt.Sprintf("%s member %d", w.Name, n)
+	}
 	backoff := time.Duration(0)
 	stalls := 0 // in a row
 	replace := false
@@ -345,28 +403,28 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 				backoff *= 2
 			}
 		}
-		port, release := e.ports.Take()
-		conn, err := e.dial(ctx, port)
+		port, release := w.Ports.Take()
+		conn, err := w.Dial(ctx, port)
 		if err != nil {
 			release()
 			if errors.Is(err, syscall.EADDRINUSE) {
 				continue // that port is someone else's: another one, now
 			}
 			if errors.Is(err, ErrSilent) {
-				e.ports.Dead(port)
+				w.Ports.Dead(port)
 			}
-			e.logf("trunk: member %d: dial: %v", n, err)
+			e.logf("trunk: %s: dial: %v", name, err)
 			grow()
 			continue
 		}
-		epoch, err := exchangeHello(conn, g.id, e.cfg.Observe != nil)
+		epoch, r, err := exchangeHello(conn, g.id, e.cfg.Observe != nil, w.kind())
 		if err != nil {
 			conn.Close()
 			release()
 			if errors.Is(err, ErrSilent) {
-				e.ports.Dead(port)
+				w.Ports.Dead(port)
 			}
-			e.logf("trunk: member %d: hello: %v", n, err)
+			e.logf("trunk: %s: hello: %v", name, err)
 			grow()
 			continue
 		}
@@ -382,18 +440,18 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 		g.epoch, g.known = epoch, true
 		g.mu.Unlock()
 		started := time.Now()
-		err = g.s.Serve(conn)
+		err = g.s.serve(conn, r, w.kind(), nil)
 		release()
 		replace = true
 		if err != nil && ctx.Err() == nil && !g.retired.Load() && !g.handing.Load() {
-			e.logf("trunk: member %d: down after %s: %v", n, time.Since(started).Round(time.Second), err)
+			e.logf("trunk: %s: down after %s: %v", name, time.Since(started).Round(time.Second), err)
 		}
 		switch {
 		case errors.Is(err, ErrStalled):
 			// The path killed the flow, not the exit: the port is to
 			// blame, another one goes up now. Many in a row is the path
 			// itself, and then the slot waits like any other failure.
-			e.ports.Dead(port)
+			w.Ports.Dead(port)
 			if stalls++; stalls > 3 {
 				grow()
 			} else {
@@ -414,10 +472,13 @@ var ErrSilent = errors.New("trunk: no answer")
 
 const helloTimeout = 5 * time.Second
 
-// exchangeHello says the session's id and reads the exit's epoch.
-// observe says the entry reads observe frames (capObserve in the epoch it
-// sends, which is otherwise zero: an entry has no epoch).
-func exchangeHello(conn io.ReadWriteCloser, id SessionID, observe bool) (Epoch, error) {
+// exchangeHello says the session's id and reads the exit's epoch, for a
+// member of kind k (a t1 hello for the pool's, t2 for any other), and gives
+// the reader the member's frames are read from after it. observe says the
+// entry reads observe frames (capObserve in the epoch it sends, which is
+// otherwise zero: an entry has no epoch). A packet member says its hello
+// again every helloAgain until it is answered: a datagram may be lost.
+func exchangeHello(conn io.ReadWriteCloser, id SessionID, observe bool, k memberKind) (Epoch, *bufio.Reader, error) {
 	var epoch Epoch
 	timer := time.AfterFunc(helloTimeout, func() { conn.Close() })
 	defer timer.Stop()
@@ -425,22 +486,44 @@ func exchangeHello(conn io.ReadWriteCloser, id SessionID, observe bool) (Epoch, 
 	if observe {
 		caps[0] = capObserve
 	}
-	if _, err := conn.Write(appendHello(nil, id, caps)); err != nil {
-		return epoch, err
+	hello := appendHelloFor(nil, id, caps, k)
+	if _, err := conn.Write(hello); err != nil {
+		return epoch, nil, err
 	}
-	var b [29]byte
-	if _, err := io.ReadFull(conn, b[:]); err != nil {
+	answered := make(chan struct{})
+	defer close(answered)
+	if k.packet {
+		go func() {
+			t := time.NewTicker(helloAgain)
+			defer t.Stop()
+			for {
+				select {
+				case <-answered:
+					return
+				case <-t.C:
+					if _, err := conn.Write(hello); err != nil {
+						return
+					}
+				}
+			}
+		}()
+	}
+	r := bufio.NewReaderSize(conn, 64<<10)
+	f, err := readFrame(r)
+	if err != nil {
 		if !timer.Stop() {
-			return epoch, ErrSilent
+			return epoch, nil, ErrSilent
 		}
-		return epoch, err
+		return epoch, nil, err
 	}
-	if b[0] != fHello || string(b[1:5]) != magic || [16]byte(b[5:21]) != id {
-		return epoch, errMagic
+	if f.typ != fHello || f.session != id || f.kind != k {
+		return epoch, nil, errMagic
 	}
-	copy(epoch[:], b[21:29])
-	return epoch, nil
+	return f.epoch, r, nil
 }
+
+// helloAgain is how often a packet member says its hello until answered.
+var helloAgain = 250 * time.Millisecond
 
 // PortBook hands out source ports for members and remembers the ones the
 // path killed. A flow killed by source port dies again on that port (the

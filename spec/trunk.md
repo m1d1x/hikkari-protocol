@@ -111,3 +111,36 @@ bytes each way, chunks, chunks sent again, members that carried and that died ow
 confirmation, datagrams each way and copies dropped, how it ended. The entry adds its client's TCP numbers. The hub joins
 the ends by the id. Every stream keeps these counters in memory for its own sake; one never marked is reported by neither
 end.
+
+## Wires (t2, draft)
+
+Status: written 2026-11-11 on branch `stage4-wires`, not deployed; the set of wires waits for the owner's choice after the
+stand (hikkari-client `plans/2026-11-11-trunk-wires-stage4.md`, step 1). Code: `wires.go`, `selector.go`.
+
+A wire is a kind of member, not a session of its own: the pool is one wire, and members of other forms (QUIC streams, an
+encrypted UDP socket, a tunnel) join the same session. A stream moves from wire to wire as it moves from a dead member to a
+live one: its unconfirmed chunks go again on the other wire, with no new open.
+
+A member of any wire but the pool says it in a t2 hello: `"HKT2"`, session id [16], epoch [8], wire u8, flags u8. Flags:
+bit 1, the member carries streams; bit 2, it is a packet member. The exit answers in kind (the same wire and flags). The
+pool's members keep the t1 hello, so an exit that predates t2 still serves them and refuses the rest as strangers.
+
+A member without the streams flag carries datagrams and pings only: no open, data, ack, fin or rst goes on it, and one that
+arrives there is dropped. A packet member sends every frame in a datagram of its own and reads one frame sequence per
+datagram, both ways; its hello is said again every 250 ms until answered, and the exit answers every copy. It pings every
+100 ms whether or not the last ping came back, owes progress from its oldest unanswered ping, a pong of any ping since
+then is its proof, and its stall limit is the member's limit plus 100 ms: datagrams lost one by one do not kill it.
+
+The entry routes two classes of traffic, each on a wire of its choice: voice (calls and other small live datagrams; by the
+port, as one copy is chosen today) and bulk (streams and every other datagram). A wire with no member that can carry the
+class is passed over for any member that can. The exit has no route: it answers a stream or a flow on the wire the entry
+last sent it on. The trunk's call can be pinned to one wire: then its datagrams go on that wire only, and are lost while it
+has no member, so the call hears the wire alone.
+
+The entry chooses the route every second (the selector). A wire is red when it has no member up, or when every member has
+owed progress for 500 ms while another wire proved the path alive in that time; a red wire is left at once. Every wire
+owing together is a pause of the entry or a cut of the whole path: nothing is red for it and nothing moves. Otherwise the
+rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
+its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
+carries it only when it is better by a margin (3 heard pauses; a quarter faster) for 3 minutes. Bulk goes only on wires
+that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
