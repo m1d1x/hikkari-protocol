@@ -40,6 +40,7 @@ import (
 	hkclient "github.com/m1d1x/hikkari-protocol/client"
 	hkserver "github.com/m1d1x/hikkari-protocol/server"
 	"github.com/m1d1x/hikkari-protocol/trunk"
+	"github.com/m1d1x/hikkari-protocol/wire/datagram"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
@@ -85,6 +86,28 @@ func Certificate(trunkKey, sni string) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
+// DefaultSender is the wire's congestion controller when none is set: BBR,
+// not the datagram channel's guard of v1.05. The guard is made for a
+// connection of DATAGRAM frames only, whose applications pace themselves;
+// a wire member carries the trunk's streams, and the guard's cut to 70% on
+// loss with growth of 3% a half second costs them. Measured on an emulated
+// border line, rtt 47 ms, 12 MiB five times with a call beside it
+// (TestQuicWireSenderOnASharedLine, hikkari-client
+// plans/research/2026-11-11-trunk-quic-wire-sender.md): BBR 71-72 Mbit/s
+// against 32-65 at 100 Mbit/s with a 20 ms queue, 76-77 against 34-40 with
+// 0.5% loss on it, 152-154 against 110-113 at 300 Mbit/s, the same 94 with a
+// 100 ms queue. The price: on the 20 ms queue BBR's four members overran it
+// (a fifth of the bytes down dropped) and the call beside lost 1% to the
+// guard's near nothing.
+var DefaultSender = datagram.SenderBBR
+
+func sender(s string) string {
+	if s == "" {
+		return DefaultSender
+	}
+	return s
+}
+
 // errPin is a certificate that is not the exit's.
 var errPin = errors.New("quicwire: the exit's certificate is not the trunk key's")
 
@@ -117,6 +140,8 @@ type Dialer struct {
 	SNI  string // the server name the members say
 	// Salamander obfuscates every packet (the Hysteria2 shape).
 	Salamander bool
+	// Sender is the members' congestion controller; empty is DefaultSender.
+	Sender string
 }
 
 // Dial opens one member from localPort (0: any): a QUIC connection of its
@@ -133,7 +158,7 @@ func (d Dialer) Dial(ctx context.Context, localPort int) (io.ReadWriteCloser, er
 	life, cancel := context.WithCancel(context.Background())
 	dc, err := hkclient.NewDatagram(hkclient.DatagramOptions{
 		Context: life, Dialer: portDialer(localPort), Server: M.SocksaddrFromNetIP(d.Exit),
-		Password: AccessKey(d.Key), Salamander: salamander,
+		Password: AccessKey(d.Key), Salamander: salamander, Sender: sender(d.Sender),
 		TLS: &clientTLS{config: &tls.Config{ServerName: d.SNI, InsecureSkipVerify: true, VerifyPeerCertificate: verify}},
 	})
 	if err != nil {
@@ -202,6 +227,8 @@ type ListenOptions struct {
 	// Serve gets every member (trunk.Exit.ServeMember), on a goroutine of
 	// its own.
 	Serve func(io.ReadWriteCloser)
+	// Sender, as the entry's; most of the wire's bytes are the exit's.
+	Sender string
 }
 
 // Listen serves the wire until ctx ends or Close.
@@ -228,6 +255,7 @@ func Listen(ctx context.Context, o ListenOptions) (*hkserver.Datagram, error) {
 		Conn:        o.Conn,
 		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &cert, nil },
 		Salamander:  salamander,
+		Sender:      sender(o.Sender),
 		Admitter:    admitter{},
 		Exit:        exit{serve: o.Serve},
 	})

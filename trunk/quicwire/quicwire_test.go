@@ -90,7 +90,10 @@ func TestStreamsOverQUIC(t *testing.T) {
 				t.Fatal(err)
 			}
 			e.SetRoute(trunk.Route{Voice: trunk.AnyWire, Bulk: quic})
-			go e.Run(ctx)
+			// Run logs to the test: the test waits for it to end first.
+			ran := make(chan struct{})
+			go func() { defer close(ran); e.Run(ctx) }()
+			defer func() { cancel(); <-ran }()
 			waitFor(t, func() bool { return e.Wires()[quic].Members == 2 })
 
 			client, edge := net.Pipe()
