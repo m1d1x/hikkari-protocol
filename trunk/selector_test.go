@@ -54,8 +54,9 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 	if c.Route.Voice != PoolWire || !slices.Contains(c.Red, testUDP) {
 		t.Fatalf("voice stayed on a red wire: %+v", c)
 	}
-	if c.Why == "" {
-		t.Fatal("a move with no word for the log")
+	// The hub reads this line back part by part (cascadewatch).
+	if c.Why != "voice: udp is red, to pool" {
+		t.Fatalf("the log says %q", c.Why)
 	}
 }
 

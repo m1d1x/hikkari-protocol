@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -97,7 +98,11 @@ type Choice struct {
 	Warm []WireID
 	// Red are the wires red now.
 	Red []WireID
-	// Why says what changed, for the log; empty when nothing did.
+	// Why says what changed, for the log; empty when nothing did. One
+	// part per class that moved, joined by "; ", each one of
+	// "<class>: on <wire>", "<class>: <wire> is red, to <wire>" and
+	// "<class>: <wire> better than <wire> for <hold>" (hub cascadewatch
+	// reads them back as events).
 	Why string
 }
 
@@ -382,7 +387,7 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 		}
 	}
 	if len(why) > 0 {
-		c.Why = fmt.Sprint(why)
+		c.Why = strings.Join(why, "; ")
 	}
 	return c
 }
@@ -419,7 +424,7 @@ var SteerEvery = time.Second
 func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...any)) {
 	t := time.NewTicker(SteerEvery)
 	defer t.Stop()
-	var lastRed string
+	lastRed := "none"
 	for {
 		select {
 		case <-ctx.Done():
@@ -432,12 +437,30 @@ func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...a
 			if c.Why != "" {
 				logf("trunk: route: %s", c.Why)
 			}
-			if r := fmt.Sprint(c.Red); r != lastRed {
+			if r := sel.names(c.Red); r != lastRed {
 				lastRed = r
-				logf("trunk: red wires %v", c.Red)
+				logf("trunk: red wires %s", r)
 			}
 		}
 	}
+}
+
+// names are the wires' names joined by ",", "none" for no wire.
+func (s *Selector) names(ids []WireID) string {
+	if len(ids) == 0 {
+		return "none"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if sw := s.wires[id]; sw != nil {
+			out = append(out, sw.w.Name)
+		} else {
+			out = append(out, fmt.Sprint(id))
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 func (e *Entry) currentRoute() Route {
