@@ -318,6 +318,46 @@ func judge(f *liveFlow, line *bloatedLine, from, to, tail time.Time) liveVerdict
 	return v
 }
 
+// diary keeps what the client logs, stamped, for a failed run.
+type diary struct {
+	mu    sync.Mutex
+	start time.Time
+	lines []string
+}
+
+func (d *diary) add(level string, args ...any) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.lines = append(d.lines, fmt.Sprintf("%7.3fs %s %s", time.Since(d.start).Seconds(), level, fmt.Sprint(args...)))
+}
+
+func (d *diary) Trace(args ...any)                        { d.add("trace", args...) }
+func (d *diary) Debug(args ...any)                        { d.add("debug", args...) }
+func (d *diary) Info(args ...any)                         { d.add("info", args...) }
+func (d *diary) Warn(args ...any)                         { d.add("warn", args...) }
+func (d *diary) Error(args ...any)                        { d.add("error", args...) }
+func (d *diary) Fatal(args ...any)                        { d.add("fatal", args...) }
+func (d *diary) Panic(args ...any)                        { d.add("panic", args...) }
+func (d *diary) TraceContext(_ context.Context, a ...any) { d.add("trace", a...) }
+func (d *diary) DebugContext(_ context.Context, a ...any) { d.add("debug", a...) }
+func (d *diary) InfoContext(_ context.Context, a ...any)  { d.add("info", a...) }
+func (d *diary) WarnContext(_ context.Context, a ...any)  { d.add("warn", a...) }
+func (d *diary) ErrorContext(_ context.Context, a ...any) { d.add("error", a...) }
+func (d *diary) FatalContext(_ context.Context, a ...any) { d.add("fatal", a...) }
+func (d *diary) PanicContext(_ context.Context, a ...any) { d.add("panic", a...) }
+
+// dump logs the client's diary when the run failed.
+func (d *diary) dump(t *testing.T) {
+	if !t.Failed() {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, l := range d.lines {
+		t.Log("client: " + l)
+	}
+}
+
 // liveCase is one of the four line and bulk pairs.
 type liveCase struct {
 	name       string
@@ -397,11 +437,14 @@ func liveOnABloatedLine(t *testing.T, lc liveCase) {
 	}
 	stream := &hubStream{hub: hub, key: key}
 	stream.stall.Store(true)
+	log := &diary{start: time.Now()}
+	defer log.dump(t)
 	c := client.New(client.Options{
 		Stream:        stream,
 		Datagram:      newDatagram("datagram"),
 		VoiceDatagram: newDatagram("voice"),
 		Dup:           true,
+		Logger:        log,
 	})
 	listenLive := func() net.PacketConn {
 		conn, err := c.ListenPacket(ctx, M.Socksaddr{})
@@ -409,6 +452,12 @@ func liveOnABloatedLine(t *testing.T, lc liveCase) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = conn.Close() })
+		// A datagram attempt that missed ConnectTimeout leaves the
+		// association on the stream channel, stalled here: say so, rather
+		// than report the stream as lost.
+		if _, ok := conn.(interface{ MirrorState() client.Mirror }); !ok {
+			t.Fatalf("an association fell back to the stream channel (%T): the datagram channel missed client.DefaultConnectTimeout", conn)
+		}
 		return conn
 	}
 

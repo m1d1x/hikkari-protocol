@@ -95,3 +95,40 @@ func TestTheGuardLiftsTheLimit(t *testing.T) {
 		t.Fatalf("limited time %v not counted on lifting", g.limitedFor)
 	}
 }
+
+// stubRTT is a connection's round trip as the guard reads it.
+type stubRTT struct{ latest time.Duration }
+
+func (s *stubRTT) MinRTT() time.Duration                  { return s.latest }
+func (s *stubRTT) LatestRTT() time.Duration               { return s.latest }
+func (s *stubRTT) SmoothedRTT() time.Duration             { return s.latest }
+func (s *stubRTT) MeanDeviation() time.Duration           { return 0 }
+func (s *stubRTT) MaxAckDelay() time.Duration             { return 0 }
+func (s *stubRTT) PTO(bool) time.Duration                 { return 3 * s.latest }
+func (s *stubRTT) UpdateRTT(time.Duration, time.Duration) {}
+func (s *stubRTT) SetMaxAckDelay(time.Duration)           {}
+func (s *stubRTT) SetInitialRTT(time.Duration)            {}
+
+// While the line's queue the excess left is still full (the round trip far
+// over the least seen under the limit) the limit holds; once it drains the
+// limit grows again.
+func TestTheGuardProbesOnlyAnEmptyLine(t *testing.T) {
+	g := newGuardSender(1200)
+	rtt := &stubRTT{latest: 20 * time.Millisecond}
+	g.SetRTTStatsProvider(rtt)
+	now := guardRun(g, monotime.Now(), 2, 2000, 0.25, 20*time.Millisecond)
+	if !g.limited {
+		t.Fatal("no limit")
+	}
+	cut := g.rate
+	rtt.latest = 600 * time.Millisecond // the queue is full
+	now = guardRun(g, now, 5, int(cut/1200), 0, 20*time.Millisecond)
+	if !g.limited || g.rate != cut {
+		t.Fatalf("the limit moved on a full line: %.0f, cut %.0f", g.rate, cut)
+	}
+	rtt.latest = 25 * time.Millisecond // drained
+	guardRun(g, now, 5, int(cut/1200), 0, 20*time.Millisecond)
+	if g.rate <= cut {
+		t.Fatalf("the limit did not grow on an empty line: %.0f", g.rate)
+	}
+}
