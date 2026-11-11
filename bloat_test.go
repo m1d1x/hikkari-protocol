@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,11 +19,81 @@ import (
 
 // bloatedLine is a home line whose downlink queue another download has
 // filled: every packet towards the client waits bloat more, in order, the
-// queue drains at the line's rate (lineSlot a packet), and none is dropped (the QUIC connections see no loss). The relay's QUIC
+// queue drains at the line's rate (lineSlot a packet), and none is dropped (the QUIC connections see no loss) unless limit is set.
+// Every QUIC connection through the line shares its one queue. The relay's QUIC
 // connections learn the line's round trip while it is idle, then the queue
 // grows, as a TCP download under the call grows it.
 type bloatedLine struct {
 	bloat atomic.Int64 // ns
+	// limit, when set, is the longest a packet may wait in the line's queue:
+	// one that would wait longer is dropped, as a home router's full buffer
+	// drops it, and the QUIC connections see the loss.
+	limit time.Duration
+	// track keeps every packet's time in the line, for delayAt.
+	track bool
+
+	mu      sync.Mutex
+	last    time.Time // FIFO across the line: no packet overtakes the one before
+	log     []passage // when track is set, by at
+	dropped int64
+}
+
+// passage is one packet the line handed over: when, and how long it waited
+// in the line's queue.
+type passage struct {
+	at   time.Time
+	wait time.Duration
+}
+
+// enter queues one packet arriving now and says when the line hands it over,
+// or false when the line drops it.
+func (l *bloatedLine) enter(now time.Time) (time.Time, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	at := now.Add(time.Duration(l.bloat.Load()))
+	if at.Before(l.last.Add(lineSlot)) {
+		at = l.last.Add(lineSlot) // the line drains its queue at its rate
+	}
+	if l.limit > 0 && at.Sub(now) > l.limit {
+		l.dropped++
+		return time.Time{}, false
+	}
+	l.last = at
+	if l.track {
+		l.log = append(l.log, passage{at, at.Sub(now)})
+	}
+	return at, true
+}
+
+// delayAt is the longest wait in the line of the packets it handed over in
+// [from, to]: the line's own delay at that moment, our queues not counted.
+func (l *bloatedLine) delayAt(from, to time.Time) time.Duration {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	i := sort.Search(len(l.log), func(i int) bool { return !l.log[i].at.Before(from) })
+	var worst time.Duration
+	for ; i < len(l.log) && !l.log[i].at.After(to); i++ {
+		worst = max(worst, l.log[i].wait)
+	}
+	return worst
+}
+
+// peak is the longest wait any packet had in the line since since.
+func (l *bloatedLine) peak(since time.Time) time.Duration {
+	return l.delayAt(since, time.Now())
+}
+
+// empty is when the line hands over the last packet it holds now.
+func (l *bloatedLine) empty() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.last
+}
+
+func (l *bloatedLine) drops() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.dropped
 }
 
 func (l *bloatedLine) DialContext(ctx context.Context, network string, dest M.Socksaddr) (net.Conn, error) {
@@ -30,7 +101,7 @@ func (l *bloatedLine) DialContext(ctx context.Context, network string, dest M.So
 	if err != nil {
 		return nil, err
 	}
-	b := &bloatedConn{Conn: c, line: l, in: make(chan arrival, 4096)}
+	b := &bloatedConn{Conn: c, line: l, in: make(chan arrival, 1<<16)}
 	go b.pump()
 	return b, nil
 }
@@ -51,24 +122,22 @@ type bloatedConn struct {
 	net.Conn
 	line *bloatedLine
 	in   chan arrival
-	last time.Time // FIFO: no packet overtakes the one before
 	rd   atomic.Pointer[time.Time]
 }
 
 func (c *bloatedConn) pump() {
 	defer close(c.in)
+	b := make([]byte, 2048)
 	for {
-		b := make([]byte, 2048)
 		n, err := c.Conn.Read(b)
 		if err != nil {
 			return
 		}
-		at := time.Now().Add(time.Duration(c.line.bloat.Load()))
-		if at.Before(c.last.Add(lineSlot)) {
-			at = c.last.Add(lineSlot) // the line drains its queue at its rate
+		at, ok := c.line.enter(time.Now())
+		if !ok {
+			continue
 		}
-		c.last = at
-		c.in <- arrival{b[:n], at}
+		c.in <- arrival{append([]byte(nil), b[:n]...), at}
 	}
 }
 

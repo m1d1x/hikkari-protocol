@@ -39,6 +39,12 @@ type ServiceOptions struct {
 	Handler            ServerHandler
 	MasqueradeHandler  http.Handler
 	BBRProfile         string
+	// Sender is every connection's congestion controller: SenderGuard (the
+	// default) or SenderBBR (with BBRProfile), the rollback.
+	Sender string
+	// Ceiling, when set, gives an authenticated user's connection its limit
+	// on datagrams down, shared by the user's connections (nil: none).
+	Ceiling func(user any) *Ceiling
 	// OnAuth, when set, is told of every connection that authenticates, as
 	// it does (v1.04 observability).
 	OnAuth func(user any, conn *quic.Conn)
@@ -65,6 +71,8 @@ type Service[U comparable] struct {
 	masqueradeHandler  http.Handler
 	quicListener       io.Closer
 	bbrProfile         congestion_meta2.Profile
+	sender             string
+	ceiling            func(user any) *Ceiling
 	onAuth             func(user any, conn *quic.Conn)
 	connectionIDs      quic.ConnectionIDGenerator
 }
@@ -91,6 +99,10 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 			return nil, err
 		}
 	}
+	sender, err := ParseSender(options.Sender)
+	if err != nil {
+		return nil, err
+	}
 	if options.MasqueradeHandler == nil {
 		options.MasqueradeHandler = http.NotFoundHandler()
 	}
@@ -109,6 +121,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		onAuth:             options.OnAuth,
 		connectionIDs:      options.ConnectionIDs,
 		bbrProfile:         bbrProfile,
+		sender:             sender,
+		ceiling:            options.Ceiling,
 	}
 	service.userMap.Store(&map[string]U{})
 	return service, nil
@@ -200,6 +214,7 @@ func (s *Service[U]) handleConnection(connection *quic.Conn) {
 		Service:    s,
 		ctx:        s.ctx,
 		quicConn:   connection,
+		queue:      newConnSendQueue(connection, s.sender),
 		connDone:   make(chan struct{}),
 		udpConnMap: make(map[uint32]*udpPacketConn),
 	}
@@ -215,6 +230,7 @@ type serverSession[U comparable] struct {
 	*Service[U]
 	ctx           context.Context
 	quicConn      *quic.Conn
+	queue         *sendQueue // the one sender of its datagrams (v1.05)
 	connAccess    sync.Mutex
 	connDone      chan struct{}
 	connErr       error
@@ -242,12 +258,12 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.onAuth != nil {
 			s.onAuth(user, s.quicConn)
 		}
-		// BBR always, whatever bandwidth the client claims: Brutal's fixed
-		// rate makes no bandwidth and costs latency.
-		s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-			s.quicConn.InitialPacketSize(),
-			s.bbrProfile,
-		))
+		// Never Brutal, whatever bandwidth the client claims: a fixed rate
+		// makes no bandwidth and costs latency.
+		setSender(s.quicConn, s.queue, s.sender, s.bbrProfile)
+		if s.ceiling != nil {
+			s.queue.ceiling.Store(s.ceiling(user))
+		}
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{UDPEnabled: true, RxAuto: true})
 		w.WriteHeader(protocol.StatusAuthOK)
 		if s.ctx.Done() != nil {

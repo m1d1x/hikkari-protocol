@@ -12,6 +12,7 @@ import (
 	"github.com/m1d1x/hikkari-protocol/connect"
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/observe"
+	"github.com/m1d1x/hikkari-protocol/wire/datagram"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
@@ -23,8 +24,25 @@ import (
 const DupGrace = 30 * time.Second
 
 // dupQueue bounds the frames waiting for one carrier; a carrier that cannot
-// keep up loses the newest, the other carrier still has them.
+// keep up loses the newest, the other carrier still has them. A datagram
+// carrier hands its frames on at once to the connection's scheduler, where
+// they wait by their age (v1.05); a stream carrier's own queue drops a frame
+// older than datagram.StaleAfter before its write.
 const dupQueue = 256
+
+// legFrame is a frame in a leg's queue: when it was queued, and whether it
+// must go whatever its age (an attach).
+type legFrame struct {
+	b    []byte
+	at   time.Time
+	keep bool
+}
+
+// channelStats is a datagram carrier's association as the scheduler counts
+// it (wire/datagram).
+type channelStats interface {
+	TakeStats() datagram.ChannelStats
+}
 
 // DupHub serves duplicated associations (package dup) for both channels of a
 // relay: carriers of one session, from either channel, share one exit socket.
@@ -177,7 +195,10 @@ func (h *DupHub) attach(ctx context.Context, key, group string, id dup.Session, 
 		s.unbook = h.book.Add(group, s.take)
 		go s.down()
 	}
-	leg := &dupLeg{c: c, queue: make(chan []byte, dupQueue)}
+	leg := &dupLeg{c: c, s: s, queue: make(chan legFrame, dupQueue)}
+	if p, ok := c.(*packetCarrier); ok {
+		leg.stats, _ = common.Cast[channelStats](p.conn)
+	}
 	s.mu.Lock()
 	s.legs[leg] = struct{}{}
 	s.mu.Unlock()
@@ -187,7 +208,9 @@ func (h *DupHub) attach(ctx context.Context, key, group string, id dup.Session, 
 
 type dupLeg struct {
 	c     carrier
-	queue chan []byte
+	s     *dupSession
+	stats channelStats // a datagram carrier's; nil for a stream carrier
+	queue chan legFrame
 	// mu orders put against stop: the session sends answers to a leg that
 	// may be detaching.
 	mu   sync.Mutex
@@ -213,7 +236,7 @@ func (l *dupLeg) join(id dup.Session, lane uint8) {
 		}
 	}
 	ack, _ := dup.Append(nil, dup.Frame{Kind: dup.KindAttach, Session: id, Lane: lane})
-	l.put(ack)
+	l.queueFrame(legFrame{b: ack, at: time.Now(), keep: true})
 }
 
 // voiceCarrier is a datagram association that can say its QUIC connection
@@ -223,13 +246,17 @@ type voiceCarrier interface{ CarryVoice() }
 // put queues a frame without waiting; a stopped leg loses it, and so does a
 // full one, which says so: the frame never reached the wire.
 func (l *dupLeg) put(frame []byte) (full bool) {
+	return l.queueFrame(legFrame{b: frame, at: time.Now()})
+}
+
+func (l *dupLeg) queueFrame(f legFrame) (full bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.done {
 		return false
 	}
 	select {
-	case l.queue <- frame:
+	case l.queue <- f:
 		return false
 	default:
 		return true
@@ -238,9 +265,19 @@ func (l *dupLeg) put(frame []byte) (full bool) {
 
 func (l *dupLeg) voice() bool { return uint8(l.lane.Load()) == dup.LaneVoice }
 
+// write sends the leg's frames in order. A stream carrier drops an answer
+// that waited longer than datagram.StaleAfter: it would come too late to be
+// of use (v1.05).
 func (l *dupLeg) write() {
-	for frame := range l.queue {
-		if l.c.writeFrame(frame) != nil {
+	stream := l.c.via() == dup.ViaStream
+	for f := range l.queue {
+		if stream && !f.keep && time.Since(f.at) > datagram.StaleAfter {
+			l.s.mu.Lock()
+			l.s.staleStream++
+			l.s.mu.Unlock()
+			continue
+		}
+		if l.c.writeFrame(f.b) != nil {
 			l.c.close()
 			for range l.queue {
 			}
@@ -276,6 +313,22 @@ type dupSession struct {
 	names    sync.Map                  // netip.AddrPort -> M.Socksaddr
 	// Answers a leg's queue had no room for, by the leg's channel.
 	fullDatagram, fullStream int64
+	// What the legs' channels dropped and how long frames waited (v1.05),
+	// taken from the datagram legs and the stream legs' queues.
+	staleDatagram, staleStream, rxDrop int64
+	queueMS                            observe.Dist
+}
+
+// absorb takes what a datagram leg's channel counted into the session; s.mu
+// is held.
+func (s *dupSession) absorb(leg *dupLeg) {
+	if leg.stats == nil {
+		return
+	}
+	st := leg.stats.TakeStats()
+	s.staleDatagram += st.Stale
+	s.rxDrop += st.RxDrop
+	s.queueMS.Merge(&st.Queue)
 }
 
 // up sends the first copy of a client packet out of the exit socket.
@@ -383,6 +436,9 @@ func (s *dupSession) down() {
 // detach removes a leg; the last one leaves the session the grace period.
 func (s *dupSession) detach(leg *dupLeg) {
 	s.mu.Lock()
+	if _, ok := s.legs[leg]; ok {
+		s.absorb(leg)
+	}
 	delete(s.legs, leg)
 	left := len(s.legs)
 	if left == 0 && !s.ended {
@@ -402,6 +458,9 @@ func (s *dupSession) end() {
 	s.mu.Lock()
 	s.ended = true
 	legs := s.legs
+	for leg := range legs {
+		s.absorb(leg)
+	}
 	s.legs = map[*dupLeg]struct{}{}
 	s.endedBy = observe.EndIdle
 	if len(legs) == 0 {
@@ -436,6 +495,14 @@ func (s *dupSession) take(p *observe.Period) {
 	p.Dup.FullDatagram += s.fullDatagram
 	p.Dup.FullStream += s.fullStream
 	s.fullDatagram, s.fullStream = 0, 0
+	for leg := range s.legs {
+		s.absorb(leg)
+	}
+	p.Dup.StaleDatagram += s.staleDatagram
+	p.Dup.StaleStream += s.staleStream
+	p.Dup.RxDrop += s.rxDrop
+	p.Dup.QueueMS.Merge(&s.queueMS)
+	s.staleDatagram, s.staleStream, s.rxDrop, s.queueMS = 0, 0, 0, observe.Dist{}
 }
 
 type packetCarrier struct {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/observe"
+	"github.com/m1d1x/hikkari-protocol/wire/datagram"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -45,8 +46,25 @@ const dupRedial = 2 * time.Second
 
 // legQueue bounds the frames waiting for one carrier. A carrier that cannot
 // keep up loses the newest frames, as a UDP path would; the application's
-// writes never wait for a carrier.
+// writes never wait for a carrier. A datagram carrier hands its frames on at
+// once to the connection's scheduler, where they wait by their age (v1.05);
+// the stream copy's own queue drops a frame older than datagram.StaleAfter
+// before its write.
 const legQueue = 256
+
+// legFrame is a frame in a carrier's queue: when it was queued, and whether
+// it must go whatever its age (an attach).
+type legFrame struct {
+	b    []byte
+	at   time.Time
+	keep bool
+}
+
+// channelStats is a datagram carrier's association as the scheduler counts
+// it (wire/datagram).
+type channelStats interface {
+	TakeStats() datagram.ChannelStats
+}
 
 type inbound struct {
 	payload []byte
@@ -87,6 +105,10 @@ type dupConn struct {
 	det          detector
 	// Frames a carrier's queue had no room for, by the carrier's channel.
 	fullDatagram, fullStream int64
+	// What the carriers' channels dropped and how long frames waited (v1.05),
+	// taken from the datagram carriers and the stream copy's queue.
+	staleDatagram, staleStream, rxDrop int64
+	queueMS                            observe.Dist
 
 	deadline     time.Time
 	deadlineWake chan struct{}
@@ -98,31 +120,37 @@ type dupLeg struct {
 	via   dup.Via
 	send  func([]byte) error
 	shut  func()
+	stats channelStats // a datagram carrier's; nil for the stream copy
 	mu    sync.Mutex
 	done  bool
-	queue chan []byte
+	queue chan legFrame
 }
 
 func newLeg(lane uint8, via dup.Via, send func([]byte) error, shut func()) *dupLeg {
-	return &dupLeg{lane: lane, via: via, send: send, shut: shut, queue: make(chan []byte, legQueue)}
+	return &dupLeg{lane: lane, via: via, send: send, shut: shut, queue: make(chan legFrame, legQueue)}
 }
 
-// put queues a frame without waiting; false when the carrier is gone or full.
+// put queues an attach without waiting; false when the carrier is gone or
+// full. An attach goes whatever its age.
 func (l *dupLeg) put(frame []byte) bool {
-	ok, _ := l.offer(frame)
+	ok, _ := l.queueFrame(legFrame{b: frame, at: time.Now(), keep: true})
 	return ok
 }
 
-// offer is put that also says whether a refused frame found the queue full,
-// so it never reached the wire.
+// offer queues a packet's frame and also says whether a refused frame found
+// the queue full, so it never reached the wire.
 func (l *dupLeg) offer(frame []byte) (ok, full bool) {
+	return l.queueFrame(legFrame{b: frame, at: time.Now()})
+}
+
+func (l *dupLeg) queueFrame(f legFrame) (ok, full bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.done {
 		return false, false
 	}
 	select {
-	case l.queue <- frame:
+	case l.queue <- f:
 		return true, false
 	default:
 		return false, true
@@ -175,6 +203,13 @@ func (d *dupConn) take(p *observe.Period) {
 	p.Dup.FullDatagram += d.fullDatagram
 	p.Dup.FullStream += d.fullStream
 	d.fullDatagram, d.fullStream = 0, 0
+	d.absorb(d.primary)
+	d.absorb(d.voice)
+	p.Dup.StaleDatagram += d.staleDatagram
+	p.Dup.StaleStream += d.staleStream
+	p.Dup.RxDrop += d.rxDrop
+	p.Dup.QueueMS.Merge(&d.queueMS)
+	d.staleDatagram, d.staleStream, d.rxDrop, d.queueMS = 0, 0, 0, observe.Dist{}
 	if d.det.done.N > 0 {
 		if p.Calls == nil {
 			p.Calls = &observe.Calls{}
@@ -184,12 +219,25 @@ func (d *dupConn) take(p *observe.Period) {
 	}
 }
 
+// absorb takes what a datagram carrier's channel counted into the session;
+// d.mu is held.
+func (d *dupConn) absorb(leg *dupLeg) {
+	if leg == nil || leg.stats == nil {
+		return
+	}
+	s := leg.stats.TakeStats()
+	d.staleDatagram += s.Stale
+	d.rxDrop += s.RxDrop
+	d.queueMS.Merge(&s.Queue)
+}
+
 // packetLeg starts a carrier on a datagram connection, attached to lane.
 func (d *dupConn) packetLeg(p net.PacketConn, lane uint8) *dupLeg {
 	leg := newLeg(lane, dup.ViaDatagram, func(frame []byte) error {
 		_, err := p.WriteTo(frame, dup.HostAddr())
 		return err
 	}, func() { _ = p.Close() })
+	leg.stats, _ = p.(channelStats)
 	leg.put(attachFrame(d.id, lane))
 	go d.drain(leg)
 	go d.readPacket(leg, p)
@@ -197,9 +245,17 @@ func (d *dupConn) packetLeg(p net.PacketConn, lane uint8) *dupLeg {
 }
 
 // drain sends a carrier's frames in order; a failed send ends the carrier.
+// The stream copy drops a packet's frame that waited longer than
+// datagram.StaleAfter: it would come too late to be of use (v1.05).
 func (d *dupConn) drain(leg *dupLeg) {
-	for frame := range leg.queue {
-		if err := leg.send(frame); err != nil {
+	for f := range leg.queue {
+		if leg.via == dup.ViaStream && !f.keep && time.Since(f.at) > datagram.StaleAfter {
+			d.mu.Lock()
+			d.staleStream++
+			d.mu.Unlock()
+			continue
+		}
+		if err := leg.send(f.b); err != nil {
 			d.legDown(leg, err)
 			break
 		}
@@ -397,11 +453,13 @@ func (d *dupConn) legDown(leg *dupLeg, err error) {
 	primaryLost, redial := false, false
 	switch leg {
 	case d.primary:
+		d.absorb(leg)
 		d.primary = nil
 		primaryLost = true
 		redial = !d.redialing && d.ctx.Err() == nil
 		d.redialing = d.redialing || redial
 	case d.voice:
+		d.absorb(leg)
 		d.voice = nil
 		d.voiceErr = time.Now()
 	case d.mirror:
@@ -519,6 +577,9 @@ func (d *dupConn) Close() error {
 	d.cancel()
 	d.mu.Lock()
 	legs := []*dupLeg{d.primary, d.voice, d.mirror}
+	for _, leg := range legs {
+		d.absorb(leg)
+	}
 	d.primary, d.voice, d.mirror = nil, nil, nil
 	first := !d.closed
 	if first {

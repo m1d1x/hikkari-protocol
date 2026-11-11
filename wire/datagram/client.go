@@ -37,7 +37,10 @@ type ClientOptions struct {
 	TLSConfig          aTLS.Config
 	QUICOptions        qtls.QUICOptions
 	BBRProfile         string
-	ChromeParrot       bool
+	// Sender is the connection's congestion controller: SenderGuard (the
+	// default) or SenderBBR (with BBRProfile), the rollback.
+	Sender       string
+	ChromeParrot bool
 	// OnAuth, when set, is told of every connection the relay admits (v1.04
 	// observability).
 	OnAuth func(conn *quic.Conn)
@@ -53,6 +56,7 @@ type Client struct {
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	bbrProfile         congestion_meta2.Profile
+	sender             string
 	onAuth             func(conn *quic.Conn)
 
 	connAccess sync.Mutex
@@ -85,7 +89,12 @@ func NewClient(options ClientOptions) (*Client, error) {
 			return nil, err
 		}
 	}
+	sender, err := ParseSender(options.Sender)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
+		sender:             sender,
 		ctx:                options.Context,
 		dialer:             options.Dialer,
 		logger:             options.Logger,
@@ -240,13 +249,12 @@ func (c *Client) authenticateAndWrap(ctx context.Context, rawConn io.Closer, cre
 		return nil, E.New("authentication failed, status code: ", response.StatusCode)
 	}
 	authResponse := protocol.AuthResponseFromHeader(response.Header)
-	// BBR always: Brutal's fixed rate makes no bandwidth and costs latency.
-	quicConn.SetCongestionControl(congestion_meta2.NewBbrSenderWithProfile(
-		quicConn.InitialPacketSize(),
-		c.bbrProfile,
-	))
+	// Never Brutal: a fixed rate makes no bandwidth and costs latency.
+	queue := newConnSendQueue(quicConn, c.sender)
+	setSender(quicConn, queue, c.sender, c.bbrProfile)
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
+		queue:       queue,
 		rawConn:     rawConn,
 		connDone:    make(chan struct{}),
 		udpDisabled: !authResponse.UDPEnabled,
@@ -291,7 +299,7 @@ func (c *Client) ListenPacket(ctx context.Context) (net.PacketConn, error) {
 		return nil, E.New("UDP disabled by server")
 	}
 	var sessionID uint32
-	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, func() {
+	clientPacketConn := newUDPPacketConn(c.ctx, conn.quicConn, conn.queue, func() {
 		conn.releaseUDPSession(sessionID)
 	})
 	conn.access.Lock()
@@ -362,6 +370,7 @@ type clientOffer struct {
 
 type clientQUICConnection struct {
 	quicConn     *quic.Conn
+	queue        *sendQueue // the one sender of its datagrams (v1.05)
 	rawConn      io.Closer
 	connDone     chan struct{}
 	connErr      error

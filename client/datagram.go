@@ -33,7 +33,10 @@ type DatagramOptions struct {
 	QUIC qtls.QUICOptions
 	// NoChromeParrot sends the plain QUIC Initial instead of Chrome's.
 	NoChromeParrot bool
-	Logger         logger.Logger
+	// Sender is the connection's congestion controller (v1.05):
+	// datagram.SenderGuard when empty, datagram.SenderBBR the rollback.
+	Sender string
+	Logger logger.Logger
 	// Book, when set, counts the channel's QUIC connections under Name
 	// ("datagram", or "voice" for the voice connection of v1.03) in the
 	// client's group (v1.04 observability).
@@ -62,6 +65,7 @@ func NewDatagram(opts DatagramOptions) (*Datagram, error) {
 		TLSConfig:          opts.TLS,
 		QUICOptions:        opts.QUIC,
 		ChromeParrot:       !opts.NoChromeParrot,
+		Sender:             opts.Sender,
 		OnAuth: func(conn *quic.Conn) {
 			name := opts.Name
 			if name == "" {

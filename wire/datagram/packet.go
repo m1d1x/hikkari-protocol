@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"io"
 	"math"
 	"net"
@@ -121,8 +120,9 @@ type udpPacketConn struct {
 	cancel          context.CancelCauseFunc
 	sessionID       uint32
 	quicConn        *quic.Conn
+	queue           *sendQueue
+	stats           channelStats
 	data            chan *udpMessage
-	udpMTU          int
 	packetId        atomic.Uint32
 	closeOnce       sync.Once
 	defragger       *udpDefragger
@@ -131,14 +131,18 @@ type udpPacketConn struct {
 	readDeadline    pipe.Deadline
 }
 
-func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, onDestroy func()) *udpPacketConn {
+// receiveQueue bounds the messages an association holds for its reader; over
+// it a message is dropped and counted (ChannelStats.RxDrop).
+const receiveQueue = 256
+
+func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, queue *sendQueue, onDestroy func()) *udpPacketConn {
 	ctx, cancel := context.WithCancelCause(ctx)
 	return &udpPacketConn{
 		ctx:          ctx,
 		cancel:       cancel,
 		quicConn:     quicConn,
-		data:         make(chan *udpMessage, 64),
-		udpMTU:       1200 - 3,
+		queue:        queue,
+		data:         make(chan *udpMessage, receiveQueue),
 		defragger:    newUDPDefragger(),
 		onDestroy:    onDestroy,
 		readDeadline: pipe.MakeDeadline(),
@@ -180,127 +184,57 @@ func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
+	return c.write(buffer.Bytes(), destination.String(), destination)
+}
+
+func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if err := c.write(p, addr.String(), M.SocksaddrFromNet(addr)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// write hands one message to the connection's scheduler and returns at once
+// (v1.05): the message waits there, by its age, and never in the writer.
+func (c *udpPacketConn) write(p []byte, destinationString string, destination M.Socksaddr) error {
 	select {
 	case <-c.ctx.Done():
 		return net.ErrClosed
 	default:
 	}
-	if buffer.Len() > protocol.MaxUDPSize {
+	if len(p) > protocol.MaxUDPSize {
 		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: protocol.MaxUDPSize}
 	}
 	if !destination.IsIP() && len(destination.Fqdn) > 255 {
 		return E.New("fqdn too long")
 	}
-	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
-	message := allocMessage()
-	*message = udpMessage{
-		sessionID:     c.sessionID,
-		packetID:      packetId,
-		fragmentTotal: 1,
-		destination:   destination.String(),
-		data:          buffer,
-	}
-	defer message.releaseMessage()
-	var err error
-	if c.udpMTU > message.headerSize() && buffer.Len() > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
-	} else {
-		err = c.writePacket(message)
-	}
-	if err == nil {
-		return nil
-	}
-	var tooLargeErr *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLargeErr) || int(tooLargeErr.MaxDatagramPayloadSize-3) <= message.headerSize() {
-		return err
-	}
-	return c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
-}
-
-func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	select {
-	case <-c.ctx.Done():
-		return 0, net.ErrClosed
-	default:
-	}
-	if len(p) > protocol.MaxUDPSize {
-		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: protocol.MaxUDPSize}
-	}
-	destination := M.SocksaddrFromNet(addr)
-	if !destination.IsIP() && len(destination.Fqdn) > 255 {
-		return 0, E.New("fqdn too long")
-	}
-	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
-	message := allocMessage()
-	*message = udpMessage{
-		sessionID:     c.sessionID,
-		packetID:      packetId,
-		fragmentTotal: 1,
-		destination:   addr.String(),
-		data:          buf.As(p),
-	}
-	defer message.releaseMessage()
-	if c.udpMTU > message.headerSize() && len(p) > c.udpMTU-message.headerSize() {
-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
-		if err == nil {
-			return len(p), nil
-		}
-	} else {
-		err = c.writePacket(message)
-	}
-	if err == nil {
-		return len(p), nil
-	}
-	var tooLargeErr *quic.DatagramTooLargeError
-	if !errors.As(err, &tooLargeErr) || int(tooLargeErr.MaxDatagramPayloadSize-3) <= message.headerSize() {
-		return
-	}
-	err = c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
-	if err == nil {
-		return len(p), nil
-	}
-	return
+	return c.queue.put(&queuedMessage{
+		owner:       c,
+		packetID:    uint16(c.packetId.Add(1) % math.MaxUint16),
+		destination: destinationString,
+		data:        append([]byte(nil), p...),
+		at:          time.Now(),
+	})
 }
 
 func (c *udpPacketConn) inputPacket(message *udpMessage) {
-	if message.fragmentTotal <= 1 {
-		select {
-		case c.data <- message:
-		default:
-			message.releaseMessage()
-		}
-	} else {
-		newMessage := c.defragger.feed(message)
-		if newMessage != nil {
-			select {
-			case c.data <- newMessage:
-			default:
-				newMessage.releaseMessage()
-			}
+	if message.fragmentTotal > 1 {
+		if message = c.defragger.feed(message); message == nil {
+			return
 		}
 	}
-}
-
-func (c *udpPacketConn) writePackets(messages []*udpMessage) error {
-	defer releaseMessages(messages)
-	for _, message := range messages {
-		err := c.writePacket(message)
-		if err != nil {
-			return err
-		}
+	select {
+	case c.data <- message:
+	default:
+		message.releaseMessage()
+		c.stats.rxDrop()
 	}
-	return nil
-}
-
-func (c *udpPacketConn) writePacket(message *udpMessage) error {
-	buffer := message.pack()
-	defer buffer.Release()
-	return c.quicConn.SendDatagram(buffer.Bytes())
 }
 
 func (c *udpPacketConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closeWithError(os.ErrClosed)
+		c.queue.forget(c.sessionID)
 		c.onDestroy()
 	})
 	return nil
