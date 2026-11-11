@@ -3,8 +3,8 @@ module github.com/m1d1x/hikkari-protocol/trunk/quicwire
 go 1.26.0
 
 require (
-	github.com/m1d1x/hikkari-protocol v0.0.0
-	github.com/m1d1x/hikkari-protocol/trunk v0.0.0
+	github.com/m1d1x/hikkari-protocol v0.0.0-20261111064314-55387882bce4
+	github.com/m1d1x/hikkari-protocol/trunk v0.0.0-20261111064314-55387882bce4
 	github.com/sagernet/sing v0.9.7-0.20260929150544-0ad23b637bd4
 )
 
