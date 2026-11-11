@@ -57,7 +57,13 @@ const (
 	guardClean = 0.02
 	guardGrow  = 1.03
 	guardHold  = 3
-	guardOff   = 2.0
+	// guardProbeRTT: the limit grows only while the round trip is within
+	// this of the least seen since the limit came on, the line's queue all
+	// but empty. A probe over the line's rate into a full queue costs every
+	// sender on the line a burst of loss (a call beside a deaf bulk got 81
+	// to 95 % of its packets with growth on a full queue).
+	guardProbeRTT = 50 * time.Millisecond
+	guardOff      = 2.0
 	// guardFloor is the least the limit falls to, bytes a second (1 Mbit/s):
 	// a connection sending less floods no line a call can live on, and the
 	// limit never cuts a call that loses by another sender's flood on the
@@ -93,6 +99,10 @@ type guardSender struct {
 	limited bool
 	rate    float64 // bytes a second while limited
 	clean   int     // clean stretches in a row while limited
+	// rtt is the connection's; leastRTT the least round trip seen since the
+	// limit came on.
+	rtt      congestion.RTTStatsProvider
+	leastRTT time.Duration
 	// pace is rate for the connection's scheduler, 0 while not limited
 	// (math.Float64bits; read from the scheduler's goroutine).
 	pace   atomic.Uint64
@@ -110,7 +120,23 @@ func newGuardSender(initialPacketSize congestion.ByteCount) *guardSender {
 	return &guardSender{maxDatagramSize: initialPacketSize}
 }
 
-func (g *guardSender) SetRTTStatsProvider(congestion.RTTStatsProvider) {}
+func (g *guardSender) SetRTTStatsProvider(p congestion.RTTStatsProvider) { g.rtt = p }
+
+// lineEmpty reports whether the round trip is back near the least seen while
+// limited: the queue the excess left on the line has drained.
+func (g *guardSender) lineEmpty() bool {
+	if g.rtt == nil {
+		return true
+	}
+	latest := g.rtt.LatestRTT()
+	if latest <= 0 {
+		return true
+	}
+	if g.leastRTT == 0 || latest < g.leastRTT {
+		g.leastRTT = latest
+	}
+	return latest <= g.leastRTT+guardProbeRTT
+}
 
 func (g *guardSender) TimeUntilSend(congestion.ByteCount) monotime.Time {
 	if !g.limited || g.budget >= float64(g.maxDatagramSize) {
@@ -190,7 +216,7 @@ func (g *guardSender) judge(now monotime.Time) {
 	switch {
 	case !g.limited && lossy:
 		g.limited, g.rate, g.budget, g.refill = true, delivered, 0, now
-		g.clean = 0
+		g.clean, g.leastRTT = 0, 0
 		g.mu.Lock()
 		g.since = now
 		g.mu.Unlock()
@@ -200,10 +226,10 @@ func (g *guardSender) judge(now monotime.Time) {
 	case g.limited && loss >= guardClean:
 		g.clean = 0
 	case g.limited:
-		if g.clean++; g.clean <= guardHold {
-			break
+		g.clean++
+		if empty := g.lineEmpty(); g.clean > guardHold && empty {
+			g.rate *= guardGrow
 		}
-		g.rate *= guardGrow
 		if g.rate > guardOff*float64(g.sent)/secs {
 			g.limited = false
 			g.mu.Lock()
@@ -211,6 +237,9 @@ func (g *guardSender) judge(now monotime.Time) {
 			g.since = 0
 			g.mu.Unlock()
 		}
+	}
+	if g.limited && g.rtt != nil {
+		g.lineEmpty() // keeps leastRTT up to date in every stretch
 	}
 	if g.limited {
 		g.pace.Store(math.Float64bits(g.rate))
