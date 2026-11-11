@@ -315,6 +315,14 @@ func (s *Session) Route() Route {
 	return s.route
 }
 
+// LastPause is when this end last came back from a pause of its own (a
+// turn of its clock later than lateTick); zero for none.
+func (s *Session) LastPause() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resumed
+}
+
 // Wires is what the session sees of each wire that has a member up now,
 // by wire id.
 func (s *Session) Wires() map[WireID]WireState {

@@ -139,7 +139,10 @@ has no member, so the call hears the wire alone.
 
 The entry chooses the route every second (the selector). A wire is red when it has no member up, or when every member has
 owed progress for 500 ms while another wire proved the path alive in that time; a red wire is left at once. Every wire
-owing together is a pause of the entry or a cut of the whole path: nothing is red for it and nothing moves. Otherwise the
+owing together is a pause of the entry or a cut of the whole path: nothing is red for it and nothing moves. Nor is a wire
+left while every wire is red, or within 10 s of a pause of the entry's own (its session's clock or the selector's tick ran
+late): a box that was not run buries and owes on every wire, and which one comes back last is luck, not the wire. Such a
+wire is held; while it has no member up, its traffic goes on any member that can carry it. Otherwise the
 rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
 its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
 carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Bulk goes only on wires

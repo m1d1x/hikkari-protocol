@@ -20,7 +20,13 @@ import (
 //     owing progress for RedSilence (WireState.Owed) while another wire
 //     proved the path alive in that time. Every wire silent together is a pause of this box
 //     or a cut of the whole path: nobody is red for it (as Quiet in the
-//     pool), and nothing moves.
+//     pool), and nothing moves. Nor does a wire red within PauseGrace of a
+//     pause of this box (Paused): a box that was not run buries and owes
+//     on every wire, and which one comes back last is luck, not the wire
+//     (11.11: every move of voice off udp came in a train of the entry's
+//     own pauses, at the stand's rounds). Such a wire is Held, not left;
+//     while it has no member the session carries its traffic on any member
+//     that can, as for any wire without one.
 //   - Otherwise the rank is slow. Voice is ranked by its call (CallWindow)
 //     over VoiceSpan: fewer red minutes, then fewer pauses over 60 ms, then
 //     a shorter round trip at p99. Bulk is ranked by its 1 MiB downloads
@@ -43,12 +49,15 @@ type SelectorConfig struct {
 	// BulkMargin is how much faster a challenger's median download must be,
 	// as a fraction (0.25: a quarter), at as few failures.
 	BulkMargin float64
+	// PauseGrace is how long after a pause of this box (Paused) a red wire
+	// is held rather than left.
+	PauseGrace time.Duration // 10 s
 }
 
 const (
-	DefaultRedSilence  = 500 * time.Millisecond
-	DefaultVoiceSpan   = 10 * time.Minute
-	DefaultBulkSpan    = time.Hour
+	DefaultRedSilence = 500 * time.Millisecond
+	DefaultVoiceSpan  = 10 * time.Minute
+	DefaultBulkSpan   = time.Hour
 	// The margins and the hold from the stand's night (11.11 01:00–05:46
 	// UTC, hikkari-client plans/research/2026-11-11-trunk-selector-thresholds.md):
 	// voice moved between wires as good as each other did not lower its red
@@ -57,6 +66,10 @@ const (
 	DefaultHold        = 5 * time.Minute
 	DefaultVoiceMargin = 5
 	DefaultBulkMargin  = 0.25
+	// A pause train of the entry at a round of the stand (11.11) took its
+	// udp members and kept the wire red 7 s after the last pause, while they
+	// redialed: the grace covers it with room.
+	DefaultPauseGrace = 10 * time.Second
 	// A minute of a call is red when it lost more than this share of its
 	// datagrams or paused longer than callGapWord (a word).
 	redLossPerK = 10
@@ -81,6 +94,9 @@ func (c SelectorConfig) withDefaults() SelectorConfig {
 	if c.BulkMargin <= 0 {
 		c.BulkMargin = DefaultBulkMargin
 	}
+	if c.PauseGrace <= 0 {
+		c.PauseGrace = DefaultPauseGrace
+	}
 	return c
 }
 
@@ -103,6 +119,9 @@ type Choice struct {
 	Warm []WireID
 	// Red are the wires red now.
 	Red []WireID
+	// Held are the wires of Red that are not left: red within PauseGrace
+	// of this box's own pause, or every wire red at once.
+	Held []WireID
 	// Why says what changed, for the log; empty when nothing did. One
 	// part per class that moved, joined by "; ", each one of
 	// "<class>: on <wire>", "<class>: <wire> is red, to <wire>" and
@@ -126,6 +145,8 @@ type Selector struct {
 	wires map[WireID]*selWire
 	cur   Route
 	chall [2]challenger // by Class
+	// paused is when this box last came back from a pause of its own.
+	paused time.Time
 }
 
 type challenger struct {
@@ -142,6 +163,16 @@ func NewSelector(cfg SelectorConfig, wires ...Wire) *Selector {
 		s.wires[w.ID] = &selWire{w: w}
 	}
 	return s
+}
+
+// Paused tells the selector this box was not run until end: the session's
+// clock ran late (Session.LastPause), or the selector's own tick did.
+func (s *Selector) Paused(end time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if end.After(s.paused) {
+		s.paused = end
+	}
 }
 
 // Call takes one window of a wire's call.
@@ -302,11 +333,18 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
+	// Left: the red wires to blame. None within PauseGrace of this box's
+	// pause, none when every wire is red.
+	left := red
+	if len(red) == len(s.wires) || !s.paused.IsZero() && now.Sub(s.paused) <= s.cfg.PauseGrace {
+		left = map[WireID]bool{}
+	}
+
 	var why []string
 	next := s.cur
 	for _, class := range []Class{ClassVoice, ClassBulk} {
 		eligible := func(id WireID) bool {
-			return !red[id] && (class == ClassVoice || s.wires[id].w.Streams)
+			return !left[id] && (class == ClassVoice || s.wires[id].w.Streams)
 		}
 		// Ranked best first; ties by id, so the choice is stable.
 		var ranked []WireID
@@ -360,6 +398,9 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 	for _, id := range ids {
 		if red[id] {
 			c.Red = append(c.Red, id)
+			if !left[id] {
+				c.Held = append(c.Held, id)
+			}
 		}
 	}
 	warm := map[WireID]bool{}
@@ -372,7 +413,7 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 		// The best other wire of another shape, for this class.
 		var second WireID = AnyWire
 		for _, id := range ids {
-			if id == chosen || red[id] || s.wires[id].w.Shape == s.wires[chosen].w.Shape {
+			if id == chosen || left[id] || s.wires[id].w.Shape == s.wires[chosen].w.Shape {
 				continue
 			}
 			if class == ClassBulk && !s.wires[id].w.Streams {
@@ -424,17 +465,29 @@ func (s *Selector) byMarginLocked(class Class, a, b WireID, now time.Time) bool 
 var SteerEvery = time.Second
 
 // Steer sets the entry's route from sel every SteerEvery until ctx ends.
-// logf gets a line whenever the route changes, and one whenever the set of
-// red wires does.
+// It tells sel of this box's pauses: the session's (its clock ran late) and
+// its own (a tick later than two SteerEvery). logf gets a line whenever the
+// route changes, one whenever the set of red wires does, and one whenever
+// the set of held ones does.
 func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...any)) {
 	t := time.NewTicker(SteerEvery)
 	defer t.Stop()
-	lastRed := "none"
+	lastRed, lastHeld := "none", "none"
+	var last time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case now := <-t.C:
+		case <-t.C:
+			// The time we ran, not the time the ticker fired.
+			now := time.Now()
+			if !last.IsZero() && now.Sub(last) > 2*SteerEvery {
+				sel.Paused(now)
+			}
+			last = now
+			if p := e.Session().LastPause(); !p.IsZero() {
+				sel.Paused(p)
+			}
 			c := sel.Choose(now, e.Wires())
 			if c.Route != e.currentRoute() {
 				e.SetRoute(c.Route)
@@ -445,6 +498,10 @@ func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...a
 			if r := sel.names(c.Red); r != lastRed {
 				lastRed = r
 				logf("trunk: red wires %s", r)
+			}
+			if h := sel.names(c.Held); h != lastHeld {
+				lastHeld = h
+				logf("trunk: held red wires %s: this box paused or every wire is red", h)
 			}
 		}
 	}
