@@ -25,9 +25,12 @@ type Dial func(ctx context.Context, localPort int) (io.ReadWriteCloser, error)
 // When the exit says it drains (its process is being replaced without a cut,
 // fDrain), the entry opens a new session, with a new id and a full pool of its
 // own, whose members reach the exit's new process; every new stream and flow
-// goes there (Session). The old session is retired: it keeps the members it
-// has, replaces none, and is closed when it carries nothing more or after
-// RetireLimit. Its members ending is what lets the exit's old process go.
+// goes there (Session) once a quarter of its pool is up (takeOver), or after
+// TakeOverLimit: until then the old session takes them, as the exit's old
+// process still serves, and nothing new waits for a pool that is not there.
+// The old session then is retired: it keeps the members it has, replaces
+// none, and is closed when it carries nothing more or after RetireLimit. Its
+// members ending is what lets the exit's old process go.
 //
 // An entry whose own process is being replaced (Retire) retires its current
 // session too, and opens none after it: an fDrain from the exit then changes
@@ -45,7 +48,8 @@ type Entry struct {
 	run     context.Context
 	slots   sync.WaitGroup
 	retired []*generation
-	leaving bool // Retire: no new generation, ever
+	next    *generation // drained: comes up, then takes over from cur
+	leaving bool        // Retire: no new generation, ever
 }
 
 // generation is one session of the entry and its pool.
@@ -53,12 +57,20 @@ type generation struct {
 	s       *Session
 	id      SessionID
 	retired atomic.Bool
-	since   time.Time // when it was retired
+	handing atomic.Bool // the exit drains it: its slots replace no member
+	since   time.Time   // when it was retired
 
 	mu    sync.Mutex
 	epoch Epoch
 	known bool
 }
+
+// TakeOverLimit is how long a new session waits for a quarter of its pool
+// before it takes over anyway.
+var TakeOverLimit = 10 * time.Second
+
+// takeOverEvery is how often a new session's pool is looked at.
+var takeOverEvery = 10 * time.Millisecond
 
 // RetireLimit closes a retired session that still carries something: the
 // exit's old process gives up its sessions after as long (edge handoff.go).
@@ -150,12 +162,19 @@ func (e *Entry) Carrying() (streams, flows int) {
 // allLocked is every session the entry has not closed, each once.
 func (e *Entry) allLocked() []*generation {
 	all := append([]*generation(nil), e.retired...)
-	for _, g := range all {
-		if g == e.cur {
-			return all
+	for _, g := range []*generation{e.cur, e.next} {
+		if g == nil {
+			continue
+		}
+		dup := false
+		for _, r := range all {
+			dup = dup || r == g
+		}
+		if !dup {
+			all = append(all, g)
 		}
 	}
-	return append(all, e.cur)
+	return all
 }
 
 // Ports is the entry's book of source ports.
@@ -202,13 +221,13 @@ func (e *Entry) startLocked(g *generation) {
 	}
 }
 
-// drained answers the exit's fDrain on g: a new generation takes everything
-// new, and g retires. A retired g, the entry's own included (Retire), opens
-// nothing: it takes nothing new.
+// drained answers the exit's fDrain on g: a new generation comes up, takes
+// everything new once it can carry it (takeOver), and g retires. A retired
+// g, the entry's own included (Retire), opens nothing: it takes nothing new.
 func (e *Entry) drained(g *generation) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if g != e.cur || e.leaving || g.retired.Load() || e.run == nil || e.run.Err() != nil {
+	if g != e.cur || e.next != nil || e.leaving || g.retired.Load() || g.handing.Load() || e.run == nil || e.run.Err() != nil {
 		return
 	}
 	next, err := e.newGeneration()
@@ -216,11 +235,57 @@ func (e *Entry) drained(g *generation) {
 		e.logf("trunk: exit drains, no new session: %v", err)
 		return
 	}
-	g.retired.Store(true)
-	g.since = time.Now()
-	e.retired = append(e.retired, g)
-	e.cur = next
+	// g's members reach the exit's old process; one that dies now would
+	// come back at the new one under g's id, so none is replaced.
+	g.handing.Store(true)
+	e.next = next
 	e.startLocked(next)
+	go e.takeOver(e.run, g, next)
+}
+
+// takeOver makes next the current session once a quarter of its pool is
+// up, or after TakeOverLimit, and retires g. An entry that retires in the
+// meantime (Retire) keeps g and lets next go.
+func (e *Entry) takeOver(ctx context.Context, g, next *generation) {
+	want := (e.members + 3) / 4
+	started := time.Now()
+	t := time.NewTicker(takeOverEvery)
+	defer t.Stop()
+	for next.s.Stats().Members < want && time.Since(started) < TakeOverLimit {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		e.mu.Lock()
+		leaving := e.leaving
+		e.mu.Unlock()
+		if leaving {
+			break
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.next != next {
+		return
+	}
+	e.next = nil
+	if e.leaving {
+		next.retired.Store(true)
+		next.since = time.Now()
+		e.retired = append(e.retired, next)
+		return
+	}
+	if !g.retired.Load() {
+		g.retired.Store(true)
+		g.since = time.Now()
+		e.retired = append(e.retired, g)
+	}
+	e.cur = next
+	up := next.s.Stats().Members
+	if up < want {
+		e.logf("trunk: exit drains: the new session has %d of %d member(s) after %s, it takes over anyway", up, e.members, TakeOverLimit)
+	}
 	st := g.s.Stats()
 	e.logf("trunk: exit drains: new session, the old one keeps %d stream(s) and %d flow(s)", st.Streams, st.Flows)
 }
@@ -257,7 +322,7 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 	backoff := time.Duration(0)
 	stalls := 0 // in a row
 	replace := false
-	for ctx.Err() == nil && !g.retired.Load() {
+	for ctx.Err() == nil && !g.retired.Load() && !g.handing.Load() {
 		wait := backoff
 		if replace && e.spread > 0 {
 			r, _ := rand.Int(rand.Reader, big.NewInt(int64(e.spread)))
@@ -269,7 +334,7 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 			case <-ctx.Done():
 				return
 			}
-			if g.retired.Load() {
+			if g.retired.Load() || g.handing.Load() {
 				return
 			}
 		}
@@ -320,7 +385,7 @@ func (e *Entry) slot(ctx context.Context, g *generation, n int) {
 		err = g.s.Serve(conn)
 		release()
 		replace = true
-		if err != nil && ctx.Err() == nil && !g.retired.Load() {
+		if err != nil && ctx.Err() == nil && !g.retired.Load() && !g.handing.Load() {
 			e.logf("trunk: member %d: down after %s: %v", n, time.Since(started).Round(time.Second), err)
 		}
 		switch {

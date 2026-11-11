@@ -115,6 +115,8 @@ type harness struct {
 	budget func(n int64) int64
 	dials  atomic.Int64
 	cancel context.CancelFunc
+	// dialDelay, when set, is how long a new member takes to reach the exit.
+	dialDelay atomic.Int64
 
 	logMu sync.Mutex
 	logs  []string // the entry's lines
@@ -148,6 +150,13 @@ func newHarnessLocal(t *testing.T, cfg, exitCfg Config, members int, budget func
 	replaceSpread = 20 * time.Millisecond
 	dial := func(ctx context.Context, port int) (io.ReadWriteCloser, error) {
 		n := h.dials.Add(1)
+		if d := time.Duration(h.dialDelay.Load()); d > 0 {
+			select {
+			case <-time.After(d):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		a, b := net.Pipe()
 		go func() { _ = h.exit.ServeMember(b) }()
 		if h.budget == nil {
@@ -171,8 +180,10 @@ func newHarnessLocal(t *testing.T, cfg, exitCfg Config, members int, budget func
 	h.cancel = cancel
 	exitCtx, exitCancel := context.WithCancel(context.Background())
 	go h.exit.Run(exitCtx)
-	go h.entry.Run(ctx)
-	t.Cleanup(func() { cancel(); exitCancel() })
+	ran := make(chan struct{})
+	go func() { h.entry.Run(ctx); close(ran) }()
+	// The entry's last line (what it cut) is logged before the test ends.
+	t.Cleanup(func() { cancel(); <-ran; exitCancel() })
 	waitFor(t, func() bool { return h.entry.Session().Stats().Members == members })
 	return h
 }
@@ -768,4 +779,55 @@ func TestEntryCountsWhatItCuts(t *testing.T) {
 	}
 	h.cancel()
 	waitFor(t, func() bool { return strings.Contains(h.journal(), "trunk: closed with 2 stream(s) and 0 flow(s) cut") })
+}
+
+// TestExitDrainWaitsForThePool: the exit's new process is slow to take the
+// new session's members. Until a quarter of the new pool is up, the old
+// session goes on taking new streams (the exit's old process still serves
+// them), so nothing new waits for a pool that is not there; then the new
+// session takes over and the old one retires.
+func TestExitDrainWaitsForThePool(t *testing.T) {
+	retireEvery = 20 * time.Millisecond
+	defer func() { retireEvery = 5 * time.Second }()
+	h := newHarness(t, Config{}, 4, nil, nil)
+	c1 := h.carry()
+	defer c1.Close()
+	roundTrip(t, c1, 1<<16)
+	s := h.entry.Session()
+
+	h.dialDelay.Store(int64(400 * time.Millisecond))
+	old := h.exit
+	next := NewExit(Config{}, h.local)
+	exitCtx, exitCancel := context.WithCancel(context.Background())
+	defer exitCancel()
+	go next.Run(exitCtx)
+	h.exit = next
+	old.Drain()
+	time.Sleep(100 * time.Millisecond)
+	if h.entry.Session() != s || h.entry.Retired() != 0 {
+		t.Fatalf("the new session took over with no member up")
+	}
+	c2 := h.carry() // during the wait: the old session, the old process
+	defer c2.Close()
+	roundTrip(t, c2, 1<<16)
+	if _, st := old.Stats(); st.Streams != 2 {
+		t.Fatalf("the exit's old process carries %d streams, want both", st.Streams)
+	}
+
+	waitFor(t, func() bool { return h.entry.Session() != s && h.entry.Retired() == 1 })
+	if m := h.entry.Session().Stats().Members; m < 1 {
+		t.Fatalf("the new session took over with %d members", m)
+	}
+	c3 := h.carry()
+	defer c3.Close()
+	roundTrip(t, c3, 1<<16)
+	if _, st := next.Stats(); st.Streams != 1 {
+		t.Fatalf("the exit's new process carries %d streams, want the one after the takeover", st.Streams)
+	}
+	if !strings.Contains(h.journal(), "exit drains: new session, the old one keeps 2 stream(s)") {
+		t.Fatalf("no takeover line:\n%s", h.journal())
+	}
+	c1.Close()
+	c2.Close()
+	waitFor(t, func() bool { return h.entry.Retired() == 0 })
 }
