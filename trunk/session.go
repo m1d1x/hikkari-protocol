@@ -611,11 +611,12 @@ func (s *Session) dropMemberLocked(m *member, stalled bool) {
 // has a member up (wireOfLocked). With room set it only takes a member under
 // Inflight (or owing nothing): a full wire is waited for, not spilled from.
 func (s *Session) pickLocked(st *stream, room bool) *member {
-	want := AnyWire
+	want, strict := AnyWire, false
 	if st != nil {
 		want = s.wireOfLocked(st)
+		strict = s.local == nil && st.pin != AnyWire
 	}
-	if want != AnyWire {
+	if want != AnyWire && !strict {
 		up := false
 		for m := range s.members {
 			if m.kind.streams && m.kind.wire == want {
@@ -647,6 +648,9 @@ func (s *Session) pickLocked(st *stream, room bool) *member {
 func (s *Session) wireOfLocked(st *stream) WireID {
 	if s.local != nil {
 		return st.wire
+	}
+	if st.pin != AnyWire {
+		return st.pin
 	}
 	return s.route.Bulk
 }
@@ -893,8 +897,9 @@ type stream struct {
 	writeDone bool // local has seen everything (and the FIN) the other end sent
 
 	ended bool
-	// wire is the exit's: the wire the entry last sent the stream on.
-	wire WireID
+	// wire is the exit's: the wire the entry last sent the stream on. pin
+	// is the entry's: the one wire it is held to (CarryOn).
+	wire, pin WireID
 
 	// What an observed stream reports (observe.go); kept for every stream,
 	// told only for one marked.
@@ -912,7 +917,7 @@ type stream struct {
 func (s *Session) newStreamLocked(id uint32, port uint16, local net.Conn) *stream {
 	st := &stream{id: id, port: port, local: local, ready: make(chan struct{}), gone: make(chan struct{}), credit: uint64(s.cfg.Window),
 		ahead: map[uint64][]byte{}, finAt: -1, advertise: uint64(s.cfg.Window), wake: make(chan struct{}, 1),
-		opened: time.Now(), carriers: map[*member]struct{}{}, wire: AnyWire}
+		opened: time.Now(), carriers: map[*member]struct{}{}, wire: AnyWire, pin: AnyWire}
 	if local != nil {
 		close(st.ready)
 	}
@@ -924,19 +929,45 @@ func (s *Session) newStreamLocked(id uint32, port uint16, local net.Conn) *strea
 
 // Carry opens a stream to the exit's port and carries local over it until
 // both directions end. Entry only.
-func (s *Session) Carry(local net.Conn, port uint16) {
-	s.mu.Lock()
-	if s.shutdown {
-		s.mu.Unlock()
-		local.Close()
+func (s *Session) Carry(local net.Conn, port uint16) { s.CarryOn(local, port, AnyWire) }
+
+// CarryOn is Carry held to one wire whatever the route (pin, AnyWire for
+// none): its chunks wait while that wire has no member, and never go on
+// another. The trunk's own download on a wire (Entry.Download) is one.
+func (s *Session) CarryOn(local net.Conn, port uint16, pin WireID) {
+	st := s.open(local, port, pin)
+	if st == nil {
 		return
+	}
+	s.readLocal(st)
+	<-st.gone
+}
+
+// open starts a stream of local to port; nil when the session is closed.
+func (s *Session) open(local net.Conn, port uint16, pin WireID) *stream {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shutdown {
+		local.Close()
+		return nil
 	}
 	s.nextID++
 	st := s.newStreamLocked(s.nextID, port, local)
+	st.pin = pin
 	s.queueLocked(&segment{st: st, kind: fOpen}, true)
-	s.mu.Unlock()
-	s.readLocal(st)
-	<-st.gone
+	return st
+}
+
+// abort resets a stream at once: what it owes is dropped, wherever it waits.
+// The trunk's own download ends this way, done or not: its last frames may
+// be held to a wire that is gone.
+func (s *Session) abort(st *stream) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !st.ended {
+		st.endWhy = EndLocal
+		s.endStreamLocked(st, true)
+	}
 }
 
 // openLocked: the entry opened a stream; the exit dials the relay for it.
@@ -966,7 +997,13 @@ func (s *Session) openLocked(m *member, f frame) {
 	}
 	s.ackLocked(st, m)
 	go func() {
-		c, err := s.local.DialStream(withTarget(s.ctx, Target{s, ObsStream, f.stream}), f.port)
+		var c net.Conn
+		var err error
+		if f.port == EchoPort {
+			c = sourceConn() // the trunk's own download (Entry.Download)
+		} else {
+			c, err = s.local.DialStream(withTarget(s.ctx, Target{s, ObsStream, f.stream}), f.port)
+		}
 		s.mu.Lock()
 		if err != nil || st.ended {
 			if c != nil {
@@ -1331,7 +1368,9 @@ func (s *Session) endStreamLocked(st *stream, reset bool) {
 		}
 	}
 	if reset {
-		s.resets.Add(1)
+		if st.port != EchoPort {
+			s.resets.Add(1) // the trunk's own download is not a client's
+		}
 		sent := 0
 		for m := range s.members {
 			if !m.kind.streams {

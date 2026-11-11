@@ -68,6 +68,15 @@ type generation struct {
 	mu    sync.Mutex
 	epoch Epoch
 	known bool
+
+	// runs are its wires' slots, under the entry's mu: a wire changed or
+	// taken away (SetWires) has its run cancelled, which closes its members.
+	runs map[WireID]*wireRun
+}
+
+type wireRun struct {
+	w      Wire
+	cancel context.CancelFunc
 }
 
 // TakeOverLimit is how long a new session waits for a quarter of its pool
@@ -149,7 +158,7 @@ func (e *Entry) poolWire() Wire {
 }
 
 func (e *Entry) newGeneration() (*generation, error) {
-	g := &generation{s: newSession(e.cfg, nil)}
+	g := &generation{s: newSession(e.cfg, nil), runs: map[WireID]*wireRun{}}
 	g.s.route = e.route
 	if _, err := rand.Read(g.id[:]); err != nil {
 		return nil, err
@@ -268,11 +277,77 @@ func (e *Entry) Run(ctx context.Context) {
 
 func (e *Entry) startLocked(g *generation) {
 	for _, w := range append([]Wire{e.poolWire()}, e.wires...) {
-		for i := 0; i < w.Members; i++ {
-			e.slots.Add(1)
-			go func() { defer e.slots.Done(); e.slot(e.run, g, w, i) }()
+		e.startWireLocked(g, w)
+	}
+}
+
+// startWireLocked starts w's slots in g, under a context of their own.
+func (e *Entry) startWireLocked(g *generation, w Wire) {
+	ctx, cancel := context.WithCancel(e.run)
+	g.runs[w.ID] = &wireRun{w: w, cancel: cancel}
+	for i := 0; i < w.Members; i++ {
+		e.slots.Add(1)
+		go func() { defer e.slots.Done(); e.slot(ctx, g, w, i) }()
+	}
+}
+
+// SetWires makes ws the wires besides the pool, while the entry runs: a
+// new wire comes up, a wire gone has its members closed (what they carried
+// goes again on the others), a wire changed (members, shape, form or Knobs)
+// is closed and comes up anew. Only the current session and the one coming
+// up open members; retired ones lose a wire gone and get none new. The hub
+// changes a wire's knobs this way, without a new process (stage plan, шаг 6).
+func (e *Entry) SetWires(ws []Wire) error {
+	seen := map[WireID]bool{}
+	for i := range ws {
+		w := &ws[i]
+		if w.ID == PoolWire || w.ID == AnyWire || seen[w.ID] {
+			return fmt.Errorf("trunk: wire %q: id %d reserved or twice", w.Name, w.ID)
+		}
+		if w.Members < 1 || w.Dial == nil {
+			return fmt.Errorf("trunk: wire %q needs a dial and at least one member", w.Name)
+		}
+		seen[w.ID] = true
+		if w.Ports == nil {
+			w.Ports = e.ports
 		}
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.wires = append([]Wire(nil), ws...)
+	if e.run == nil {
+		return nil
+	}
+	want := map[WireID]Wire{}
+	for _, w := range ws {
+		want[w.ID] = w
+	}
+	for _, g := range e.allLocked() {
+		live := g == e.cur || g == e.next
+		for id, r := range g.runs {
+			if id == PoolWire {
+				continue
+			}
+			if w, ok := want[id]; !ok || !sameWire(w, r.w) {
+				r.cancel()
+				delete(g.runs, id)
+			}
+		}
+		if !live || g.retired.Load() || g.handing.Load() {
+			continue
+		}
+		for _, w := range ws {
+			if g.runs[w.ID] == nil {
+				e.startWireLocked(g, w)
+			}
+		}
+	}
+	return nil
+}
+
+// sameWire says a running wire needs no restart for w.
+func sameWire(a, b Wire) bool {
+	return a.Name == b.Name && a.Shape == b.Shape && a.Members == b.Members && a.Streams == b.Streams && a.Packet == b.Packet && a.Knobs == b.Knobs
 }
 
 // drained answers the exit's fDrain on g: a new generation comes up, takes
@@ -440,7 +515,10 @@ func (e *Entry) slot(ctx context.Context, g *generation, w Wire, n int) {
 		g.epoch, g.known = epoch, true
 		g.mu.Unlock()
 		started := time.Now()
+		// A wire taken away (SetWires) closes its members.
+		unhook := context.AfterFunc(ctx, func() { conn.Close() })
 		err = g.s.serve(conn, r, w.kind(), nil)
+		unhook()
 		release()
 		replace = true
 		if err != nil && ctx.Err() == nil && !g.retired.Load() && !g.handing.Load() {

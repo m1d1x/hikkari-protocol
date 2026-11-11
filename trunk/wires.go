@@ -90,6 +90,9 @@ type Wire struct {
 	// Streams and Packet are the members' form (memberKind).
 	Streams bool
 	Packet  bool
+	// Knobs names what Dial was made from (a port, an SNI, a password):
+	// SetWires restarts a wire whose Knobs changed.
+	Knobs string
 }
 
 func (w Wire) kind() memberKind {

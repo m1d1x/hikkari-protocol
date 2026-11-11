@@ -34,11 +34,12 @@ type wireHarness struct {
 	exit  *Exit
 	entry *Entry
 	wires map[WireID]*testWire
+	dial  map[WireID]Dial
 }
 
 func newWireHarness(t *testing.T, cfg Config, pool, quic, udp int) *wireHarness {
 	t.Helper()
-	h := &wireHarness{exit: NewExit(cfg, newLoopLocal(t, nil)), wires: map[WireID]*testWire{PoolWire: {}, testQuic: {}, testUDP: {}}}
+	h := &wireHarness{exit: NewExit(cfg, newLoopLocal(t, nil)), wires: map[WireID]*testWire{PoolWire: {}, testQuic: {}, testUDP: {}}, dial: map[WireID]Dial{}}
 	ports, err := NewPortBook(20000, 30000, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -56,6 +57,7 @@ func newWireHarness(t *testing.T, cfg Config, pool, quic, udp int) *wireHarness 
 			return &wireConn{Conn: a, w: tw, closed: make(chan struct{})}, nil
 		}
 	}
+	h.dial[testQuic] = streamDial(testQuic)
 	logf := func(format string, a ...any) { t.Logf(format, a...) }
 	h.entry, err = NewEntry(cfg, pool, streamDial(PoolWire), ports, logf)
 	if err != nil {
@@ -315,4 +317,70 @@ func TestPinnedCallHoldsToItsWire(t *testing.T) {
 	if p := h.wires[PoolWire].out.Load() - p0; p > 50*20 {
 		t.Fatalf("the pool carried %d bytes of a pinned call", p)
 	}
+}
+
+// TestDownloadOnAWire: the trunk's own 1 MiB goes on the wire asked for,
+// both ways, whatever the route; on a cut wire it times out and leaves no
+// stream behind.
+func TestDownloadOnAWire(t *testing.T) {
+	h := newWireHarness(t, Config{Stall: 100 * time.Millisecond}, 2, 2, 0)
+	quic, pool := h.wires[testQuic], h.wires[PoolWire]
+	q0, p0 := quic.in.Load(), pool.in.Load()
+	r := h.entry.Download(context.Background(), testQuic, 1<<20)
+	if r.End != "ok" || r.Got != 1<<20 {
+		t.Fatalf("download %+v", r)
+	}
+	if q, p := quic.in.Load()-q0, pool.in.Load()-p0; q < 1<<20 || p > 64<<10 {
+		t.Fatalf("quic %d, pool %d bytes in: not on the wire asked for", q, p)
+	}
+	quic.cut.Store(true)
+	waitFor(t, func() bool { return h.entry.Wires()[testQuic].Members == 0 })
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if r := h.entry.Download(ctx, testQuic, 1<<20); r.End != "timeout" || r.Got != 0 {
+		t.Fatalf("download on a cut wire: %+v", r)
+	}
+	waitFor(t, func() bool { return h.entry.Session().Stats().Streams == 0 })
+}
+
+// TestSetWiresWhileRunning: a wire taken away closes its members and the
+// transfer on it goes on over the pool; given back, it comes up; with new
+// knobs, it is dialled anew.
+func TestSetWiresWhileRunning(t *testing.T) {
+	h := newWireHarness(t, Config{Stall: 100 * time.Millisecond, Quiet: 10 * time.Second}, 2, 2, 0)
+	h.entry.SetRoute(Route{Voice: AnyWire, Bulk: testQuic})
+	c := h.carry()
+	defer c.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		roundTrip(t, c, 16<<20)
+	}()
+	waitFor(t, func() bool { return h.wires[testQuic].out.Load() > 4<<20 })
+	if err := h.entry.SetWires(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.entry.Wires()[testQuic].Members == 0 })
+	<-done
+	if st := h.entry.Session().Stats(); st.StreamsReset != 0 {
+		t.Fatalf("the stream was reset: %+v", st)
+	}
+	quic := Wire{ID: testQuic, Name: "quic", Shape: "browser", Members: 3, Dial: h.dial[testQuic], Streams: true, Knobs: "a"}
+	if err := h.entry.SetWires([]Wire{quic}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.entry.Wires()[testQuic].Members == 3 })
+	d0 := h.wires[testQuic].dials.Load()
+	if err := h.entry.SetWires([]Wire{quic}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if d := h.wires[testQuic].dials.Load() - d0; d != 0 {
+		t.Fatalf("the same wire was dialled again: %d", d)
+	}
+	quic.Knobs = "b"
+	if err := h.entry.SetWires([]Wire{quic}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return h.wires[testQuic].dials.Load()-d0 >= 3 && h.entry.Wires()[testQuic].Members == 3 })
 }

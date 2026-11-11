@@ -144,3 +144,17 @@ rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60
 its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
 carries it only when it is better by a margin (3 heard pauses; a quarter faster) for 3 minutes. Bulk goes only on wires
 that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
+
+The trunk's own download: a stream to port 0, held to one wire, carries 8 bytes (u64, the length asked, at most 64 MiB);
+the exit answers it from the trunk itself, with no socket, with that many zero bytes and its end. The entry resets the
+stream once it has them, or when it gives up: its last frames may wait for a wire that is gone. Neither the download nor
+its reset counts among clients' resets. An exit older than this has no port 0 and resets the stream: the download fails.
+
+The entry's wires can change while it runs: a wire taken away has its members closed (what they carried goes again on the
+others), a new one comes up, a changed one (members, shape, form, or the knobs its dial is made from) is closed and comes up
+anew. Only the current session and the one coming up open members.
+
+The bare UDP wire (`trunk/udpwire`): packet members, a UDP socket of its own per member on the entry and one socket for all
+on the exit, a member per entry address. A datagram is a 12-byte random nonce and the frames of one write sealed with
+AES-256-GCM under HKDF-SHA256(trunk key, "hikkari trunk udp wire"). A datagram that opens under no trunk key is dropped
+without an answer.
