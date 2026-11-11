@@ -136,23 +136,34 @@ var PeerIdle = 2 * time.Minute
 // opens under one of keys (trunk keys) becomes a member, given to serve
 // (trunk.Exit.ServeMember) on a goroutine of its own.
 func Listen(addr string, keys []string, serve func(io.ReadWriteCloser)) (*Listener, error) {
-	if len(keys) == 0 {
-		return nil, errors.New("udpwire: no trunk key")
-	}
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	l := &Listener{serve: serve, peers: map[netip.AddrPort]*peer{}}
+	c, err := net.ListenUDP("udp", ua)
+	if err != nil {
+		return nil, err
+	}
+	l, err := Serve(c, keys, serve)
+	if err != nil {
+		c.Close()
+	}
+	return l, err
+}
+
+// Serve is Listen on a socket already bound (one the caller shares with a
+// process it hands over to, say); Close closes it.
+func Serve(c *net.UDPConn, keys []string, serve func(io.ReadWriteCloser)) (*Listener, error) {
+	if len(keys) == 0 {
+		return nil, errors.New("udpwire: no trunk key")
+	}
+	l := &Listener{c: c, serve: serve, peers: map[netip.AddrPort]*peer{}}
 	for _, k := range keys {
 		a, err := AEAD(k)
 		if err != nil {
 			return nil, err
 		}
 		l.keys = append(l.keys, a)
-	}
-	if l.c, err = net.ListenUDP("udp", ua); err != nil {
-		return nil, err
 	}
 	go l.read()
 	go l.reap()

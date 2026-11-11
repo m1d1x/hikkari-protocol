@@ -191,9 +191,12 @@ func (c *clientTLS) Clone() aTLS.Config                  { return &clientTLS{con
 
 // ListenOptions are the exit's end of the wire.
 type ListenOptions struct {
-	Listen string   // the UDP address
-	Keys   []string // trunk keys; the certificate is the first one's
-	SNI    string
+	Listen string // the UDP address
+	// Conn, when set, is the socket to serve instead of binding Listen; the
+	// listener closes it on Close.
+	Conn net.PacketConn
+	Keys []string // trunk keys; the certificate is the first one's
+	SNI  string
 	// Salamander, as the entry's: an exit of one wire serves one shape.
 	Salamander bool
 	// Serve gets every member (trunk.Exit.ServeMember), on a goroutine of
@@ -222,6 +225,7 @@ func Listen(ctx context.Context, o ListenOptions) (*hkserver.Datagram, error) {
 	}
 	d, err := hkserver.ListenDatagram(ctx, hkserver.DatagramOptions{
 		Listen:      o.Listen,
+		Conn:        o.Conn,
 		Certificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &cert, nil },
 		Salamander:  salamander,
 		Admitter:    admitter{},
