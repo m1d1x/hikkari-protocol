@@ -40,7 +40,7 @@ func (s *serverSession[U]) handleUDPMessage(message *udpMessage) {
 	udpConn, loaded := s.udpConnMap[sessionID]
 	s.udpAccess.RUnlock()
 	if !loaded || common.Done(udpConn.ctx) {
-		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, func() {
+		udpConn = newUDPPacketConn(auth.ContextWithUser(s.ctx, s.authUser), s.quicConn, s.queue, func() {
 			s.udpAccess.Lock()
 			delete(s.udpConnMap, sessionID)
 			s.udpAccess.Unlock()

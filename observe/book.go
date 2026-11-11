@@ -101,6 +101,9 @@ type QUIC struct {
 	RTT    Dist `json:"rtt"`
 	RTTMin Dist `json:"rtt_min"`
 	Loss   Dist `json:"loss_pm"`
+	// GuardS is the seconds the datagram channel's guard held its
+	// connections to a rate (v1.05): the path lost more than a tenth.
+	GuardS float64 `json:"guard_s,omitempty"`
 }
 
 func (q *QUIC) merge(o *QUIC) {
@@ -114,6 +117,7 @@ func (q *QUIC) merge(o *QUIC) {
 	q.RTT.Merge(&o.RTT)
 	q.RTTMin.Merge(&o.RTTMin)
 	q.Loss.Merge(&o.Loss)
+	q.GuardS += o.GuardS
 }
 
 // Dup is one direction of duplicated sessions in a period. A packet is
@@ -140,6 +144,18 @@ type Dup struct {
 	// side's count; the far end sees them as only_stream or missing).
 	FullDatagram int64 `json:"full_dgram,omitempty"`
 	FullStream   int64 `json:"full_stream,omitempty"`
+	// StaleDatagram are frames the datagram channel's scheduler dropped
+	// unsent: older than datagram.StaleAfter in its queue, or the oldest of a
+	// session over its memory (v1.05, the sending side's count). StaleStream
+	// are stream copies dropped as too old before their write.
+	StaleDatagram int64 `json:"stale_dgram,omitempty"`
+	StaleStream   int64 `json:"stale_stream,omitempty"`
+	// RxDrop are messages the receiving side had no room for in the
+	// association's queue (the receiving side's count).
+	RxDrop int64 `json:"rx_drop,omitempty"`
+	// QueueMS is how long each frame sent waited in the datagram channel's
+	// scheduler, in ms.
+	QueueMS Dist `json:"queue_ms"`
 	// LeadDatagram and LeadStream: by how many ms the first copy beat the
 	// second, by the first copy's channel.
 	LeadDatagram Dist `json:"lead_dgram"`
@@ -158,6 +174,10 @@ func (d *Dup) merge(o *Dup) {
 	d.Both += o.Both
 	d.Late += o.Late
 	d.FullDatagram += o.FullDatagram
+	d.StaleDatagram += o.StaleDatagram
+	d.StaleStream += o.StaleStream
+	d.RxDrop += o.RxDrop
+	d.QueueMS.Merge(&o.QueueMS)
 	d.FullStream += o.FullStream
 	d.LeadDatagram.Merge(&o.LeadDatagram)
 	d.LeadStream.Merge(&o.LeadStream)

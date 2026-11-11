@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -51,6 +52,13 @@ type DatagramOptions struct {
 	ProbePassword string
 	// Salamander, when set, obfuscates every packet with this password.
 	Salamander string
+	// Sender is every connection's congestion controller (v1.05):
+	// datagram.SenderGuard when empty, datagram.SenderBBR the rollback.
+	Sender string
+	// KeyCeiling is each access key's limit on datagrams down in bits a
+	// second, shared by the key's connections (v1.05): DefaultKeyCeiling
+	// when 0, none when below 0. SetKeyCeiling changes it live.
+	KeyCeiling int64
 	// Idle ends a UDP flow without packets; UDPIdle when zero.
 	Idle     time.Duration
 	Admitter Admitter
@@ -71,12 +79,15 @@ type DatagramOptions struct {
 // Datagram is the datagram channel: QUIC with HTTP/3 auth, UDP as QUIC
 // DATAGRAM frames (the Hysteria2 wire in wire/datagram), streams allowed too.
 type Datagram struct {
-	opts    DatagramOptions
-	service *datagram.Service[string]
-	conn    net.PacketConn
-	flows   atomic.Int64
-	conns   atomic.Int64
-	closing atomic.Bool
+	opts     DatagramOptions
+	ceilMu   sync.Mutex
+	ceiling  int64                        // bits a second, below 0 none
+	ceilings map[string]*datagram.Ceiling // by key
+	service  *datagram.Service[string]
+	conn     net.PacketConn
+	flows    atomic.Int64
+	conns    atomic.Int64
+	closing  atomic.Bool
 }
 
 // ListenDatagram opens the channel; SetKeys gives it the roster.
@@ -90,7 +101,11 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 	if opts.Masquerade == nil {
 		opts.Masquerade = http.NotFoundHandler()
 	}
-	d := &Datagram{opts: opts}
+	d := &Datagram{opts: opts, ceilings: map[string]*datagram.Ceiling{}}
+	d.ceiling = opts.KeyCeiling
+	if d.ceiling == 0 {
+		d.ceiling = DefaultKeyCeiling
+	}
 	service, err := datagram.NewService[string](datagram.ServiceOptions{
 		Context:            ctx,
 		Logger:             quietLogger{},
@@ -100,6 +115,11 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 		Handler:            d,
 		MasqueradeHandler:  opts.Masquerade,
 		ConnectionIDs:      opts.ConnectionIDs,
+		Sender:             opts.Sender,
+		Ceiling: func(user any) *datagram.Ceiling {
+			key, _ := user.(string)
+			return d.keyCeiling(key)
+		},
 		OnAuth: func(user any, conn *quic.Conn) {
 			d.conns.Add(1)
 			context.AfterFunc(conn.Context(), func() { d.conns.Add(-1) })
@@ -127,9 +147,56 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 // SetKeys replaces the roster: user = password = access key, plus the probe
 // credential under the empty key.
 func (d *Datagram) SetKeys(keys []string) {
+	d.forgetCeilings(keys)
 	users := append([]string{""}, keys...)
 	passwords := append([]string{d.opts.ProbePassword}, keys...)
 	d.service.UpdateUsers(users, passwords)
+}
+
+// DefaultKeyCeiling is a key's limit on datagrams down (bits a second) when
+// the relay names none: the stand's datagram wire between nekko-spb and unl1
+// carried 264 to 271 Mbit/s (2026-11-11), a user's line far less.
+const DefaultKeyCeiling = 100_000_000
+
+// keyCeiling is key's ceiling, one for all its connections.
+func (d *Datagram) keyCeiling(key string) *datagram.Ceiling {
+	d.ceilMu.Lock()
+	defer d.ceilMu.Unlock()
+	c := d.ceilings[key]
+	if c == nil {
+		c = datagram.NewCeiling(d.ceiling)
+		d.ceilings[key] = c
+	}
+	return c
+}
+
+// forgetCeilings drops the ceilings of keys off the roster.
+func (d *Datagram) forgetCeilings(keys []string) {
+	keep := map[string]bool{"": true}
+	for _, k := range keys {
+		keep[k] = true
+	}
+	d.ceilMu.Lock()
+	defer d.ceilMu.Unlock()
+	for k := range d.ceilings {
+		if !keep[k] {
+			delete(d.ceilings, k)
+		}
+	}
+}
+
+// SetKeyCeiling changes every key's limit on datagrams down, now (bits a
+// second; 0 is DefaultKeyCeiling, below 0 none): the hub's knob, no restart.
+func (d *Datagram) SetKeyCeiling(bitsPerSecond int64) {
+	if bitsPerSecond == 0 {
+		bitsPerSecond = DefaultKeyCeiling
+	}
+	d.ceilMu.Lock()
+	defer d.ceilMu.Unlock()
+	d.ceiling = bitsPerSecond
+	for _, c := range d.ceilings {
+		c.SetRate(bitsPerSecond)
+	}
 }
 
 func (d *Datagram) group(key string, remote M.Socksaddr) string {

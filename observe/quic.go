@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,11 +32,22 @@ func WatchQUIC(b *Book, group, name string, conn *quic.Conn, stopping func() boo
 }
 
 type quicWatch struct {
-	conn  *quic.Conn
-	name  string
-	fresh bool
-	end   atomic.Pointer[string] // set before the last take
-	last  quic.ConnectionStats
+	conn    *quic.Conn
+	name    string
+	fresh   bool
+	end     atomic.Pointer[string] // set before the last take
+	last    quic.ConnectionStats
+	guarded time.Duration // the guard's limited time at the last take
+}
+
+var guards sync.Map // *quic.Conn -> func() time.Duration
+
+// Guard says that conn's sender is the datagram channel's guard (v1.05) and
+// how long it has held the connection to a rate so far: a watch of conn
+// counts it as guard_s.
+func Guard(conn *quic.Conn, limited func() time.Duration) {
+	guards.Store(conn, limited)
+	context.AfterFunc(conn.Context(), func() { guards.Delete(conn) })
 }
 
 func (w *quicWatch) take(p *Period) {
@@ -68,6 +80,13 @@ func (w *quicWatch) take(p *Period) {
 	}
 	if out > 0 {
 		q.Loss.Add(float64(lost) * 1000 / float64(out))
+	}
+	if f, ok := guards.Load(w.conn); ok {
+		limited := f.(func() time.Duration)()
+		if limited > w.guarded {
+			q.GuardS += (limited - w.guarded).Seconds()
+			w.guarded = limited
+		}
 	}
 	w.last = s
 }

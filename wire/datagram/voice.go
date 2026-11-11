@@ -57,14 +57,14 @@ func carryVoice(conn *quic.Conn) {
 }
 
 // CarryVoice says that the QUIC connection under this association carries
-// calls' voice and nothing else (v1.03 voice lane): it gets a sender that
-// never holds a call back for a long round trip (voiceSender). Each end calls
-// it for its own sending: the client when it opens its voice carrier, the
-// relay when a carrier attaches to the voice lane.
-func (c *udpPacketConn) CarryVoice() { carryVoice(c.quicConn) }
-
-// IsVoice reports whether conn has the voice sender.
-func IsVoice(conn *quic.Conn) bool {
-	_, ok := voiceConns.Load(conn)
-	return ok
+// calls' voice and nothing else (v1.03 voice lane). On BBR (SenderBBR, the
+// rollback of v1.05) it gets a sender that never holds a call back for a long
+// round trip (voiceSender), as before v1.05; the guard never holds a call
+// back in the first place and stays. Each end calls it for its own sending:
+// the client when it opens its voice carrier, the relay when a carrier
+// attaches to the voice lane.
+func (c *udpPacketConn) CarryVoice() {
+	if c.queue.sender == SenderBBR {
+		carryVoice(c.quicConn)
+	}
 }
