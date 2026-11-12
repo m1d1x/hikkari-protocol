@@ -26,11 +26,14 @@
 
 mod brain;
 mod data;
+mod tcp;
 mod timers;
 
 use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
+
+use tcp::{TcpListen, Why};
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
 use hikkari_trunk::flow::FLOW_IDLE_NS;
@@ -39,7 +42,9 @@ use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, ANY_WIRE};
 use crate::flow::{Flows, CLASS_VOICE};
+use crate::link::StreamWire;
 use crate::member::{member_to, Member, Wire, SLOT};
+use crate::streams::Streams;
 
 const MAX_CLIENT: usize = 1500;
 
@@ -58,6 +63,11 @@ enum Slot {
     Ctl,
     Listen(usize),
     Member(usize, usize),
+    /// A client port of streams, a client's stream (its slot), a stream
+    /// member (wire, member).
+    TcpListen(usize),
+    Client(usize),
+    Link(usize, usize),
 }
 
 /// A member event for the brain, sent after the walk that found it.
@@ -81,6 +91,13 @@ pub struct Alone {
     pub wire: u8,
     /// Members that carry each client datagram (the brain's listen copies).
     pub copies: u8,
+    /// A client port of streams (None: none), the exit's port its streams
+    /// go to, and the wire of stream members that carries them: the exit's
+    /// plain TCP member port, how many members.
+    pub tcp_listen: Option<SocketAddrV4>,
+    pub tcp_to: u16,
+    pub tcp_exit: SocketAddrV4,
+    pub tcp_members: usize,
 }
 
 pub struct Pipe {
@@ -95,6 +112,13 @@ pub struct Pipe {
     /// The wire of each class, by class (CLASS_BULK, CLASS_VOICE).
     route: [u8; 2],
     flows: Flows,
+    tcp_listens: Vec<TcpListen>,
+    swires: Vec<StreamWire>,
+    streams: Streams,
+    /// What acks of one read confirmed: (carrier, bytes), applied after it.
+    released: Vec<(u32, u32)>,
+    /// Streams to end after the pass that found them done or failed.
+    doomed: Vec<(usize, Why)>,
     poll: Poll,
     slots: Vec<Slot>,
     dirty: bool,
@@ -130,6 +154,11 @@ impl Pipe {
             wires: Vec::new(),
             route: [ANY_WIRE, ANY_WIRE],
             flows: Flows::new(),
+            tcp_listens: Vec::new(),
+            swires: Vec::new(),
+            streams: Streams::new(),
+            released: Vec::with_capacity(256),
+            doomed: Vec::with_capacity(64),
             poll: Poll::new(),
             slots: Vec::new(),
             dirty: true,
@@ -178,6 +207,16 @@ impl Pipe {
         }
         p.wires.push(w);
         p.route = [a.wire, a.wire];
+        if let Some(addr) = a.tcp_listen {
+            p.tcp_listens.push(TcpListen { fd: sys::tcp_listen(addr)?, to: a.tcp_to });
+            // The pool's wire (trunk.PoolWire): the streams' only one here.
+            let mut sw = StreamWire::new(0, a.tcp_exit, a.tcp_members, health::STALL);
+            let now = now_ns();
+            for l in sw.links.iter_mut() {
+                l.dial(a.tcp_exit, &p.session, now);
+            }
+            p.swires.push(sw);
+        }
         Ok(p)
     }
 
@@ -205,11 +244,21 @@ impl Pipe {
             // Under traffic the loop runs on a tick: a wakeup is paid once per
             // tick and not once per packet. A tick that moved nothing goes
             // back to waiting for the first packet (an idle pipe sleeps).
+            let tcp = self.has_tcp();
+            if tcp {
+                self.want_tcp();
+            }
             let due = if self.tick_ns > 0 && busy {
                 sleep_at = if sleep_at + self.tick_ns > now { sleep_at + self.tick_ns } else { now + self.tick_ns };
                 let due = sleep_at.min(next.max(now));
                 sys::sleep_until(due);
-                self.poll.all();
+                // Stream sockets are many and mostly idle: read the ones the
+                // kernel says are ready, not all of them each tick.
+                if tcp {
+                    self.poll.wait(0);
+                } else {
+                    self.poll.all();
+                }
                 due
             } else {
                 let due = next.max(now);
@@ -231,9 +280,16 @@ impl Pipe {
                 self.rebuild_poll();
                 self.poll.all();
             }
+            let now = now_ns();
             self.read_clients();
+            self.accept_clients();
+            self.open_streams(now);
+            self.read_streams(now);
             self.seal_due();
             self.read_wires();
+            self.read_links(now);
+            self.write_clients();
+            self.flush_links(now);
             busy = self.moved != moved0;
         }
     }
@@ -253,11 +309,30 @@ impl Pipe {
                 }
             }
         }
+        for i in 0..self.tcp_listens.len() {
+            self.slots.push(Slot::TcpListen(i));
+        }
+        for slot in 0..self.streams.slots() {
+            if self.streams.get(slot).is_some() {
+                self.slots.push(Slot::Client(slot));
+            }
+        }
+        for (wi, w) in self.swires.iter().enumerate() {
+            for (li, l) in w.links.iter().enumerate() {
+                if l.fd.is_some() {
+                    self.slots.push(Slot::Link(wi, li));
+                }
+            }
+        }
         let (listens, wires, ctl) = (&self.listens, &self.wires, &self.ctl);
+        let (tcp_listens, streams, swires) = (&self.tcp_listens, &self.streams, &self.swires);
         self.poll.set(self.slots.iter().map(|s| match *s {
             Slot::Ctl => ctl.as_ref().unwrap().fd,
             Slot::Listen(i) => listens[i].sock.as_raw_fd(),
             Slot::Member(w, m) => wires[w].members[m].fd,
+            Slot::TcpListen(i) => tcp_listens[i].fd.as_raw_fd(),
+            Slot::Client(slot) => streams.get(slot).map_or(-1, |st| st.client.fd.as_raw_fd()),
+            Slot::Link(w, l) => swires[w].links[l].fd.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
         }));
         self.dirty = false;
     }
@@ -302,6 +377,9 @@ impl Pipe {
                 dgrams,
                 w.t.up_pkts as f64 / dgrams.max(1) as f64
             );
+        }
+        if self.has_tcp() {
+            s += &tcp::stats(&self.streams, &self.swires);
         }
         eprintln!("{s}");
     }

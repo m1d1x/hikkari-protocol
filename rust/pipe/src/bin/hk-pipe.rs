@@ -6,7 +6,9 @@
 //! The pipe ends when the brain does.
 //!
 //! Without it (the bench) the flags fix what the brain would decide: one
-//! client port, one wire, its members, the glue window, the copies.
+//! client port, one wire, its members, the glue window, the copies; with
+//! `--tcp-listen` also a client port of streams to the exit's `--tcp-to`,
+//! carried on `--tcp-members` plain TCP members to `--tcp-wire`.
 //!
 //! `--flow-idle-ms` (either way): a client's flow unused this long ends;
 //! the trunk's 2 minutes without it.
@@ -37,6 +39,10 @@ mod linux {
             to: 0,
             wire: 2,
             copies: 1,
+            tcp_listen: None,
+            tcp_to: 0,
+            tcp_exit: "127.0.0.1:20446".parse().unwrap(),
+            tcp_members: 4,
         };
         let mut flow_idle_ms: Option<u64> = None;
         let mut gro = true;
@@ -60,6 +66,10 @@ mod linux {
                 "--copies" => a.copies = v.parse().expect("--copies"),
                 "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
                 "--tick-us" => tick_ns = v.parse::<u64>().expect("--tick-us") * 1000,
+                "--tcp-listen" => a.tcp_listen = Some(v.parse().expect("--tcp-listen ip:port")),
+                "--tcp-to" => a.tcp_to = v.parse().expect("--tcp-to"),
+                "--tcp-wire" => a.tcp_exit = v.parse().expect("--tcp-wire ip:port"),
+                "--tcp-members" => a.tcp_members = v.parse().expect("--tcp-members"),
                 x => panic!("unknown flag {x}"),
             }
             i += 2;

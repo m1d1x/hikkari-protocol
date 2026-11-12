@@ -1,8 +1,9 @@
 // Command goexit is the bench's exit: trunk.Exit as the relay box runs it,
-// with the bare UDP wire (trunk/udpwire) and a plain TCP pool member for the
-// Go entry (no TLS: the bench measures the entry's UDP path, not the pool).
-// Flows to port 0 are the exit's echo (trunk.EchoPort), so no relay is
-// needed behind it. Bench only (rust/README.md).
+// with the bare UDP wire (trunk/udpwire) and plain TCP pool members for the
+// Go entry and the Rust entry's stream members (no TLS: the bench measures
+// the entry, not the pool's Chromium). Flows to port 0 are the exit's echo
+// (trunk.EchoPort); streams reach 127.0.0.1:<port> (tcpcheck -serve in the
+// bench). Bench only (rust/README.md).
 package main
 
 import (

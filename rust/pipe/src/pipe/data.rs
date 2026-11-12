@@ -105,7 +105,15 @@ impl Pipe {
                                     w.proof = now;
                                 }
                             }
-                            Frame::Drain | Frame::Other => {}
+                            // A packet member without the streams flag carries
+                            // no stream frames (spec/trunk.md, "Wires").
+                            Frame::Open { .. }
+                            | Frame::Data { .. }
+                            | Frame::Ack { .. }
+                            | Frame::Fin { .. }
+                            | Frame::Rst { .. }
+                            | Frame::Drain
+                            | Frame::Other => {}
                         }
                         at = nx;
                     }

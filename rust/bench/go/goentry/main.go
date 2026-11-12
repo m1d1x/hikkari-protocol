@@ -2,9 +2,11 @@
 // entry (hikkari-control trunkentry/handoff.go, udpPort: one read loop per
 // listened port, a trunk.Flow per client address, answers written straight
 // to the client socket) over trunk.Entry with the bare UDP wire, voice routed
-// to it as the selector routes it. What it leaves out: the Chromium pool (one
-// plain TCP member instead), the trunk's own calls, the wire stand, the
-// handoff between generations. Bench only (rust/README.md).
+// to it as the selector routes it; with -tcp-listen also its TCP path
+// (trunkentry/handoff.go: each accepted connection carried by
+// Session().Carry) over plain TCP pool members. What it leaves out: the
+// Chromium pool (plain TCP members instead), the trunk's own calls, the wire
+// stand, the handoff between generations. Bench only (rust/README.md).
 package main
 
 import (
@@ -30,6 +32,9 @@ func main() {
 	key := flag.String("key", "bench-trunk-key-0123456789abcdef", "trunk key")
 	members := flag.Int("members", 2, "udp wire members")
 	to := flag.Uint("to", 0, "exit loopback port (0: the exit's echo)")
+	tcpListen := flag.String("tcp-listen", "", "client TCP listen address (empty: none)")
+	tcpTo := flag.Uint("tcp-to", 9000, "exit loopback port of the clients' streams")
+	poolMembers := flag.Int("pool-members", 1, "plain TCP pool members")
 	flag.Parse()
 
 	exitWire, err := netip.ParseAddrPort(*wire)
@@ -44,7 +49,7 @@ func main() {
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", *pool)
 	}
-	e, err := trunk.NewEntry(trunk.Config{}, 1, dialPool, ports, log.Printf)
+	e, err := trunk.NewEntry(trunk.Config{}, *poolMembers, dialPool, ports, log.Printf)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -66,10 +71,26 @@ func main() {
 	}
 	p := &udpPort{entry: e, to: uint16(*to), pc: pc, flows: map[string]*trunk.Flow{}}
 	go p.read()
-	log.Printf("goentry: clients %s, wire %s x%d", pc.LocalAddr(), exitWire, *members)
+	if *tcpListen != "" {
+		tl, err := net.Listen("tcp", *tcpListen)
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			for {
+				conn, err := tl.Accept()
+				if err != nil {
+					return
+				}
+				go e.Session().Carry(conn, uint16(*tcpTo))
+			}
+		}()
+	}
+	log.Printf("goentry: clients %s, wire %s x%d, tcp %q x%d", pc.LocalAddr(), exitWire, *members, *tcpListen, *poolMembers)
 	for range time.Tick(10 * time.Second) {
 		st := e.Session().Stats()
-		log.Printf("goentry: members=%d flows=%d dgrams=%d/%d", st.Members, st.Flows, st.DgramsOut, st.DgramsIn)
+		log.Printf("goentry: members=%d flows=%d dgrams=%d/%d streams=%d opened=%d reset=%d up=%d down=%d",
+			st.Members, st.Flows, st.DgramsOut, st.DgramsIn, st.Streams, st.StreamsOpened, st.StreamsReset, st.Up, st.Down)
 	}
 }
 

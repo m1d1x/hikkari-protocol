@@ -8,6 +8,9 @@ use std::mem::{size_of, zeroed};
 use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
+mod tcp;
+pub use tcp::{accept, read, shutdown_write, tcp_connect, tcp_listen, write, Io};
+
 /// An IPv4 address as the kernel keeps it: what a batch reads a datagram
 /// from and sends an answer to.
 pub use libc::sockaddr_in;
@@ -237,6 +240,13 @@ impl Poll {
         self.fds.extend(fds.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
     }
 
+    /// What socket i is waited for: readable, writable, or both (neither:
+    /// only its failure).
+    #[inline]
+    pub fn want(&mut self, i: usize, read: bool, write: bool) {
+        self.fds[i].events = if read { libc::POLLIN } else { 0 } | if write { libc::POLLOUT } else { 0 };
+    }
+
     /// Waits for any of the set to be readable, at most `timeout_ns`;
     /// whether one is (readable(i) says which).
     pub fn wait(&mut self, timeout_ns: u64) -> bool {
@@ -258,6 +268,11 @@ impl Poll {
     #[inline]
     pub fn readable(&self, i: usize) -> bool {
         self.fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+    }
+
+    #[inline]
+    pub fn writable(&self, i: usize) -> bool {
+        self.fds[i].revents & (libc::POLLOUT | libc::POLLHUP | libc::POLLERR) != 0
     }
 }
 

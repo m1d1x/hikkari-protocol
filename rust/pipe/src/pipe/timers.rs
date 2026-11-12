@@ -20,7 +20,7 @@ const HELLO_EVERY: u64 = 250_000_000;
 const CLOCK: u64 = 25_000_000;
 /// Members that die together come back spread over this (trunk's
 /// replaceSpread), not as one burst of new peers from one box.
-const SPREAD: u64 = 1_000_000_000;
+pub(super) const SPREAD: u64 = 1_000_000_000;
 pub(super) const TICK_EVERY: u64 = 1_000_000_000;
 const STATS_EVERY: u64 = 10_000_000_000;
 
@@ -95,6 +95,7 @@ impl Pipe {
                 }
             }
         }
+        let next = self.link_timers(now, clock, next);
         self.send_events();
         if now >= self.tick_at {
             // Flows unused past idle end once a second, as trunk's sweep on

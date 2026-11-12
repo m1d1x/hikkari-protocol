@@ -8,4 +8,5 @@
 pub mod flow;
 pub mod frame;
 pub mod health;
+pub mod stream;
 pub mod udpwire;

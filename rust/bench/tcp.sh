@@ -1,0 +1,42 @@
+#!/bin/sh
+# Bench of the entry's TCP path (R1.3): clients' streams through the Go
+# entry (bench/go/goentry, trunk.Session Carry as production) and through
+# hk-pipe, both over plain TCP members to the same Go exit, whose streams
+# reach an echo (bench/go/tcpcheck -serve). tcpcheck sends each stream's
+# bytes, reads the echo and compares every byte; it reads the entry's CPU.
+# Runs inside a Linux box (docker on the mac, README.md); the entry on CPUs
+# 0-1, the exit and echo on 4-5, the clients on 2-3.
+#
+#   tcp.sh <reps> "<impls>" <bytes> <streams> <members>    e.g. tcp.sh 3 "go rust" 1073741824 1 4
+set -eu
+OUT=${OUT:-/bench/out}
+REPS=${1:-3}; IMPLS=${2:-"go rust"}; BYTES=${3:-1073741824}; STREAMS=${4:-1}; MEMBERS=${5:-4}
+RES=${RES:-$OUT/results-tcp.txt}
+EXIT_CPUS=${EXIT_CPUS:-4,5}; GEN_CPUS=${GEN_CPUS:-2,3}; ENTRY_CPUS=${ENTRY_CPUS:-0,1}
+
+run_one() {
+  impl=$1; rep=$2
+  taskset -c "$EXIT_CPUS" "$OUT/tcpcheck" -serve 127.0.0.1:9000 >"$OUT/echo.log" 2>&1 &
+  epid_echo=$!
+  taskset -c "$EXIT_CPUS" "$OUT/goexit" >"$OUT/exit.log" 2>&1 &
+  xpid=$!
+  sleep 0.5
+  case $impl in
+    go)   taskset -c "$ENTRY_CPUS" "$OUT/goentry" -tcp-listen 127.0.0.1:8444 -tcp-to 9000 -pool-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
+    rust) taskset -c "$ENTRY_CPUS" "$OUT/hk-pipe" --tcp-listen 127.0.0.1:8444 --tcp-to 9000 --tcp-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
+  esac
+  epid=$!
+  sleep 1.5
+  line=$(taskset -c "$GEN_CPUS" "$OUT/tcpcheck" -to 127.0.0.1:8444 -bytes "$BYTES" -streams "$STREAMS" -pid "$epid" -label "$impl#$rep m$MEMBERS s$STREAMS") || true
+  echo "$line" | tee -a "$RES"
+  sleep 1
+  kill $epid $xpid $epid_echo 2>/dev/null || true
+  wait $epid $xpid $epid_echo 2>/dev/null || true
+  tail -n 2 "$OUT/entry-tcp-$impl.log" | sed "s/^/  [$impl] /"
+}
+
+for rep in $(seq 1 "$REPS"); do
+  for impl in $IMPLS; do
+    run_one "$impl" "$rep"
+  done
+done

@@ -203,7 +203,7 @@ impl Flows {
 /// A hash for keys the pipe made itself (addresses, tags): one multiply,
 /// no SipHash per packet.
 #[derive(Default)]
-struct Fx(u64);
+pub struct Fx(u64);
 
 impl Hasher for Fx {
     fn finish(&self) -> u64 {
@@ -220,7 +220,7 @@ impl Hasher for Fx {
     }
 }
 
-type FxMap<K> = HashMap<K, u32, BuildHasherDefault<Fx>>;
+pub type FxMap<K> = HashMap<K, u32, BuildHasherDefault<Fx>>;
 
 #[cfg(test)]
 mod tests {

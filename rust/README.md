@@ -3,8 +3,8 @@
 The trunk's protocol and the cascade entry's pipe. The Go side (`trunk`, `trunk/pipectl`) is the reference and the
 brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r1.2-dgrams` on `rust-pipe-r1` (R1.1 members' health, R1.2 datagrams whole, R3 the brain's socket);
-bench and tests only, not deployed. The
+Status: branch `rust-r1.3-tcp` on `rust-r1.2-dgrams` (R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
+streams without resend, R3 the brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
 `plans/research/2026-11-12-rust-pipe-*.md`.
 
@@ -13,13 +13,13 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 | Crate | What | Who may depend on it |
 | --- | --- | --- |
 | `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
-| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), the `udp` wire's seal. No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal. No sockets, no clock, no threads | the entry, an exit, the messenger |
 | `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
 | `bench` (`hikkari-bench`) | the bench's users (`hk-loadgen`), `run.sh`, the Go entry and exit it measures against | nothing |
 
 `trunk` depends on no other crate here, `sys` on none, `pipe` on both. Inside `pipe`: `ctl` (the brain's messages),
-`flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `pipe/` (the loop: `brain`, `timers`,
-`data`).
+`flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `link` (stream members over TCP),
+`streams` (clients' connections as streams), `pipe/` (the loop: `brain`, `timers`, `data`, `tcp`).
 
 ## What it is
 
@@ -55,7 +55,31 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
   loop instead of the clock would bury the others by the first pong after the exit's pause: its pongs come a few
   datagrams apart.
 
-Left out on purpose: streams (TCP) and the pool, wires other than `udp`, drains and generations, observation, IPv6, GSO
+Streams (R1.3; spec/trunk.md, "Streams", as the Go session carries them: Carry, readLocal, writeLocal):
+
+- A client's TCP connection on a client port of streams is a stream to the exit's loopback port. Its open goes on a
+  stream member as soon as one is up; until then the client is not read. Stream ids count up and are never used again
+  while the pipe runs: the exit resets a late frame of a stream it ended for 2 minutes.
+- The client's bytes are read straight into a member's out buffer behind a data frame's head, in chunks of up to 16 KiB,
+  as far as the exit's credit (2 MiB past what it wrote) and the member's room go: a member takes a chunk while its
+  unconfirmed chunks stay under 256 KiB, or owes nothing. A chunk goes on the stream member owing least, of the bulk
+  route's wire while it has one up. The client's end is the FIN.
+- The exit's chunks are put in order (`hikkari_trunk::stream::Recv`: chunks past a hole kept inside the window) and
+  written to the client at once; what the client does not take waits for it. Each chunk is acked on the member it came
+  on (`got` names it), and the freed window is told by a quarter. The exit's FIN shuts the client's side once everything
+  before it is written. A stream ends when both FINs are confirmed and written; a reset either way ends it at once.
+- Stream members (`link.rs`) are the pool's form: a t1 hello, frames one after another on a TCP connection of their own,
+  pings when idle a second, deaths by the same rules as any member's (`trunk/src/health.rs`: a member owes while it
+  carries an unconfirmed open, chunk or FIN). Here the connection is plain TCP, as the bench's Go entry dials its pool;
+  Chromium's TLS goes under it in R2.
+- Nothing is sent again (R1.4): a member that dies under a stream's unconfirmed bytes resets the stream (`cut` in the
+  stats line). When a member comes up, every stream acks again on it.
+- Nothing is allocated per chunk: members' buffers are allocated once (out 1 MiB, in 256 KiB), a client's waiting bytes
+  in one buffer of its own, chunks past a hole are the only copies.
+
+Left out on purpose: resend and moving a stream's chunks to another member (R1.4), the Chromium pool (R2), the brain's
+messages for client ports of streams and stream wires (the bench runs them by flags), datagrams on stream members (they
+ride the packet wires), wires other than `udp` and the plain TCP members, drains and generations, observation, IPv6, GSO
 on send (the glued datagrams differ in size; answers go to different clients).
 
 `hk-loadgen` is the bench's users (cascade-load-v1 per user: voice 50/s, game 200/s, acks 125/s, in the sizes the entry's
@@ -75,6 +99,17 @@ docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/run.sh 3 30 "
 
 The entry runs on CPUs 0–1 (`taskset`), the users and the exit on CPUs of their own; `hk-loadgen` reads the entry's CPU
 from `/proc/<pid>/stat` at the start and the end of its window.
+
+Streams (R1.3): `bench/tcp.sh` runs `tcpcheck` clients through the Go entry (`goentry -tcp-listen`: each connection
+carried by `Session().Carry`, as hikkari-control trunkentry does) and through `hk-pipe --tcp-listen`, both over 4 plain
+TCP members to the same Go exit, whose streams reach an echo (`tcpcheck -serve`). Each stream sends its own PRNG bytes
+and reads the echo back, every byte compared; the line has the entry's CPU per MiB sent (each MiB crosses the entry
+twice, up and echoed down).
+
+```bash
+(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/tcpcheck ./tcpcheck)
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "go rust" 1073741824 1 4
+```
 
 ## Brain and pipe (R3)
 

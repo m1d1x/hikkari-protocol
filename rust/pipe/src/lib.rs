@@ -6,6 +6,8 @@
 //! - ctl: the brain ↔ pipe messages
 //! - flow: flows by stream id, client address and the brain's tag
 //! - member: wires and their members, each member's glue and seal
+//! - link: stream members, each over a TCP connection of its own
+//! - streams: clients' TCP connections as streams to the exit
 //! - carry: which wire and member carry a flow's datagram
 //! - pipe: the loop (brain, timers, data)
 
@@ -15,6 +17,10 @@ mod carry;
 #[cfg(target_os = "linux")]
 mod flow;
 #[cfg(target_os = "linux")]
+mod link;
+#[cfg(target_os = "linux")]
 mod member;
 #[cfg(target_os = "linux")]
 pub mod pipe;
+#[cfg(target_os = "linux")]
+mod streams;
