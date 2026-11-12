@@ -47,7 +47,10 @@ pub fn put_ping(out: &mut [u8], typ: u8, token: u64) -> usize {
 /// One frame read from a datagram's plaintext.
 pub enum Frame {
     Hello,
-    Dgram { stream: u32, off: usize, len: usize },
+    /// A dgram: its flow (stream), its sender's seq (the receiver drops
+    /// copies by it, flow::Replay), the exit's port, and the payload at
+    /// `off..off + len`.
+    Dgram { stream: u32, seq: u32, port: u16, off: usize, len: usize },
     Ping(u64),
     Pong(u64),
     Drain,
@@ -80,7 +83,8 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
             if rest < 12 + n {
                 return None;
             }
-            Some((Frame::Dgram { stream: be32(b), off: b + 12, len: n }, b + 12 + n))
+            let port = u16::from_be_bytes([p[b + 8], p[b + 9]]);
+            Some((Frame::Dgram { stream: be32(b), seq: be32(b + 4), port, off: b + 12, len: n }, b + 12 + n))
         }
         F_PING => Some((Frame::Ping(be64(fixed(8)? - 8)), b + 8)),
         F_PONG => Some((Frame::Pong(be64(fixed(8)? - 8)), b + 8)),
@@ -108,21 +112,21 @@ mod tests {
     #[test]
     fn frames_in_sequence() {
         let mut b = [0u8; 200];
-        let mut n = put_dgram(&mut b, 7, 1, 0, b"abc");
+        let mut n = put_dgram(&mut b, 7, 1, 443, b"abc");
         n += put_ping(&mut b[n..], F_PING, 42);
-        n += put_dgram(&mut b[n..], 8, 2, 0, b"");
+        n += put_dgram(&mut b[n..], 8, 0x0102_0304, 0, b"");
         let mut at = 0;
         let mut seen = vec![];
         while at < n {
             let (f, next) = next_frame(&b[..n], at).unwrap();
             seen.push(match f {
-                Frame::Dgram { stream, len, .. } => format!("d{stream}/{len}"),
+                Frame::Dgram { stream, seq, port, off, len } => format!("d{stream}/{seq}/{port}/{}", String::from_utf8_lossy(&b[off..off + len])),
                 Frame::Ping(t) => format!("p{t}"),
                 _ => "?".into(),
             });
             at = next;
         }
-        assert_eq!(seen, ["d7/3", "p42", "d8/0"]);
+        assert_eq!(seen, ["d7/1/443/abc", "p42", "d8/16909060/0/"]);
         assert!(next_frame(&b[..5], 0).is_none());
     }
 }

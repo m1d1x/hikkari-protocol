@@ -5,6 +5,7 @@
 //! Go package trunk is the reference: a change here is a change of the spec
 //! first, and a test against the Go side.
 
+pub mod flow;
 pub mod frame;
 pub mod health;
 pub mod udpwire;

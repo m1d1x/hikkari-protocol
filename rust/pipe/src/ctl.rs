@@ -5,7 +5,7 @@
 //! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
 //! here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -138,10 +138,19 @@ pub struct PipeTick {
     pub pauses: u32,
     /// The latest turn of the loop past due in the last second, in µs.
     pub late_max_us: u32,
+    /// Clients' flows open, the trunk's own calls left out (trunk Stats.Flows).
     pub flows: u32,
+    /// Since the pipe started, the trunk's own calls left out (trunk
+    /// Stats): datagrams read from clients and the brain's flows
+    /// (DgramsOut), delivered (DgramsIn), copies dropped (DgramsCopy).
+    pub dgrams_out: u64,
+    pub dgrams_in: u64,
+    pub dgrams_copy: u64,
+    /// Clients' flows ended unused.
+    pub flows_idle: u64,
 }
 
-pub const TICK_HEAD: usize = 1 + 16 + 1;
+pub const TICK_HEAD: usize = 1 + 16 + 32 + 1;
 pub const TICK_WIRE: usize = 1 + 1 + 1 + 4 + 4 + 4 + 6 * 8;
 
 /// A tick: the pipe's part, then each wire. out must hold
@@ -152,7 +161,10 @@ pub fn put_tick(out: &mut [u8], p: &PipeTick, wires: &[WireTick]) -> usize {
     out[5..9].copy_from_slice(&p.pauses.to_le_bytes());
     out[9..13].copy_from_slice(&p.late_max_us.to_le_bytes());
     out[13..17].copy_from_slice(&p.flows.to_le_bytes());
-    out[17] = wires.len() as u8;
+    for (i, v) in [p.dgrams_out, p.dgrams_in, p.dgrams_copy, p.flows_idle].iter().enumerate() {
+        out[17 + i * 8..25 + i * 8].copy_from_slice(&v.to_le_bytes());
+    }
+    out[49] = wires.len() as u8;
     let mut at = TICK_HEAD;
     for w in wires {
         let b = &mut out[at..at + TICK_WIRE];
@@ -199,7 +211,7 @@ mod tests {
 
     // The same bytes as trunk/pipectl msg_test.go TestGolden.
     const WIRE_GOLDEN: &str = "030301e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    const TICK_GOLDEN: &str = "82ffffffff02000000390500000700000001020302fa00000064000000b80b0000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000";
+    const TICK_GOLDEN: &str = "82ffffffff020000003905000007000000080000000000000009000000000000000a000000000000000b0000000000000001020302fa00000064000000b80b0000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000";
 
     #[test]
     fn parses_the_brains_wire() {
@@ -221,7 +233,16 @@ mod tests {
 
     #[test]
     fn puts_the_tick_the_brain_reads() {
-        let p = PipeTick { pause_ago_ms: NONE_MS, pauses: 2, late_max_us: 1337, flows: 7 };
+        let p = PipeTick {
+            pause_ago_ms: NONE_MS,
+            pauses: 2,
+            late_max_us: 1337,
+            flows: 7,
+            dgrams_out: 8,
+            dgrams_in: 9,
+            dgrams_copy: 10,
+            flows_idle: 11,
+        };
         let w = WireTick {
             id: 2,
             members: 3,

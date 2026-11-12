@@ -33,6 +33,7 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
+use hikkari_trunk::flow::FLOW_IDLE_NS;
 use hikkari_trunk::health::{self, Judge};
 use hikkari_trunk::udpwire;
 
@@ -78,6 +79,8 @@ pub struct Alone {
     pub glue_max: usize,
     pub to: u16,
     pub wire: u8,
+    /// Members that carry each client datagram (the brain's listen copies).
+    pub copies: u8,
 }
 
 pub struct Pipe {
@@ -85,6 +88,8 @@ pub struct Pipe {
     session: [u8; 16],
     gro: bool,
     tick_ns: u64,
+    /// A client's flow unused this long ends (trunk FlowIdle).
+    flow_idle_ns: u64,
     listens: Vec<Listen>,
     wires: Vec<Wire>,
     /// The wire of each class, by class (CLASS_BULK, CLASS_VOICE).
@@ -120,6 +125,7 @@ impl Pipe {
             session,
             gro,
             tick_ns,
+            flow_idle_ns: FLOW_IDLE_NS,
             listens: Vec::new(),
             wires: Vec::new(),
             route: [ANY_WIRE, ANY_WIRE],
@@ -161,7 +167,7 @@ impl Pipe {
         let mut p = Pipe::new(None, gro, tick_ns);
         let sock = UdpSocket::bind(a.listen)?;
         sys::tune(&sock, gro)?;
-        p.listens.push(Listen { id: 0, sock, class: CLASS_VOICE, to: a.to, copies: 1, down: SendBatch::new() });
+        p.listens.push(Listen { id: 0, sock, class: CLASS_VOICE, to: a.to, copies: a.copies, down: SendBatch::new() });
         let key = udpwire::key(&a.key);
         let mut w = Wire::new(a.wire, key, health::STALL);
         w.glue_ns = a.glue_ns;
@@ -173,6 +179,12 @@ impl Pipe {
         p.wires.push(w);
         p.route = [a.wire, a.wire];
         Ok(p)
+    }
+
+    /// A client's flow unused for idle_ns ends; the trunk's is 2 minutes,
+    /// tests take less.
+    pub fn set_flow_idle(&mut self, idle_ns: u64) {
+        self.flow_idle_ns = idle_ns.max(1);
     }
 
     /// Runs until the brain is gone (forever without one).
@@ -267,8 +279,16 @@ impl Pipe {
 
     fn log_stats(&self) {
         let mut s = format!(
-            "hk-pipe: flows={} route=bulk:{},voice:{} pauses={} bad={}",
-            self.flows.live, self.route[0], self.route[1], self.judge.pauses, self.bad
+            "hk-pipe: flows={} idle={} dgrams={}/{} copies={} route=bulk:{},voice:{} pauses={} bad={}",
+            self.flows.clients,
+            self.flows.n.idle,
+            self.flows.n.out,
+            self.flows.n.delivered,
+            self.flows.n.copies,
+            self.route[0],
+            self.route[1],
+            self.judge.pauses,
+            self.bad
         );
         for w in &self.wires {
             let dgrams = w.members.iter().map(|m| m.dgrams).sum::<u64>();

@@ -1,5 +1,6 @@
 //! What the pipe does on time rather than on packets: members' hellos,
-//! pings and deaths on the members' clock, the brain's tick, the stats line.
+//! pings and deaths on the members' clock, flows unused past idle, the
+//! brain's tick, the stats line.
 
 use hikkari_sys as sys;
 use hikkari_trunk::frame;
@@ -96,6 +97,9 @@ impl Pipe {
         }
         self.send_events();
         if now >= self.tick_at {
+            // Flows unused past idle end once a second, as trunk's sweep on
+            // its tick: an end a second late changes nothing.
+            self.flows.sweep(now, self.flow_idle_ns);
             self.send_tick(now);
             self.tick_at = if self.tick_at + TICK_EVERY > now { self.tick_at + TICK_EVERY } else { now + TICK_EVERY };
         }

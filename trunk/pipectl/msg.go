@@ -25,7 +25,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 1
+const Version = 2
 
 // Brain → pipe.
 const (
@@ -100,8 +100,16 @@ type Tick struct {
 	Pauses   int
 	// LateMax is the latest turn of the loop past due in the last second.
 	LateMax time.Duration
-	Flows   int
-	Wires   []WireTick
+	// Flows is the clients' flows open, the trunk's own calls left out (as
+	// trunk Stats.Flows).
+	Flows int
+	// Since the pipe started, the trunk's own calls left out, as trunk
+	// Stats counts them: datagrams read from clients and the brain's flows,
+	// delivered, and copies dropped as already seen.
+	DgramsOut, DgramsIn, DgramsCopy uint64
+	// FlowsIdle is the clients' flows ended unused (trunk's FlowIdle).
+	FlowsIdle uint64
+	Wires     []WireTick
 }
 
 // WireTick is one wire in a tick.
@@ -122,7 +130,7 @@ type WireTick struct {
 }
 
 const (
-	tickHead = 1 + 16 + 1
+	tickHead = 1 + 16 + 32 + 1
 	tickWire = 3 + 12 + 48
 )
 
@@ -146,7 +154,10 @@ func parseTick(m []byte) (Tick, error) {
 		LateMax:  time.Duration(le.Uint32(m[9:])) * time.Microsecond,
 		Flows:    int(le.Uint32(m[13:])),
 	}
-	n := int(m[17])
+	for k, p := range []*uint64{&t.DgramsOut, &t.DgramsIn, &t.DgramsCopy, &t.FlowsIdle} {
+		*p = le.Uint64(m[17+8*k:])
+	}
+	n := int(m[tickHead-1])
 	if len(m) != tickHead+n*tickWire {
 		return Tick{}, errTorn
 	}

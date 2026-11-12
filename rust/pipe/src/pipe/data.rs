@@ -5,10 +5,12 @@ use std::os::fd::AsRawFd;
 use hikkari_sys::{self as sys, now_ns, BATCH};
 use hikkari_trunk::frame::{self, Frame};
 
-use super::{Event, Pipe, Slot};
+use hikkari_sys::SeqPacket;
+
+use super::{Event, Listen, Pipe, Slot};
 use crate::carry::carry;
 use crate::ctl::{self, ANY_WIRE};
-use crate::flow::{Dest, Flow};
+use crate::flow::{Dest, Flow, Flows};
 
 impl Pipe {
     /// Clients → wires.
@@ -26,23 +28,23 @@ impl Pipe {
                 let now = now_ns();
                 for i in 0..n {
                     let key = ((li as u64) << 48) | sys::addr_key(&crecv.addr[i]);
-                    let id = flows.client(key, || Flow {
-                        dest: Dest::Client { listen: li as u16, addr: crecv.addr[i] },
-                        seq: 0,
-                        class: l.class,
-                        pin: ANY_WIRE,
-                        port: l.to,
-                        copies: l.copies,
-                    });
+                    let addr = crecv.addr[i];
+                    let Some(id) = flows.client(key, || Flow::new(Dest::Client { listen: li as u16, addr }, l.class, ANY_WIRE, l.to, l.copies, now))
+                    else {
+                        continue; // MAX_FLOWS open: no flow for a new client
+                    };
                     let seg = crecv.seg[i];
                     let len = crecv.len[i];
                     let step = if seg == 0 { len } else { seg };
                     let base = i * crecv.slot;
-                    let f = flows.get_mut(id);
+                    let Some((f, counts)) = flows.with_counts(id) else { continue };
                     let mut at = 0;
                     while at < len {
                         let p = &crecv.buf[base + at..base + (at + step).min(len)];
                         carry(wires, *route, f, id, p, now);
+                        if !f.echo() {
+                            counts.out += 1;
+                        }
                         *moved += 1;
                         at += step;
                     }
@@ -83,26 +85,11 @@ impl Pipe {
                     let mut at = 0;
                     while let Some((fr, nx)) = frame::next_frame(p, at) {
                         match fr {
-                            Frame::Dgram { stream, off, len } => {
+                            Frame::Dgram { stream, seq, off, len, .. } => {
                                 w.t.down_pkts += 1;
                                 w.t.down_bytes += len as u64;
                                 *moved += 1;
-                                match flows.dest(stream) {
-                                    Some(Dest::Client { listen, addr }) => {
-                                        let l = &mut listens[*listen as usize];
-                                        if l.down.full() {
-                                            l.down.flush(l.sock.as_raw_fd());
-                                        }
-                                        l.down.push(p[off..].as_ptr(), len, Some(addr));
-                                    }
-                                    Some(Dest::Brain { tag }) => {
-                                        if let Some(c) = ctl {
-                                            let k = ctl::put_dgram(out, *tag, &p[off..off + len]);
-                                            c.send(&out[..k]);
-                                        }
-                                    }
-                                    _ => {}
-                                }
+                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now);
                             }
                             Frame::Hello => {
                                 if !m.h.up {
@@ -137,5 +124,42 @@ impl Pipe {
             }
         }
         self.send_events();
+    }
+}
+
+/// A datagram of trunk stream `stream` from the exit: to its client (queued
+/// in the listen's batch, pointing into the receive buffer) or to the brain;
+/// a copy already seen is dropped (spec/trunk.md, "Datagrams"), as is one
+/// whose flow ended here.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64) {
+    let Some((f, counts)) = flows.with_counts(stream) else { return };
+    let echo = f.echo();
+    if f.replay.seen(seq) {
+        if !echo {
+            counts.copies += 1;
+        }
+        return;
+    }
+    f.used = now;
+    if !echo {
+        counts.delivered += 1;
+    }
+    match &f.dest {
+        Dest::Client { listen, addr } => {
+            let l = &mut listens[*listen as usize];
+            if l.down.full() {
+                l.down.flush(l.sock.as_raw_fd());
+            }
+            l.down.push(p.as_ptr(), p.len(), Some(addr));
+        }
+        Dest::Brain { tag } => {
+            if let Some(c) = ctl {
+                let k = ctl::put_dgram(out, *tag, p);
+                c.send(&out[..k]);
+            }
+        }
+        Dest::Gone => {}
     }
 }

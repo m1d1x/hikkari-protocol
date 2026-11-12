@@ -126,13 +126,16 @@ impl Pipe {
                 route[CLASS_VOICE as usize] = voice;
             }
             Msg::Open { tag, class, pin, port, copies } => {
-                flows.open(tag, Flow { dest: Dest::Brain { tag }, seq: 0, class, pin, port, copies })?;
+                flows.open(tag, Flow::new(Dest::Brain { tag }, class, pin, port, copies, now))?;
             }
             Msg::Dgram { tag, payload } => {
-                let Some(id) = flows.tagged(tag) else {
+                let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
                     return Ok(()); // closed under it
                 };
-                carry(wires, *route, flows.get_mut(id), id, payload, now);
+                carry(wires, *route, f, id, payload, now);
+                if !f.echo() {
+                    n.out += 1;
+                }
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
@@ -180,7 +183,11 @@ impl Pipe {
             pause_ago_ms: if self.judge.resumed == 0 { NONE_MS } else { ms(now - self.judge.resumed) },
             pauses: self.judge.pauses,
             late_max_us: (self.late_max / 1000).min(u32::MAX as u64) as u32,
-            flows: self.flows.live,
+            flows: self.flows.clients,
+            dgrams_out: self.flows.n.out,
+            dgrams_in: self.flows.n.delivered,
+            dgrams_copy: self.flows.n.copies,
+            flows_idle: self.flows.n.idle,
         };
         self.late_max = 0;
         let Some(c) = &mut self.ctl else { return };

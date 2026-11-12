@@ -6,7 +6,10 @@
 //! The pipe ends when the brain does.
 //!
 //! Without it (the bench) the flags fix what the brain would decide: one
-//! client port, one wire, its members, the glue window.
+//! client port, one wire, its members, the glue window, the copies.
+//!
+//! `--flow-idle-ms` (either way): a client's flow unused this long ends;
+//! the trunk's 2 minutes without it.
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -33,7 +36,9 @@ mod linux {
             glue_max: 1200,
             to: 0,
             wire: 2,
+            copies: 1,
         };
+        let mut flow_idle_ms: Option<u64> = None;
         let mut gro = true;
         let mut tick_ns = 1_000_000u64;
         let mut ctl: Option<i32> = None;
@@ -52,6 +57,8 @@ mod linux {
                 "--to" => a.to = v.parse().expect("--to"),
                 "--gro" => gro = v == "1",
                 "--wire-id" => a.wire = v.parse().expect("--wire-id"),
+                "--copies" => a.copies = v.parse().expect("--copies"),
+                "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
                 "--tick-us" => tick_ns = v.parse::<u64>().expect("--tick-us") * 1000,
                 x => panic!("unknown flag {x}"),
             }
@@ -76,6 +83,9 @@ mod linux {
                 Pipe::alone(&a, tick_ns, gro).expect("sockets")
             }
         };
+        if let Some(ms) = flow_idle_ms {
+            p.set_flow_idle(ms * 1_000_000);
+        }
         p.run();
         eprintln!("hk-pipe: the brain is gone");
     }
