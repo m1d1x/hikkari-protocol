@@ -464,12 +464,31 @@ func (s *Selector) byMarginLocked(class Class, a, b WireID, now time.Time) bool 
 // SteerEvery is how often Steer chooses.
 var SteerEvery = time.Second
 
-// Steer sets the entry's route from sel every SteerEvery until ctx ends.
-// It tells sel of this box's pauses: the session's (its clock ran late) and
-// its own (a tick later than two SteerEvery). logf gets a line whenever the
-// route changes, one whenever the set of red wires does, and one whenever
-// the set of held ones does.
+// Steered is what a selector steers: the wires as their carrier sees them,
+// the carrier's own pauses, and its route. The entry is one (its sessions
+// carry the packets); so is the entry's pipe when a pipe carries them
+// (pipectl.Pipe).
+type Steered interface {
+	Wires() map[WireID]WireState
+	// LastPause is when the carrier last came back from a pause of its own;
+	// zero for none.
+	LastPause() time.Time
+	Route() Route
+	SetRoute(Route)
+}
+
+// Steer sets the entry's route from sel every SteerEvery until ctx ends
+// (SteerOn the entry).
 func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...any)) {
+	SteerOn(ctx, e, sel, logf)
+}
+
+// SteerOn sets t's route from sel every SteerEvery until ctx ends.
+// It tells sel of the pauses: the carrier's (t.LastPause) and its own (a
+// tick later than two SteerEvery). logf gets a line whenever the route
+// changes, one whenever the set of red wires does, and one whenever the set
+// of held ones does.
+func SteerOn(ctx context.Context, e Steered, sel *Selector, logf func(string, ...any)) {
 	t := time.NewTicker(SteerEvery)
 	defer t.Stop()
 	lastRed, lastHeld := "none", "none"
@@ -485,11 +504,11 @@ func (e *Entry) Steer(ctx context.Context, sel *Selector, logf func(string, ...a
 				sel.Paused(now)
 			}
 			last = now
-			if p := e.Session().LastPause(); !p.IsZero() {
+			if p := e.LastPause(); !p.IsZero() {
 				sel.Paused(p)
 			}
 			c := sel.Choose(now, e.Wires())
-			if c.Route != e.currentRoute() {
+			if c.Route != e.Route() {
 				e.SetRoute(c.Route)
 			}
 			if c.Why != "" {
@@ -525,8 +544,13 @@ func (s *Selector) names(ids []WireID) string {
 	return strings.Join(out, ",")
 }
 
-func (e *Entry) currentRoute() Route {
+// Route is the route the entry gives its sessions.
+func (e *Entry) Route() Route {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.route
 }
+
+// LastPause is when the entry's current session last came back from a
+// pause of its own.
+func (e *Entry) LastPause() time.Time { return e.Session().LastPause() }

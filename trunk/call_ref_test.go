@@ -25,7 +25,7 @@ func (c *refCall) bucket(at time.Time) *callBucket {
 	from := at.Truncate(c.cfg.Window)
 	b := c.buckets[from]
 	if b == nil {
-		b = &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[*Session]bool{}}
+		b = &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[CallCarrier]bool{}}
 		c.buckets[from] = b
 	}
 	return b

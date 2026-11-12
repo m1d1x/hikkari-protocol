@@ -162,7 +162,7 @@ func TestSteerLeavesACutWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.entry.Steer(ctx, sel, t.Logf)
-	waitFor(t, func() bool { return h.entry.currentRoute() == Route{Voice: testUDP, Bulk: testQuic} })
+	waitFor(t, func() bool { return h.entry.Route() == Route{Voice: testUDP, Bulk: testQuic} })
 
 	c := h.carry()
 	defer c.Close()
@@ -174,7 +174,7 @@ func TestSteerLeavesACutWire(t *testing.T) {
 	waitFor(t, func() bool { return h.wires[testQuic].out.Load() > 4<<20 })
 	cut := time.Now()
 	h.wires[testQuic].cut.Store(true)
-	waitFor(t, func() bool { return h.entry.currentRoute().Bulk == PoolWire })
+	waitFor(t, func() bool { return h.entry.Route().Bulk == PoolWire })
 	if d := time.Since(cut); d > 5*time.Second {
 		t.Fatalf("the route left the cut wire after %s", d)
 	} else {
@@ -279,7 +279,7 @@ func TestSteerHoldsThroughOwnPause(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.entry.Steer(ctx, sel, t.Logf)
-	waitFor(t, func() bool { return h.entry.currentRoute().Voice == testUDP })
+	waitFor(t, func() bool { return h.entry.Route().Voice == testUDP })
 
 	s := h.entry.Session()
 	s.mu.Lock()
@@ -288,12 +288,12 @@ func TestSteerHoldsThroughOwnPause(t *testing.T) {
 	pausedAt := time.Now()
 	h.wires[testUDP].cut.Store(true)
 	for time.Since(pausedAt) < grace-300*time.Millisecond {
-		if r := h.entry.currentRoute(); r.Voice != testUDP {
+		if r := h.entry.Route(); r.Voice != testUDP {
 			t.Fatalf("voice left udp %s after this box's pause", time.Since(pausedAt).Round(time.Millisecond))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	waitFor(t, func() bool { return h.entry.currentRoute().Voice == PoolWire })
+	waitFor(t, func() bool { return h.entry.Route().Voice == PoolWire })
 	if d := time.Since(pausedAt); d > grace+5*time.Second {
 		t.Fatalf("the route left the cut wire %s after the pause", d)
 	} else {

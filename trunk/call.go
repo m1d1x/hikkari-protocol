@@ -114,9 +114,9 @@ type callBucket struct {
 	got      int
 	rtts     []time.Duration
 	arrivals []time.Time
-	sessions map[*Session]bool
-	last     *Session // the session of the last send, to skip the map
-	closed   bool     // reported: its datagrams' answers no longer count
+	sessions map[CallCarrier]bool
+	last     CallCarrier // the carrier of the last send, to skip the map
+	closed   bool        // reported: its datagrams' answers no longer count
 }
 
 // callSent is one datagram sent and not yet past its window's Grace.
@@ -148,15 +148,41 @@ func newCall(cfg CallConfig, start time.Time) *call {
 	return &call{cfg: cfg, start: start, ring: make([]callSent, 64)}
 }
 
+// CallCarrier carries a call's datagrams to the exit's echo and back: the
+// entry's session, or the entry's pipe when a pipe carries the packets
+// (pipectl).
+type CallCarrier interface {
+	// OpenCallFlow opens a flow to EchoPort with o; deliver gets each
+	// answer.
+	OpenCallFlow(o FlowOptions, deliver func([]byte)) CallFlow
+}
+
+// CallFlow is a call's flow: Send is false once the flow has ended.
+type CallFlow interface {
+	Send(p []byte) bool
+	Close()
+}
+
+// OpenCallFlow is the call's flow on this session.
+func (s *Session) OpenCallFlow(o FlowOptions, deliver func([]byte)) CallFlow {
+	return s.OpenFlowWith(EchoPort, o, deliver, nil)
+}
+
 // RunCall keeps a call going on the session session gives (the entry's
 // current one, Entry.Session) until ctx ends, and gives report every window
 // once its Grace is over. report runs on the call's own goroutine.
 func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, report func(CallWindow)) {
+	RunCallOn(ctx, func() CallCarrier { return session() }, cfg, report)
+}
+
+// RunCallOn is RunCall on any carrier: carrier gives the current one, and a
+// new one is a new flow, counted in the window's Sessions.
+func RunCallOn(ctx context.Context, carrier func() CallCarrier, cfg CallConfig, report func(CallWindow)) {
 	cfg = cfg.withDefaults()
 	c := newCall(cfg, time.Now())
 	var (
-		cur  *Session
-		flow *Flow
+		cur  CallCarrier
+		flow CallFlow
 		seq  uint64
 	)
 	defer func() {
@@ -172,7 +198,7 @@ func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, repor
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if s := session(); s != cur || flow == nil {
+			if s := carrier(); s != cur || flow == nil {
 				if flow != nil {
 					flow.Close()
 				}
@@ -181,7 +207,7 @@ func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, repor
 				if cfg.OnWire {
 					o.Pin = cfg.Wire
 				}
-				flow = s.OpenFlowWith(EchoPort, o, c.answer, nil)
+				flow = s.OpenCallFlow(o, c.answer)
 			}
 			seq++
 			binary.BigEndian.PutUint64(payload, seq)
@@ -207,7 +233,7 @@ func (c *call) bucketLocked(at time.Time) *callBucket {
 	}
 	from := at.Truncate(c.cfg.Window)
 	per := min(int(c.cfg.Window/c.cfg.Every)+1, 1<<14)
-	b := &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[*Session]bool{},
+	b := &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[CallCarrier]bool{},
 		rtts: make([]time.Duration, 0, per), arrivals: make([]time.Time, 0, per)}
 	i := len(c.buckets)
 	for i > 0 && c.buckets[i-1].from.After(from) {
@@ -240,7 +266,7 @@ func (c *call) push(r callSent) {
 	c.n++
 }
 
-func (c *call) sent(seq uint64, at time.Time, s *Session) {
+func (c *call) sent(seq uint64, at time.Time, s CallCarrier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.bucketLocked(at)

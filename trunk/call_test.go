@@ -99,7 +99,7 @@ func TestCallWindowPauses(t *testing.T) {
 	ms := func(n int) time.Time { return from.Add(time.Duration(n) * time.Millisecond) }
 	b := &callBucket{from: from, to: from.Add(time.Second), sent: 50, got: 3,
 		rtts:     []time.Duration{50 * time.Millisecond, 40 * time.Millisecond, 70 * time.Millisecond},
-		arrivals: []time.Time{ms(20), ms(40), ms(540), ms(600), ms(620)}, sessions: map[*Session]bool{nil: true}}
+		arrivals: []time.Time{ms(20), ms(40), ms(540), ms(600), ms(620)}, sessions: map[CallCarrier]bool{nil: true}}
 	// Pauses: 20, 20, 500, 60, 20, then 380 to the window's end.
 	w := cfg.window(b, from)
 	if w.Gaps60 != 2 || w.Gaps150 != 2 || w.GapMax != 500*time.Millisecond {
@@ -115,7 +115,7 @@ func TestCallWindowPauses(t *testing.T) {
 		t.Fatalf("round trips or loss %+v", w)
 	}
 	// Nothing came back at all: the whole window is one pause.
-	w = cfg.window(&callBucket{from: from, to: from.Add(time.Second), sent: 50, sessions: map[*Session]bool{}}, from)
+	w = cfg.window(&callBucket{from: from, to: from.Add(time.Second), sent: 50, sessions: map[CallCarrier]bool{}}, from)
 	if w.Gaps150 != 1 || w.GapMax != time.Second || w.Got != 0 || w.RTTP50 != 0 {
 		t.Fatalf("a silent window %+v", w)
 	}
