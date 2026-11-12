@@ -36,8 +36,9 @@ pub const NONE_MS: u32 = u32::MAX;
 
 // Why a member went up or down.
 pub const WHY_HELLO: u8 = 1; // the exit answered its hello
-pub const WHY_SILENT: u8 = 2; // it owed an answer longer than the wire's dead_ms
+pub const WHY_SILENT: u8 = 2; // it owed an answer past its stall (the wire's dead_ms) while another member proved the exit alive
 pub const WHY_GONE: u8 = 3; // its socket failed
+pub const WHY_QUIET: u8 = 4; // every member silent at once, past Quiet (1 s): the exit or the whole path
 
 /// Most sockets one message may carry: a wire's members.
 pub const MAX_FDS: usize = 64;
@@ -134,7 +135,7 @@ pub struct WireTick {
 #[derive(Clone, Copy, Default)]
 pub struct PipeTick {
     /// How long ago the pipe came back from its latest pause (a turn of its
-    /// loop later than 100 ms past due, as trunk's lateTick); NONE_MS for none.
+    /// loop more than 100 ms after the one before, as trunk's lateTick); NONE_MS for none.
     pub pause_ago_ms: u32,
     pub pauses: u32,
     /// The latest turn of the loop past due in the last second, in µs.

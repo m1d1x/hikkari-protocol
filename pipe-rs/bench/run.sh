@@ -21,6 +21,7 @@ run_one() {
   case $impl in
     go)   taskset -c "$ENTRY_CPUS" "$OUT/goentry" >"$OUT/entry-$impl.log" 2>&1 & ;;
     rust) taskset -c "$ENTRY_CPUS" "$OUT/hk-pipe" --glue-us "$GLUE_US" >"$OUT/entry-$impl.log" 2>&1 & ;;
+    rustbase) taskset -c "$ENTRY_CPUS" "$OUT/hk-pipe-base" --glue-us "$GLUE_US" >"$OUT/entry-$impl.log" 2>&1 & ;;
     rust2) taskset -c "$ENTRY_CPUS" "$OUT/hk-pipe" --glue-us 2000 --tick-us 2000 >"$OUT/entry-$impl.log" 2>&1 & ;;
     rustev) taskset -c "$ENTRY_CPUS" "$OUT/hk-pipe" --glue-us "$GLUE_US" --tick-us 0 >"$OUT/entry-$impl.log" 2>&1 & ;;
   esac

@@ -27,6 +27,7 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use crate::ctl::{self, Ctl, Msg, PipeTick, WireTick, ANY_WIRE, NONE_MS};
+use crate::health::{self, Health, Judge, Verdict};
 use crate::sys::{self, now_ns, Poll, RecvBatch, SendBatch, BATCH};
 use crate::wire::{self, Frame, Seal, DGRAM_HEAD, OVERHEAD};
 
@@ -35,11 +36,15 @@ pub const SLOT: usize = 2048;
 const MAX_CLIENT: usize = 1500;
 /// A member's hello is said again this often until answered.
 const HELLO_EVERY: u64 = 250_000_000;
-/// A member pings this often (the exit judges a packet member by its pings).
-const PING_EVERY: u64 = 100_000_000;
-/// A turn of the loop later than this past due is the pipe's own pause
-/// (trunk's lateTick: the box did not run it).
-const LATE: u64 = 100_000_000;
+/// The members' clock (trunk's tick): pings are sent and debts judged on
+/// it, not on every turn of the loop. A pause of the exit ends with every
+/// member's pongs at once, a few datagrams apart; judged between the first
+/// and the last of them, the others would be buried by the first one's
+/// proof.
+const CLOCK: u64 = 25_000_000;
+/// Members that die together come back spread over this (trunk's
+/// replaceSpread), not as one burst of new peers from one box.
+const SPREAD: u64 = 1_000_000_000;
 const TICK_EVERY: u64 = 1_000_000_000;
 const STATS_EVERY: u64 = 10_000_000_000;
 
@@ -86,14 +91,12 @@ struct Flow {
 struct Member {
     sock: Option<UdpSocket>,
     fd: i32,
-    up: bool,
+    /// Up, its pings, its debt: spec/trunk.md, "Members' health".
+    h: Health,
     hello_at: u64,
-    ping_at: u64,
-    /// Since when it owes an answer to a ping (0: it owes none).
-    owed_since: u64,
-    ping_tok: u64,
-    ping_sent: u64,
-    rtt_ns: u64,
+    /// Without a brain: when a member taken down gets its new socket (0:
+    /// not waiting for one).
+    renew_at: u64,
     /// Sealed datagrams waiting for sendmmsg: BATCH slots.
     out: Vec<u8>,
     out_n: usize,
@@ -115,13 +118,9 @@ impl Member {
         Member {
             sock,
             fd,
-            up: false,
+            h: Health::new(true),
             hello_at: 0,
-            ping_at: 0,
-            owed_since: 0,
-            ping_tok: 0,
-            ping_sent: 0,
-            rtt_ns: 0,
+            renew_at: 0,
             out: vec![0; SLOT * BATCH],
             out_n: 0,
             send: SendBatch::new(),
@@ -137,9 +136,9 @@ impl Member {
     fn set_sock(&mut self, sock: Option<UdpSocket>) {
         self.fd = sock.as_ref().map_or(-1, |s| s.as_raw_fd());
         self.sock = sock;
-        self.up = false;
+        self.h.down();
         self.hello_at = 0;
-        self.owed_since = 0;
+        self.renew_at = 0;
         self.glue_n = 0;
         self.glue_since = 0;
         self.out_n = 0;
@@ -192,19 +191,20 @@ struct Wire {
     id: u8,
     glue_ns: u64,
     glue_max: usize,
-    dead_ns: u64,
+    /// Its members' stall (trunk Config.Stall): the brain's dead_ms.
+    stall_ns: u64,
     key: [u8; 32],
     members: Vec<Member>,
     /// Without a brain: where a member's new socket goes.
     exit: Option<SocketAddrV4>,
-    /// When one of its members last heard the exit (0: never).
+    /// When one of its members last proved its round trip (0: never).
     proof: u64,
     t: WireTick,
 }
 
 impl Wire {
     fn up(&self) -> usize {
-        self.members.iter().filter(|m| m.up).count()
+        self.members.iter().filter(|m| m.h.up).count()
     }
 }
 
@@ -269,8 +269,9 @@ pub struct Pipe {
     fds: Vec<i32>,
     events: Vec<Event>,
     tok: u64,
-    resumed: u64,
-    pauses: u32,
+    /// The session's proof and the pipe's own pauses.
+    judge: Judge,
+    clock_at: u64,
     late_max: u64,
     tick_at: u64,
     stats_at: u64,
@@ -306,8 +307,8 @@ impl Pipe {
             fds: Vec::with_capacity(ctl::MAX_FDS),
             events: Vec::with_capacity(64),
             tok: 0,
-            resumed: 0,
-            pauses: 0,
+            judge: Judge::new(health::QUIET),
+            clock_at: now,
             late_max: 0,
             tick_at: now + TICK_EVERY,
             stats_at: now,
@@ -338,7 +339,7 @@ impl Pipe {
             id: a.wire,
             glue_ns: a.glue_ns,
             glue_max: a.glue_max,
-            dead_ns: 1_000_000_000,
+            stall_ns: health::STALL,
             key,
             members: Vec::new(),
             exit: Some(a.exit),
@@ -357,8 +358,13 @@ impl Pipe {
     pub fn run(&mut self) {
         let mut sleep_at = 0u64;
         let mut busy = false;
+        let mut prev = 0u64;
         loop {
             let now = now_ns();
+            // Before the clock: a member's debt counts from the end of a
+            // pause of the pipe's own.
+            self.judge.turn(prev, now);
+            prev = now;
             let next = self.timers(now);
             if self.dirty {
                 self.rebuild_poll();
@@ -382,10 +388,6 @@ impl Pipe {
             if now > due {
                 let late = now - due;
                 self.late_max = self.late_max.max(late);
-                if late > LATE {
-                    self.resumed = now;
-                    self.pauses += 1;
-                }
             }
             let moved0 = self.moved;
             if !self.from_brain() {
@@ -427,56 +429,75 @@ impl Pipe {
         self.dirty = false;
     }
 
-    /// The members' own talk (hello until answered, a ping every 100 ms, a
-    /// member silent past its wire's dead_ns taken down), the brain's tick,
-    /// the stats line; returns when the next of them is due.
+    /// The members' own talk and health (hello until answered; on the
+    /// members' clock a ping every 100 ms and the debts judged, health.rs),
+    /// the brain's tick, the stats line; returns when the next of them is
+    /// due.
     fn timers(&mut self, now: u64) -> u64 {
-        let mut next = now + PING_EVERY;
-        let mut need = false;
-        for w in self.wires.iter_mut() {
+        let clock = now >= self.clock_at;
+        if clock {
+            self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
+        }
+        let mut next = self.clock_at;
+        let alone = self.ctl.is_none();
+        let Pipe { wires, judge, tok, events, session, dirty, .. } = self;
+        for w in wires.iter_mut() {
             for (mi, m) in w.members.iter_mut().enumerate() {
+                if m.renew_at != 0 {
+                    if now >= m.renew_at {
+                        // Alone the pipe dials its own: a new socket is a
+                        // new peer to the exit, joined by its hello.
+                        let sock = w.exit.and_then(|exit| member_to(exit).ok());
+                        m.set_sock(sock);
+                        *dirty = true;
+                    } else {
+                        next = next.min(m.renew_at);
+                    }
+                }
                 if m.fd < 0 {
                     continue;
                 }
-                if m.up && m.owed_since != 0 && now - m.owed_since > w.dead_ns {
-                    m.up = false;
-                    self.events.push(Event { wire: w.id, index: mi as u8, up: false, why: ctl::WHY_SILENT });
-                    need = true;
-                    continue;
-                }
-                if !m.up && now >= m.hello_at {
-                    let mut h = [0u8; 64];
-                    let n = wire::hello_t2(&mut h[12..], &self.session, w.id);
-                    let n = m.seal.seal(&mut h, n);
-                    if let Some(s) = &m.sock {
-                        let _ = s.send(&h[..n]);
+                if !m.h.up {
+                    if now >= m.hello_at {
+                        let mut h = [0u8; 64];
+                        let n = wire::hello_t2(&mut h[12..], session, w.id);
+                        let n = m.seal.seal(&mut h, n);
+                        if let Some(s) = &m.sock {
+                            let _ = s.send(&h[..n]);
+                        }
+                        m.hello_at = now + HELLO_EVERY;
                     }
-                    m.hello_at = now + HELLO_EVERY;
-                }
-                if m.up && now >= m.ping_at {
-                    self.tok += 1;
-                    let tok = self.tok;
-                    m.glue_frame(9, w.glue_max, now, |b| wire::put_ping(b, wire::F_PING, tok));
-                    m.seal_glue();
-                    m.flush_out();
-                    if m.owed_since == 0 {
-                        m.owed_since = now;
+                    next = next.min(m.hello_at);
+                } else if clock {
+                    match m.h.tick(judge, w.stall_ns, now, tok) {
+                        Verdict::Fine => {}
+                        Verdict::Ping(t) => {
+                            m.glue_frame(9, w.glue_max, now, |b| wire::put_ping(b, wire::F_PING, t));
+                            m.seal_glue();
+                            m.flush_out();
+                        }
+                        Verdict::Dead { quiet } => {
+                            let why = if quiet { ctl::WHY_QUIET } else { ctl::WHY_SILENT };
+                            events.push(Event { wire: w.id, index: mi as u8, up: false, why });
+                            // Its socket goes now: what comes on it is no
+                            // member's. The brain answers the event with a
+                            // new one; alone the pipe dials it within SPREAD.
+                            m.set_sock(None);
+                            *dirty = true;
+                            if alone {
+                                let mut r = [0u8; 8];
+                                sys::urandom(&mut r);
+                                m.renew_at = now + 1 + u64::from_le_bytes(r) % SPREAD;
+                                next = next.min(m.renew_at);
+                            }
+                            continue;
+                        }
                     }
-                    m.ping_tok = tok;
-                    m.ping_sent = now;
-                    m.ping_at = now + PING_EVERY;
-                }
-                next = next.min(if m.up { m.ping_at } else { m.hello_at });
-                if m.up && m.owed_since != 0 {
-                    next = next.min(m.owed_since + w.dead_ns + 1);
                 }
                 if m.glue_since != 0 {
                     next = next.min(m.glue_since + w.glue_ns);
                 }
             }
-        }
-        if need {
-            self.renew_dead();
         }
         self.send_events();
         if now >= self.tick_at {
@@ -488,26 +509,6 @@ impl Pipe {
             self.log_stats();
         }
         next.min(self.tick_at)
-    }
-
-    /// A member taken down gets a new socket, as a Go member is dialed anew:
-    /// the exit sees a new peer and joins it to the session by its hello.
-    /// With a brain the brain binds it (B_MEMBER answers the event); alone
-    /// the pipe does.
-    fn renew_dead(&mut self) {
-        for w in self.wires.iter_mut() {
-            for m in w.members.iter_mut() {
-                if m.up || m.fd < 0 || m.owed_since == 0 {
-                    continue;
-                }
-                let sock = match (self.ctl.is_some(), w.exit) {
-                    (false, Some(exit)) => member_to(exit).ok(),
-                    _ => None,
-                };
-                m.set_sock(sock);
-                self.dirty = true;
-            }
-        }
     }
 
     /// Member events go to the brain at once, and a tick after them: the
@@ -535,8 +536,8 @@ impl Pipe {
 
     fn send_tick(&mut self, now: u64) {
         let p = PipeTick {
-            pause_ago_ms: if self.resumed == 0 { NONE_MS } else { ms(now - self.resumed) },
-            pauses: self.pauses,
+            pause_ago_ms: if self.judge.resumed == 0 { NONE_MS } else { ms(now - self.judge.resumed) },
+            pauses: self.judge.pauses,
             late_max_us: (self.late_max / 1000).min(u32::MAX as u64) as u32,
             flows: self.live_flows,
         };
@@ -551,12 +552,12 @@ impl Pipe {
             t.owed_ms = 0;
             t.rtt_us = 0;
             let mut first = true;
-            for m in w.members.iter().filter(|m| m.up) {
-                let owed = if m.owed_since == 0 { 0 } else { ms(now - m.owed_since) };
+            for m in w.members.iter().filter(|m| m.h.up) {
+                let owed = ms(m.h.owed(&self.judge, now));
                 t.owed_ms = if first { owed } else { t.owed_ms.min(owed) };
                 first = false;
-                if m.rtt_ns > 0 {
-                    let us = (m.rtt_ns / 1000) as u32;
+                if m.h.rtt > 0 {
+                    let us = (m.h.rtt / 1000) as u32;
                     t.rtt_us = if t.rtt_us == 0 { us } else { t.rtt_us.min(us) };
                 }
             }
@@ -571,7 +572,7 @@ impl Pipe {
     }
 
     fn log_stats(&self) {
-        let mut s = format!("hk-pipe: flows={} route=bulk:{},voice:{} pauses={} bad={}", self.live_flows, self.route[0], self.route[1], self.pauses, self.bad);
+        let mut s = format!("hk-pipe: flows={} route=bulk:{},voice:{} pauses={} bad={}", self.live_flows, self.route[0], self.route[1], self.judge.pauses, self.bad);
         for w in &self.wires {
             s += &format!(
                 " | wire {} up={}/{} in={} out={} dgrams={} frames/dgram={:.2}",
@@ -668,7 +669,7 @@ impl Pipe {
                             id,
                             glue_ns: 0,
                             glue_max: 0,
-                            dead_ns: 0,
+                            stall_ns: health::STALL,
                             key,
                             members: Vec::new(),
                             exit: None,
@@ -681,7 +682,7 @@ impl Pipe {
                 let w = &mut wires[at];
                 w.glue_ns = glue_us as u64 * 1000;
                 w.glue_max = (glue_max as usize).clamp(64, SLOT - OVERHEAD);
-                w.dead_ns = dead_ms.max(1) as u64 * 1_000_000;
+                w.stall_ns = dead_ms.max(1) as u64 * 1_000_000;
                 // New sockets (or a new key) start the members over; a member
                 // keeps its counters.
                 let rekey = w.key != key;
@@ -813,7 +814,7 @@ impl Pipe {
 
     /// Wires → clients and the brain.
     fn from_wires(&mut self) {
-        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, .. } = self;
+        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Member(wi, mi) = *s else { continue };
             if !poll.readable(si) {
@@ -836,7 +837,6 @@ impl Pipe {
                         *bad += 1;
                         continue;
                     };
-                    w.proof = now;
                     let p = &d[12..12 + pn];
                     let mut at = 0;
                     while let Some((fr, nx)) = wire::next_frame(p, at) {
@@ -863,10 +863,8 @@ impl Pipe {
                                 }
                             }
                             Frame::Hello => {
-                                if !m.up {
-                                    m.up = true;
-                                    m.owed_since = 0;
-                                    m.ping_at = now;
+                                if !m.h.up {
+                                    m.h.join(now);
                                     events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO });
                                 }
                             }
@@ -874,9 +872,8 @@ impl Pipe {
                                 m.glue_frame(9, glue_max, now, |b| wire::put_ping(b, wire::F_PONG, t));
                             }
                             Frame::Pong(t) => {
-                                m.owed_since = 0;
-                                if t == m.ping_tok {
-                                    m.rtt_ns = now - m.ping_sent;
+                                if m.h.pong(judge, t, now) {
+                                    w.proof = now;
                                 }
                             }
                             Frame::Drain | Frame::Other => {}
@@ -913,7 +910,7 @@ fn carry(wires: &mut [Wire], route: [u8; 2], f: &mut Flow, id: u32, p: &[u8], no
     }
     let strict = f.pin != ANY_WIRE;
     let want = if strict { f.pin } else { route[(f.class & 1) as usize] };
-    let mut wi = wires.iter().position(|w| w.id == want && w.members.iter().any(|m| m.up));
+    let mut wi = wires.iter().position(|w| w.id == want && w.members.iter().any(|m| m.h.up));
     if wi.is_none() {
         if strict {
             if let Some(w) = wires.iter_mut().find(|w| w.id == want) {
@@ -921,7 +918,7 @@ fn carry(wires: &mut [Wire], route: [u8; 2], f: &mut Flow, id: u32, p: &[u8], no
             }
             return;
         }
-        let n = wires.iter().filter(|w| w.members.iter().any(|m| m.up)).count();
+        let n = wires.iter().filter(|w| w.members.iter().any(|m| m.h.up)).count();
         if n == 0 {
             let at = wires.iter().position(|w| w.id == want).unwrap_or(0);
             if let Some(w) = wires.get_mut(at) {
@@ -930,7 +927,7 @@ fn carry(wires: &mut [Wire], route: [u8; 2], f: &mut Flow, id: u32, p: &[u8], no
             return;
         }
         let k = id as usize % n;
-        wi = wires.iter().enumerate().filter(|(_, w)| w.members.iter().any(|m| m.up)).map(|(i, _)| i).nth(k);
+        wi = wires.iter().enumerate().filter(|(_, w)| w.members.iter().any(|m| m.h.up)).map(|(i, _)| i).nth(k);
     }
     let w = &mut wires[wi.unwrap()];
     f.seq = f.seq.wrapping_add(1);
@@ -941,7 +938,7 @@ fn carry(wires: &mut [Wire], route: [u8; 2], f: &mut Flow, id: u32, p: &[u8], no
     let mut sent = 0;
     for k in 0..n {
         let m = &mut w.members[(start + k) % n];
-        if !m.up {
+        if !m.h.up {
             continue;
         }
         m.glue_frame(DGRAM_HEAD + p.len(), w.glue_max, now, |b| wire::put_dgram(b, id, seq, port, p));

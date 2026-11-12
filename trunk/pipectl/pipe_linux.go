@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -25,6 +26,12 @@ type Config struct {
 	Args   []string // its other flags (--tick-us, --gro)
 	Stderr io.Writer
 	Logf   func(format string, a ...any)
+	// OnMember, when set, hears every member event of the pipe (why: Why*).
+	OnMember func(wire trunk.WireID, index int, up bool, why byte)
+	// Spread spreads the dials that replace members the pipe took down
+	// (trunk's replaceSpread): members that die together come back one by
+	// one. Zero is a second, negative none.
+	Spread time.Duration
 }
 
 // Wire is a wire the pipe carries, as the brain configures it.
@@ -36,7 +43,12 @@ type Wire struct {
 	Members int
 	Glue    time.Duration // how long frames wait to share a datagram; 1 ms when 0
 	GlueMax int           // the most a glued datagram holds; 1200 when 0
-	Dead    time.Duration // a member owing an answer this long is down; 1 s when 0
+	// Stall is how long a member may owe an answer while another member
+	// proves the exit alive (spec/trunk.md, "Members' health"; the pipe adds
+	// the ping interval and raises it to 4 × the member's smoothed RTT).
+	// Every member silent at once dies only after Quiet, the pipe's 1 s.
+	// trunk.DefaultStall when 0.
+	Stall time.Duration
 }
 
 // staleTick is how old the latest tick may be before the brain takes the
@@ -80,6 +92,9 @@ type wireConf struct {
 func Start(cfg Config) (*Pipe, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	if cfg.Spread == 0 {
+		cfg.Spread = time.Second
 	}
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -217,14 +232,14 @@ func (p *Pipe) SetWire(w Wire) error {
 	if w.GlueMax == 0 {
 		w.GlueMax = 1200
 	}
-	if w.Dead == 0 {
-		w.Dead = time.Second
+	if w.Stall == 0 {
+		w.Stall = trunk.DefaultStall
 	}
 	key, err := udpwire.Key(w.Key)
 	if err != nil {
 		return err
 	}
-	msg, err := putWire(w.ID, FormUDP, w.Glue, w.GlueMax, w.Dead, key)
+	msg, err := putWire(w.ID, FormUDP, w.Glue, w.GlueMax, w.Stall, key)
 	if err != nil {
 		return err
 	}
@@ -430,6 +445,9 @@ func (p *Pipe) read() {
 			}
 			id, index, up, why := trunk.WireID(m[1]), int(m[2]), m[3] == 1, m[4]
 			p.cfg.Logf("pipectl: wire %d member %d up=%v why=%d", id, index, up, why)
+			if p.cfg.OnMember != nil {
+				p.cfg.OnMember(id, index, up, why)
+			}
 			if !up {
 				go p.renew(id, index)
 			}
@@ -453,8 +471,16 @@ func (p *Pipe) read() {
 }
 
 // renew dials a member the pipe took down anew, as a Go member is: the exit
-// sees a new peer and joins it to the session by its hello.
+// sees a new peer and joins it to the session by its hello. It waits a
+// random part of Spread first, as a Go slot does.
 func (p *Pipe) renew(id trunk.WireID, index int) {
+	if p.cfg.Spread > 0 {
+		select {
+		case <-time.After(rand.N(p.cfg.Spread)):
+		case <-p.done:
+			return
+		}
+	}
 	p.mu.Lock()
 	wc := p.wires[id]
 	p.mu.Unlock()

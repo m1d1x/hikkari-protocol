@@ -45,13 +45,25 @@ func (local) DialFlow(ctx context.Context, port uint16) (net.Conn, error) {
 
 // cutter stands between a wire's members and the exit, one socket upstream
 // per member as a path would map it, and drops everything both ways while
-// cut: a wire cut on the path, the exit and the pipe both up.
+// cut: a wire cut on the path, the exit and the pipe both up. It can cut one
+// member's path alone (cutOne), and hold: keep what the members send and
+// pass it on at release, with nothing coming back meanwhile, as an exit
+// that is not run for a while and then answers what waited in its socket.
 type cutter struct {
-	ln  *net.UDPConn
-	to  *net.UDPAddr
-	cut atomic.Bool
-	mu  sync.Mutex
-	up  map[netip.AddrPort]*net.UDPConn
+	ln   *net.UDPConn
+	to   *net.UDPAddr
+	cut  atomic.Bool
+	mu   sync.Mutex
+	up   map[netip.AddrPort]*net.UDPConn
+	off  map[netip.AddrPort]bool
+	seen map[netip.AddrPort]time.Time // a member's first datagram
+	hold bool
+	held []heldDgram
+}
+
+type heldDgram struct {
+	u *net.UDPConn
+	b []byte
 }
 
 func newCutter(t *testing.T, to netip.AddrPort) *cutter {
@@ -59,7 +71,8 @@ func newCutter(t *testing.T, to netip.AddrPort) *cutter {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := &cutter{ln: ln, to: net.UDPAddrFromAddrPort(to), up: map[netip.AddrPort]*net.UDPConn{}}
+	c := &cutter{ln: ln, to: net.UDPAddrFromAddrPort(to), up: map[netip.AddrPort]*net.UDPConn{},
+		off: map[netip.AddrPort]bool{}, seen: map[netip.AddrPort]time.Time{}}
 	t.Cleanup(func() {
 		ln.Close()
 		c.mu.Lock()
@@ -75,10 +88,14 @@ func newCutter(t *testing.T, to netip.AddrPort) *cutter {
 			if err != nil {
 				return
 			}
-			if c.cut.Load() {
+			c.mu.Lock()
+			if _, ok := c.seen[from]; !ok {
+				c.seen[from] = time.Now()
+			}
+			if c.cut.Load() || c.off[from] {
+				c.mu.Unlock()
 				continue
 			}
-			c.mu.Lock()
 			u := c.up[from]
 			if u == nil {
 				u, err = net.DialUDP("udp", nil, c.to)
@@ -94,17 +111,57 @@ func newCutter(t *testing.T, to netip.AddrPort) *cutter {
 						if err != nil {
 							return
 						}
-						if !c.cut.Load() {
+						c.mu.Lock()
+						pass := !c.cut.Load() && !c.off[from] && !c.hold
+						c.mu.Unlock()
+						if pass {
 							_, _ = ln.WriteToUDPAddrPort(b[:n], from)
 						}
 					}
 				}()
+			}
+			if c.hold {
+				c.held = append(c.held, heldDgram{u, append([]byte(nil), buf[:n]...)})
+				c.mu.Unlock()
+				continue
 			}
 			c.mu.Unlock()
 			_, _ = u.Write(buf[:n])
 		}
 	}()
 	return c
+}
+
+// cutOne cuts the path of the member whose socket is at a, both ways.
+func (c *cutter) cutOne(a netip.AddrPort) {
+	c.mu.Lock()
+	c.off[a] = true
+	c.mu.Unlock()
+}
+
+func (c *cutter) setHold(on bool) {
+	c.mu.Lock()
+	c.hold = on
+	held := c.held
+	c.held = nil
+	c.mu.Unlock()
+	for _, h := range held {
+		_, _ = h.u.Write(h.b)
+	}
+}
+
+// firstSeen is when the members not in old first sent, in order.
+func (c *cutter) firstSeen(old map[netip.AddrPort]bool) []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []time.Time
+	for a, at := range c.seen {
+		if !old[a] {
+			out = append(out, at)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Before(out[j]) })
+	return out
 }
 
 // udpEcho is a relay's UDP port behind the exit that sends each datagram

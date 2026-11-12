@@ -59,8 +59,9 @@ const noneMS = ^uint32(0)
 // Why a member went up or down.
 const (
 	WhyHello  = 1 // the exit answered its hello
-	WhySilent = 2 // it owed an answer longer than its wire's Dead
+	WhySilent = 2 // it owed an answer past its wire's Stall while another member proved the exit alive
 	WhyGone   = 3 // its socket failed
+	WhyQuiet  = 4 // every member silent at once past Quiet (1 s): the exit paused or the whole path cut
 )
 
 func putWire(id trunk.WireID, form byte, glue time.Duration, glueMax int, dead time.Duration, key []byte) ([]byte, error) {
@@ -94,7 +95,7 @@ func putTag(typ byte, tag uint32) []byte { return binary.LittleEndian.AppendUint
 // Tick is the pipe's tick: itself, then each wire.
 type Tick struct {
 	// PauseAgo is how long ago the pipe came back from its latest pause (a
-	// turn of its loop later than 100 ms past due); negative for none.
+	// turn of its loop more than 100 ms after the one before); negative for none.
 	PauseAgo time.Duration
 	Pauses   int
 	// LateMax is the latest turn of the loop past due in the last second.

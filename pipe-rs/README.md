@@ -20,6 +20,14 @@ hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2
   are sent straight out of the receive buffer. UDP GRO is on for the client socket.
 - A member speaks the t2 hello of a packet member (wire 2, flags packet), says it again every 250 ms until answered, pings
   every 100 ms and answers the exit's pings.
+- Members' health is `spec/trunk.md` as the Go session judges it (`src/health.rs`, any wire's members, on the members'
+  clock of 25 ms as Go's tick): a member owing a pong past max(Stall, 4 × smoothed RTT) + 100 ms dies only while another
+  member, of any wire, proved the exit alive after its debt began (`why` silent); every member silent at once dies only
+  after Quiet, 1 s (`why` quiet); a turn of the loop more than 100 ms after the one before is the pipe's own pause, and
+  every debt counts from its end. A pong of any ping still owed is the proof; frames that merely arrive prove nothing.
+  Members taken down get new sockets spread over a second (the brain, or the pipe alone). Judging on every turn of the
+  loop instead of the clock would bury the others by the first pong after the exit's pause: its pongs come a few
+  datagrams apart.
 
 Left out on purpose: streams (TCP) and the pool, wires other than `udp`, drains and generations, observation, flow idle
 ends, IPv6, GSO on send (the glued datagrams differ in size; answers go to different clients).
@@ -58,7 +66,7 @@ Brain → pipe:
 | --- | --- |
 | `hello` | version |
 | `listen` | a client port (one socket): id, class (bulk, voice), the exit's loopback port, copies |
-| `wire` | a wire and its members (one connected socket each): id, form (`udp`; later `quic`, `h3`), glue window and size, how long a member may owe an answer before it is down, the wire's own key (udpwire.Key of the trunk key: the pipe never sees the trunk key) |
+| `wire` | a wire and its members (one connected socket each): id, form (`udp`; later `quic`, `h3`), glue window and size, its members' stall (dead_ms: Stall, the pipe adds the rest of the rule), the wire's own key (udpwire.Key of the trunk key: the pipe never sees the trunk key) |
 | `unwire` | a wire taken away; its flows go on by the route |
 | `route` | the wire of each class; the pipe moves the next datagram, nothing to migrate: the exit answers a flow on the wire the entry last sent it on |
 | `open`, `dgram`, `close` | a flow of the brain's own (its call on a wire, pinned: dropped while the wire has no member up) and its datagrams |
@@ -69,8 +77,8 @@ Pipe → brain:
 | Message | What |
 | --- | --- |
 | `hello` | version, pid |
-| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms past due), pauses, the latest turn in the second, flows; per wire members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
-| `member` | a member up (hello answered) or down (owed past the wire's limit) |
+| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms after the one before), pauses, the latest turn in the second, flows; per wire members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
+| `member` | a member up (hello answered) or down: `silent` (past its stall while another member proved the exit alive), `quiet` (every member silent past Quiet), `gone` (its socket failed) |
 | `dgram` | an answer on a brain's flow |
 | `error` | a message the pipe could not take |
 
@@ -79,7 +87,11 @@ ends, IPv6, the forms other than `udp` (R4) and streams with the pool (R5). The 
 up for any wire that has one, as `trunk.Route` does, before the selector moves the route.
 
 The test of the whole loop (a Go exit, two `udp` wires to it through cutters, the selector over the pipe's ticks, four
-clients calling): `trunk/pipectl` `TestTheSelectorMovesVoiceOffACutWire`, run on Linux with the pipe built:
+clients calling): `trunk/pipectl` `TestTheSelectorMovesVoiceOffACutWire`. Members' health against the Go exit
+(`health_linux_test.go`, trunk's TestOtherEndPaused, TestPathCut and TestOwnPause on the pipe, and a member that dies
+alone): `TestAMemberAloneSilentDiesByItsStall`, `TestTheExitPausedBuriesNoMember`, `TestAPathCutEndsMembersByQuiet`,
+`TestThePipesOwnPauseBuriesNoMember`; the same rules on a clock of their own: `cargo test --lib`. Run on Linux with the
+pipe built:
 
 ```bash
 cargo build --release --target aarch64-unknown-linux-musl && cp target/aarch64-unknown-linux-musl/release/hk-pipe bench/out/
