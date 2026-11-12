@@ -4,7 +4,9 @@
 //! both ways). A member's connection is either Chromium's CONNECT tunnel to
 //! the exit's relay (hikkari_cronet, the pool's form: trunk/chromium) or
 //! plain TCP to the exit's member port, as the bench's Go entry dials its
-//! pool. The reference is trunk session.go: a member's writeLoop (frames in
+//! pool. A tunnel's TCP connection is the loop's: connected without waiting
+//! and handed to the wire's engine once up, so no thread ever waits on a
+//! path that does not answer. The reference is trunk session.go: a member's writeLoop (frames in
 //! order, one write for all that wait) and serve (frames read one by one).
 //!
 //! Nothing is allocated per frame: a member writes into its out buffer and
@@ -14,9 +16,8 @@
 
 use std::net::SocketAddrV4;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
 
-use hikkari_cronet::{Conn, Form};
+use hikkari_cronet::{Conn, Engine};
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::{Out, IN};
@@ -29,6 +30,8 @@ use crate::ctl::WireTick;
 /// A member's connection.
 pub enum Sock {
     Tcp(OwnedFd),
+    /// A tunnel's TCP connection coming up, not yet Chromium's.
+    Dialing(OwnedFd, Engine),
     Chromium(Conn),
 }
 
@@ -36,14 +39,15 @@ impl Sock {
     /// What the loop polls: the socket, or the tunnel's wake-up.
     pub fn fd(&self) -> i32 {
         match self {
-            Sock::Tcp(fd) => fd.as_raw_fd(),
+            Sock::Tcp(fd) | Sock::Dialing(fd, _) => fd.as_raw_fd(),
             Sock::Chromium(c) => c.fd(),
         }
     }
 
+    /// A connection coming up reads nothing, or Gone once it failed.
     pub fn read(&mut self, buf: &mut [u8]) -> Io {
         match self {
-            Sock::Tcp(fd) => sys::read(fd, buf),
+            Sock::Tcp(fd) | Sock::Dialing(fd, _) => sys::read(fd, buf),
             Sock::Chromium(c) => c.read(buf),
         }
     }
@@ -51,14 +55,16 @@ impl Sock {
     pub fn write(&mut self, buf: &[u8]) -> Io {
         match self {
             Sock::Tcp(fd) => sys::write(fd, buf),
+            Sock::Dialing(..) => Io::Again,
             Sock::Chromium(c) => c.write(buf),
         }
     }
 
     /// Whether to poll it for writing while bytes wait: a tunnel's finished
-    /// write rings its wake-up, which is polled for reading.
+    /// write rings its wake-up, which is polled for reading; a connection
+    /// coming up is writable once up.
     pub fn polls_writes(&self) -> bool {
-        matches!(self, Sock::Tcp(_))
+        !matches!(self, Sock::Chromium(_))
     }
 }
 
@@ -80,8 +86,9 @@ pub fn flush(out: &mut Out, sock: &mut Sock) -> Io {
 pub enum Reach {
     /// Plain TCP to the exit's member port (the bench's pool).
     Plain(SocketAddrV4),
-    /// Chromium's CONNECT to the exit's relay (the pool's form).
-    Chromium(Arc<Form>),
+    /// Chromium's CONNECT to the exit's relay (the pool's form), on the
+    /// wire's engine.
+    Chromium(Engine),
 }
 
 pub struct Link {
@@ -135,10 +142,34 @@ impl Link {
         self.renew_at = 0;
         self.sock = match reach {
             Reach::Plain(exit) => sys::tcp_connect(*exit).ok().map(Sock::Tcp),
-            Reach::Chromium(form) => Conn::open(form, 0).ok().map(Sock::Chromium),
+            Reach::Chromium(engine) => sys::member_connect(engine.form().exit, 0).ok().map(|fd| Sock::Dialing(fd, engine.clone())),
         };
         if self.sock.is_some() {
             self.out.frame(29, |b| frame::hello_t1(b, session));
+        }
+    }
+
+    /// A tunnel's connection that came up becomes the tunnel: Done(0) when
+    /// it did (the descriptor to poll changed), Again while it is coming up
+    /// or for any other socket, Gone when it failed.
+    pub fn promote(&mut self) -> Io {
+        match &self.sock {
+            Some(Sock::Dialing(fd, _)) => match sys::connected(fd) {
+                Io::Done(_) => {}
+                r => return r,
+            },
+            _ => return Io::Again,
+        }
+        let Some(Sock::Dialing(fd, engine)) = self.sock.take() else { unreachable!("matched above") };
+        match Conn::open(&engine, fd) {
+            Ok(c) => {
+                self.sock = Some(Sock::Chromium(c));
+                Io::Done(0)
+            }
+            Err(e) => {
+                eprintln!("hk-pipe: a member's tunnel: {e}");
+                Io::Gone
+            }
         }
     }
 

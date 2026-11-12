@@ -1,38 +1,39 @@
-//! The keeper: one thread that starts members' engines and shuts them down,
-//! since both block (an engine's start spins up its network thread, its
-//! shutdown joins it) and the pipe's loop must not. The engine is set up as
-//! cronet-go NaiveClient.startEngine sets it for the Go entry's members:
-//! HTTP/2 without QUIC, its windows, its socket pools, and a dialer of ours;
-//! the exit's domain is mapped to its address, so no name is ever looked up.
+//! The keeper: one thread that starts the wires' engines and shuts them
+//! down, since both block (an engine's start spins up its network thread,
+//! its shutdown joins it) and the pipe's loop must not; it also starts and
+//! ends the members' streams, one at a time, so each member's socket goes
+//! to its own stream (engine.rs). An engine is set up as cronet-go
+//! NaiveClient.startEngine sets it for the Go entry's members: HTTP/2
+//! without QUIC, its windows, its socket pools, and the dialer of ours; the
+//! exit's domain is mapped to its address, so no name is ever looked up.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString};
 use std::sync::atomic::Ordering::*;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use hikkari_sys::{self as sys, DialErr};
+use hikkari_sys as sys;
 
 use crate::api::{self, Api, Header, Headers, Ptr};
 use crate::conn::{Shared, CALLBACKS};
+use crate::engine::{self, Hub};
 
-/// Bounds a member's TCP connect (trunk/chromium DefaultTimeout bounds TCP,
-/// TLS and the CONNECT answer together; the pipe's hello wait bounds the
-/// rest).
-const DIAL_NS: u64 = 5_000_000_000;
+/// How long a starting stream may take to ask for its socket. Chromium asks
+/// within a turn of its network thread; a stream that does not ask has
+/// found a connection to reuse, which a member must never have.
+const HANDOFF_WAIT: Duration = Duration::from_secs(1);
 
 /// How long a close waits for a canceled stream's last callback.
 const CANCEL_WAIT: Duration = Duration::from_secs(2);
 
-// Chromium's net errors the dialer answers with (net/base/net_error_list.h).
-const ERR_CONNECTION_REFUSED: isize = -102;
-const ERR_CONNECTION_FAILED: isize = -104;
-const ERR_CONNECTION_TIMED_OUT: isize = -118;
-const ERR_ADDRESS_IN_USE: isize = -147;
-
 pub(crate) enum Job {
-    Open(Arc<Shared>),
+    /// A member's stream on its socket.
+    Open(Arc<Shared>, std::os::fd::OwnedFd),
+    /// A member gone from the loop.
     Close(Arc<Shared>),
+    /// A handle on an engine dropped.
+    Release(Arc<Hub>),
 }
 
 static KEEPER: OnceLock<Sender<Job>> = OnceLock::new();
@@ -45,15 +46,18 @@ pub(crate) fn send(job: Job) {
             .spawn(move || {
                 for job in rx {
                     match job {
-                        Job::Open(sh) => {
-                            if let Err(e) = open(&sh) {
+                        Job::Open(sh, fd) => {
+                            if let Err(e) = open(&sh, fd) {
                                 eprintln!("cronet: {e}");
-                                sh.over.store(true, Release);
-                                sh.stage.store(crate::conn::FAILED, Release);
-                                sh.wake.ring();
+                                sh.fail(0);
                             }
                         }
-                        Job::Close(sh) => close(sh),
+                        Job::Close(sh) => {
+                            let hub = sh.hub.clone();
+                            close(sh);
+                            release(hub);
+                        }
+                        Job::Release(hub) => release(hub),
                     }
                 }
             })
@@ -80,8 +84,8 @@ pub fn version() -> Option<String> {
 /// options.go): the windows and socket pools of NaiveClient, the exit's
 /// domain mapped to its address, the built-in DNS client pointed at
 /// loopback, so no name ever leaves the box.
-fn options(sh: &Shared) -> CString {
-    let f = &sh.form;
+fn options(hub: &Hub) -> CString {
+    let f = &hub.form;
     let s = format!(
         concat!(
             r#"{{"AsyncDNS":{{"enable":true}},"DnsServerOverride":{{"nameservers":["127.0.0.1:53"]}},"#,
@@ -97,20 +101,24 @@ fn options(sh: &Shared) -> CString {
     CString::new(s).expect("a domain and an address have no NUL")
 }
 
-fn open(sh: &Arc<Shared>) -> Result<(), String> {
-    let a = api::api().ok_or("libcronet is not loaded")?;
-    let ctx = Arc::as_ptr(sh) as Ptr;
-    // SAFETY: the engine and stream are made and set up here, in the order
-    // cronet_c.h asks (dialer and verifier before the start); ctx and the
-    // annotation are the Shared the keeper keeps alive until close.
+/// The wire's engine, started on its first member.
+fn engine(a: &Api, hub: &Arc<Hub>) -> Result<Ptr, String> {
+    let e = hub.engine.load(Acquire);
+    if !e.is_null() {
+        return Ok(e);
+    }
+    let ctx = Arc::as_ptr(hub) as Ptr;
+    // SAFETY: made and set up in the order cronet_c.h asks (dialer and
+    // verifier before the start); ctx is the Hub, which outlives the engine
+    // (release shuts the engine down before the last Arc goes).
     unsafe {
         let e = (a.engine_create)();
-        sh.engine.store(e, Release);
-        (a.engine_set_dialer)(e, Some(dial), ctx);
-        if let Some(pem) = &sh.form.roots {
+        (a.engine_set_dialer)(e, Some(engine::dial), ctx);
+        if let Some(pem) = &hub.form.roots {
             let pem = CString::new(pem.as_str()).map_err(|_| "roots have a NUL")?;
             let v = (a.verifier_with_roots)(pem.as_ptr());
             if v.is_null() {
+                (a.engine_destroy)(e);
                 return Err("the roots are no PEM certificates".into());
             }
             (a.engine_set_verifier)(e, v);
@@ -118,25 +126,50 @@ fn open(sh: &Arc<Shared>) -> Result<(), String> {
         let p = (a.params_create)();
         (a.params_quic)(p, false);
         (a.params_http2)(p, true);
-        let opts = options(sh);
+        let opts = options(hub);
         (a.params_experimental)(p, opts.as_ptr());
         let r = (a.engine_start)(e, p);
         (a.params_destroy)(p);
         if r != 0 {
+            (a.engine_destroy)(e);
             return Err(format!("the engine did not start: {r}"));
         }
-        let se = (a.engine_stream_engine)(e);
-        let s = (a.stream_create)(se, ctx, &CALLBACKS);
-        if s.is_null() {
-            return Err("no stream".into());
-        }
-        sh.stream.store(s, Release);
-        start(a, sh, s)
+        hub.engine.store(e, Release);
+        Ok(e)
     }
 }
 
+/// A member's stream: its socket in the slot, its CONNECT started, and the
+/// keeper waits until the engine's dialer has taken the socket.
+fn open(sh: &Arc<Shared>, fd: std::os::fd::OwnedFd) -> Result<(), String> {
+    let a = api::api().ok_or("libcronet is not loaded")?;
+    let hub = &sh.hub;
+    let e = engine(a, hub)?;
+    *hub.slot.lock().expect("the slot's lock") = Some(fd);
+    // SAFETY: the stream is made on the started engine with the Shared as
+    // its annotation, which the keeper keeps alive until close.
+    unsafe {
+        let s = (a.stream_create)((a.engine_stream_engine)(e), Arc::as_ptr(sh) as Ptr, &CALLBACKS);
+        if s.is_null() {
+            hub.slot.lock().expect("the slot's lock").take();
+            return Err("no stream".into());
+        }
+        sh.stream.store(s, Release);
+        if let Err(e) = start(a, sh, s) {
+            hub.slot.lock().expect("the slot's lock").take();
+            return Err(e);
+        }
+    }
+    let g = hub.slot.lock().expect("the slot's lock");
+    let (mut g, _) = hub.taken.wait_timeout_while(g, HANDOFF_WAIT, |s| s.is_some()).expect("the slot's lock");
+    if g.take().is_some() {
+        return Err("Chromium asked for no socket for a member's stream: it found a connection to reuse".into());
+    }
+    Ok(())
+}
+
 /// The CONNECT (cronet-go NaiveClient.DialEarly): the trunk's authority,
-/// the padding header, the key.
+/// the padding header, the key, the member's isolation key.
 unsafe fn start(a: &Api, sh: &Shared, s: *mut api::Stream) -> Result<(), String> {
     let mut hs: Vec<Header> = sh.headers.iter().map(|(k, v)| Header { key: k.as_ptr(), value: v.as_ptr() }).collect();
     let arr = Headers { count: hs.len(), capacity: hs.len(), headers: hs.as_mut_ptr() };
@@ -147,16 +180,15 @@ unsafe fn start(a: &Api, sh: &Shared, s: *mut api::Stream) -> Result<(), String>
     Ok(())
 }
 
-/// Ends a member: its stream canceled and destroyed, its engine shut down,
+/// Ends a member: its stream canceled and destroyed, then its connection
+/// shut down under Chromium (which then closes its session and socket),
 /// and only then its shared state let go, since cronet's thread may call
-/// back into it until the engine is down.
+/// back into it until the stream is over.
 fn close(sh: Arc<Shared>) {
     let Some(a) = api::api() else { return };
     let s = sh.stream.load(Acquire);
-    let e = sh.engine.load(Acquire);
     // SAFETY: the loop's Conn is gone, so no one else calls the stream; the
-    // stream is destroyed before its engine, the engine shut down off its
-    // own thread.
+    // stream belongs to the hub's engine, which is up while sh holds the hub.
     unsafe {
         if !s.is_null() {
             if !sh.over.load(Acquire) {
@@ -168,32 +200,26 @@ fn close(sh: Arc<Shared>) {
             }
             (a.stream_destroy)(s);
         }
-        if !e.is_null() {
-            (a.engine_shutdown)(e);
-            (a.engine_destroy)(e);
-        }
     }
+    sys::shutdown_both(&sh.sock);
     drop(sh);
 }
 
-/// Cronet's dialer: a socket to the exit only, from the member's port.
-/// Anything else (a DNS server, another address) is refused, as
-/// trunk/chromium portDialer refuses it.
-unsafe extern "C" fn dial(ctx: Ptr, address: *const c_char, port: u16) -> isize {
-    let sh = &*(ctx as *const Shared);
-    if address.is_null() || CStr::from_ptr(address) != sh.exit_ip.as_c_str() || port != sh.form.exit.port() {
-        return ERR_CONNECTION_FAILED;
+/// Shuts the engine down once nothing but this job holds its hub: no
+/// handle in the pipe, no member.
+fn release(hub: Arc<Hub>) {
+    if Arc::strong_count(&hub) > 1 {
+        return;
     }
-    match sys::tcp_dial(sh.form.exit, sh.from, DIAL_NS) {
-        Ok(fd) => sys::into_raw(fd) as isize,
-        Err(DialErr::Silent) => {
-            sh.silent.store(true, Relaxed);
-            ERR_CONNECTION_TIMED_OUT
-        }
-        Err(DialErr::Failed(e)) => match e.raw_os_error() {
-            Some(libc::ECONNREFUSED) => ERR_CONNECTION_REFUSED,
-            Some(libc::EADDRINUSE) => ERR_ADDRESS_IN_USE,
-            _ => ERR_CONNECTION_FAILED,
-        },
+    let e = hub.engine.swap(std::ptr::null_mut(), AcqRel);
+    if e.is_null() {
+        return;
+    }
+    let Some(a) = api::api() else { return };
+    // SAFETY: no stream of the engine is left; it is shut down off its own
+    // thread and destroyed after.
+    unsafe {
+        (a.engine_shutdown)(e);
+        (a.engine_destroy)(e);
     }
 }

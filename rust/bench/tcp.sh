@@ -17,7 +17,8 @@
 # pipe is the glibc build (PIPE_GNU), since libcronet is a glibc library.
 #
 # With CUT=rst or CUT=freeze (R1.4) the members go through tcpcheck -proxy,
-# which cuts the busiest member every CUT_EVERY (3s) from CUT_AFTER (2s).
+# which cuts the busiest member every CUT_EVERY (3s) from CUT_AFTER (2s);
+# Chromium's members too (R2.2), the proxy in front of the relay channel.
 #
 #   tcp.sh <reps> "<impls>" <bytes> <streams> <members>    e.g. tcp.sh 3 "go rust" 1073741824 1 4
 set -eu
@@ -40,17 +41,18 @@ run_one() {
     rust) taskset -c "$EXIT_CPUS" "${HK_EXIT:-$OUT/hk-exit}" --pool "$POOL" --ports 9000 >"$OUT/exit.log" 2>&1 & ;;
   esac
   xpid=$!
-  pool=$POOL; cpid=
+  pool=$POOL; naive=$NAIVE; cpid=
   if [ -n "$CUT" ]; then
-    taskset -c "$EXIT_CPUS" "$OUT/tcpcheck" -proxy 127.0.0.1:20500 -proxy-to "$POOL" -cut "$CUT" -cut-every "$CUT_EVERY" -cut-after "$CUT_AFTER" >"$OUT/cut-$impl.log" 2>&1 &
+    to=$POOL; [ "$impl" = chromium ] && to=$NAIVE
+    taskset -c "$EXIT_CPUS" "$OUT/tcpcheck" -proxy 127.0.0.1:20500 -proxy-to "$to" -cut "$CUT" -cut-every "$CUT_EVERY" -cut-after "$CUT_AFTER" >"$OUT/cut-$impl.log" 2>&1 &
     cpid=$!
-    pool=127.0.0.1:20500
+    pool=127.0.0.1:20500; naive=127.0.0.1:20500
   fi
   sleep 0.5
   case $impl in
     go)   taskset -c "$ENTRY_CPUS" "$OUT/goentry" -pool "$pool" -tcp-listen 127.0.0.1:8444 -tcp-to 9000 -pool-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
     rust) taskset -c "$ENTRY_CPUS" "${PIPE:-$OUT/hk-pipe}" --tcp-wire "$pool" --tcp-listen 127.0.0.1:8444 --tcp-to 9000 --tcp-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
-    chromium) taskset -c "$ENTRY_CPUS" "${PIPE_GNU:-$OUT/hk-pipe-gnu}" --tcp-wire "$NAIVE" --tcp-chromium hk.example --tcp-roots "$OUT/naive-roots.pem" --cronet "$OUT/libcronet.so" \
+    chromium) taskset -c "$ENTRY_CPUS" "${PIPE_GNU:-$OUT/hk-pipe-gnu}" --tcp-wire "$naive" --tcp-chromium hk.example --tcp-roots "$OUT/naive-roots.pem" --cronet "$OUT/libcronet.so" \
         --tcp-listen 127.0.0.1:8444 --tcp-to 9000 --tcp-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
   esac
   epid=$!
@@ -58,6 +60,7 @@ run_one() {
   line=$(taskset -c "$GEN_CPUS" "$OUT/tcpcheck" -to 127.0.0.1:8444 -bytes "$BYTES" -streams "$STREAMS" -pid "$epid" -exit-pid "$xpid" -label "$impl-$EXIT#$rep m$MEMBERS s$STREAMS${CUT:+ cut=$CUT}") || true
   echo "$line" | tee -a "$RES"
   sleep 1
+  echo "  [$impl] fds $(ls /proc/$epid/fd | wc -l), sockets $(ls -l /proc/$epid/fd | grep -c socket)"
   kill $epid $xpid $epid_echo $cpid 2>/dev/null || true
   wait $epid $xpid $epid_echo $cpid 2>/dev/null || true
   tail -n 2 "$OUT/entry-tcp-$impl.log" | sed "s/^/  [$impl] /"

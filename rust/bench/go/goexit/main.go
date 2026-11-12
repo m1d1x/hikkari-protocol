@@ -54,6 +54,7 @@ func main() {
 	naive := flag.String("naive", "", "Chromium pool members: the relay's TLS listen address (empty: none)")
 	sni := flag.String("naive-sni", "hk.example", "the relay's domain on its certificate")
 	rootsOut := flag.String("naive-roots", "/bench/out/naive-roots.pem", "where the certificate's PEM goes for the entry")
+	hellos := flag.String("naive-hellos", "", "a directory for each member's ClientHello (empty: none)")
 	flag.Parse()
 
 	x := trunk.NewExit(trunk.Config{}, local{})
@@ -79,7 +80,7 @@ func main() {
 	}()
 	var nx *naiveExit
 	if *naive != "" {
-		if nx, err = serveNaive(x, *naive, *sni, *key, *rootsOut); err != nil {
+		if nx, err = serveNaive(x, *naive, *sni, *key, *rootsOut, *hellos); err != nil {
 			log.Fatal(err)
 		}
 	}

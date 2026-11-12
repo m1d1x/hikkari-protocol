@@ -86,7 +86,7 @@ mod linux {
         if let Some(sni) = chromium {
             hikkari_cronet::load(cronet.as_deref()).expect("libcronet");
             let form = hikkari_cronet::Form::new(a.tcp_exit, &sni, &a.key, roots).expect("--tcp-chromium");
-            a.tcp_chromium = Some(std::sync::Arc::new(form));
+            a.tcp_chromium = Some(hikkari_cronet::Engine::new(form));
             eprintln!("hk-pipe: stream members by Chromium {}", hikkari_cronet::version().unwrap_or_default());
         }
         let mut p = match ctl {

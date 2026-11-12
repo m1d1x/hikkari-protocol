@@ -101,8 +101,8 @@ pub struct Alone {
     pub tcp_exit: SocketAddrV4,
     pub tcp_members: usize,
     /// The stream members by Chromium's CONNECT to the exit's relay at
-    /// tcp_exit instead of plain TCP (None: plain).
-    pub tcp_chromium: Option<std::sync::Arc<hikkari_cronet::Form>>,
+    /// tcp_exit instead of plain TCP, on this engine (None: plain).
+    pub tcp_chromium: Option<hikkari_cronet::Engine>,
 }
 
 pub struct Pipe {
@@ -220,7 +220,7 @@ impl Pipe {
             p.tcp_listens.push(TcpListen { fd: sys::tcp_listen(addr)?, to: a.tcp_to });
             // The pool's wire (trunk.PoolWire): the streams' only one here.
             let reach = match &a.tcp_chromium {
-                Some(form) => Reach::Chromium(form.clone()),
+                Some(engine) => Reach::Chromium(engine.clone()),
                 None => Reach::Plain(a.tcp_exit),
             };
             let mut sw = StreamWire::new(0, reach, a.tcp_members, health::STALL);

@@ -362,6 +362,15 @@ impl Pipe {
         for wi in 0..self.swires.len() {
             for li in 0..self.swires[wi].links.len() {
                 let l = &mut self.swires[wi].links[li];
+                match l.promote() {
+                    Io::Done(_) => self.dirty = true,
+                    Io::Gone => {
+                        self.link_down(wi, li, ctl::WHY_GONE, now);
+                        continue;
+                    }
+                    _ => {}
+                }
+                let l = &mut self.swires[wi].links[li];
                 let Some(sock) = &mut l.sock else { continue };
                 if let Io::Gone = link::flush(&mut l.out, sock) {
                     self.link_down(wi, li, ctl::WHY_GONE, now);

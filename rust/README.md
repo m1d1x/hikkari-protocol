@@ -86,9 +86,7 @@ Streams (R1.3; spec/trunk.md, "Streams", as the Go session carries them: Carry, 
   and a stream's unconfirmed bytes in one buffer each that grows to what it holds; chunks past a hole are the only
   copies made per chunk.
 
-Left out on purpose: the port book and replacing members spread over a second (R2.3), one engine's thread per member
-(R2.2 decides), the brain's
-messages for client ports of streams and stream wires (the bench runs them by flags), datagrams on stream members (they
+Left out on purpose: the port book and replacing members spread over a second (R2.3), the brain's messages for client ports of streams and stream wires (the bench runs them by flags), datagrams on stream members (they
 ride the packet wires), wires other than `udp` and the plain TCP members, drains and generations, observation, IPv6, GSO
 on send (the glued datagrams differ in size; answers go to different clients).
 
@@ -294,19 +292,29 @@ docker run --rm -v "$PWD/bench:/bench" -e HK_PIPE=/bench/out/hk-pipe debian:book
 
 `hikkari-cronet` puts a stream member on Chromium's network stack, as `trunk/chromium` does for the Go entry: the same
 cronet build (sagernet's, Chromium 150 here), loaded at run time from `libcronet.so` (`--cronet`, else the executable's
-directory, else the dynamic linker's paths), one engine per member. The engine is set up as cronet-go
+directory, else the dynamic linker's paths). A wire's members share one engine and its one network thread (`Engine`,
+R2.2), as cronet-go `NaiveClient` with `concurrency` on a single engine: each member's CONNECT carries an isolation key
+of its own (`-network-isolation-key`), so Chromium gives it a TCP connection and an HTTP/2 session of its own, never
+pools two members on one and never resumes one member's TLS session in another's hello. The engine is set up as
 `NaiveClient.startEngine` sets it (HTTP/2 without QUIC, its windows and socket pools), its exit's domain mapped to the
-exit's address (`HostResolverRules`) and its DNS client pointed at loopback, so no name is looked up. Its dialer
-(`Cronet_Engine_SetDialer`) opens the member's TCP socket to the exit only, from the port given (0 until the port book,
-R2.3), Nagle off and Go's keepalive; anything else it is asked for is refused. The stream is the CONNECT of
-`trunk/chromium`: `-connect-authority trunk.hikkari.arpa:443`, the `padding` header, `proxy-authorization` of the trunk
-key; the first 8 writes and reads each way carry Naive padding (`hikkari_trunk::naive`).
+exit's address (`HostResolverRules`) and its DNS client pointed at loopback, so no name is looked up. The stream is the
+CONNECT of `trunk/chromium`: `-connect-authority trunk.hikkari.arpa:443`, the `padding` header, `proxy-authorization` of
+the trunk key; the first 8 writes and reads each way carry Naive padding (`hikkari_trunk::naive`).
+
+A member's TCP socket is the pipe's: the loop connects it to the exit from the member's port without waiting
+(`sys::member_connect`: Nagle off, Go's keepalive), polls it for writing like any socket, and once it is up hands it to
+the engine (`link::Link::promote`). The engine's dialer (`Cronet_Engine_SetDialer`) only takes that socket from a
+hand-over slot and refuses anything else; the keeper thread starts one member's stream at a time and waits until the
+dialer has taken its socket, so a socket always goes to its own member's stream, and a stream that asks for no socket
+(it found a connection to reuse) fails the member. A path that does not answer holds no thread: the member is still
+connecting when its hello wait ends. A member that goes down has its stream canceled and its connection shut down
+under Chromium (the member keeps a duplicate of the descriptor), so its session ends with it.
 
 The pipe's loop never waits on the library. A member's bytes cross in two buffers, one read and one write outstanding
 as the stream API allows; cronet's network thread rings the member's eventfd when a read or a write is done or the
-tunnel came up or failed, and the loop polls that eventfd as it polls a socket (`link::Sock`). Engines are started and
-shut down on one thread of their own (`keeper`), since both block. A relay that answers other than 200 (a wrong key
-gets its site) is a failed member.
+tunnel came up or failed, and the loop polls that eventfd as it polls a socket (`link::Sock`). The engine is started
+and shut down, and the streams begun and ended, on one thread of their own (`keeper`), since an engine's start and
+shutdown block. A relay that answers other than 200 (a wrong key gets its site) is a failed member.
 
 libcronet is a glibc library, so the pipe that loads it is built for `aarch64-unknown-linux-gnu`, in docker on the mac;
 the bench's box is Debian. The Go exit's `-naive` is the relay's stream channel for pool members (as the Go
@@ -321,4 +329,17 @@ cp target/gnu/release/hk-pipe bench/out/hk-pipe-gnu
 cp "$(go env GOMODCACHE)"/github.com/sagernet/cronet-go/lib/linux_arm64@*/libcronet.so bench/out/
 (cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goexit ./goexit)
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "rust chromium" 1073741824 1 4
+```
+
+R2.2, a wire's members on one engine (`bench/members.sh`): the Go exit with `-naive-hellos` writes every member's
+ClientHello whole; `gomember` (the Go entry's `trunk/chromium`, an engine each) gives the reference hellos, then
+`hk-pipe` brings up 32 members, carries the bytes, and `hellocheck` names both sets by the client release test's hk and
+ja4 (`bench/go/hello`, a copy of the client's parser, hk h1) and fails unless every member's hello is the reference's.
+`CUT=rst` or `CUT=freeze` with `tcp.sh` cuts Chromium's members too (the proxy in front of the relay channel).
+
+```bash
+(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags with_purego -o ../out/gomember ./gomember \
+  && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/hellocheck ./hellocheck)
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/members.sh 32 1073741824 1
+docker run --rm -e CUT=rst -e CUT_EVERY=1s -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 1 chromium 1073741824 16 32
 ```

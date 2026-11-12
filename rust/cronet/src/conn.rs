@@ -1,5 +1,5 @@
-//! One member's CONNECT tunnel: the state cronet's network thread and the
-//! pipe's loop share, the stream's callbacks, and the loop's side (read,
+//! One member's CONNECT tunnel on its wire's engine (engine.rs): the state
+//! cronet's network thread and the pipe's loop share, the stream's callbacks, and the loop's side (read,
 //! write) in the shape of a non-blocking socket (hikkari_sys::Io). The Go
 //! reference is cronet-go bidirectional_conn.go and naive_conn.go under
 //! trunk/chromium Dial.
@@ -13,6 +13,7 @@ use std::cell::UnsafeCell;
 use std::ffi::{c_char, c_int, CStr, CString};
 use std::io;
 use std::net::SocketAddrV4;
+use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, AtomicUsize, Ordering::*};
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use hikkari_sys::{self as sys, Io, Wake};
 use hikkari_trunk::naive::{self, Pad, Unpad, PADDED};
 
 use crate::api::{self, Stream};
+use crate::engine::{Engine, Hub};
 use crate::keeper::{self, Job};
 
 /// Where and as whom members go: the exit's relay.
@@ -59,11 +61,10 @@ pub(crate) const FAILED: u8 = 2;
 /// What cronet's network thread, the keeper and the loop share.
 pub(crate) struct Shared {
     pub wake: Wake,
-    pub form: Arc<Form>,
-    /// The exit's address as cronet names it to the dialer.
-    pub exit_ip: CString,
-    /// The local port the member's socket comes from (0: the kernel's).
-    pub from: u16,
+    pub hub: Arc<Hub>,
+    /// The member's TCP connection, a duplicate of the descriptor Chromium
+    /// holds: shut down at close, so the member's session ends with it.
+    pub sock: OwnedFd,
     pub headers: Vec<(CString, CString)>,
     pub url: CString,
     /// OPENING, UP (the relay answered 200), FAILED.
@@ -72,12 +73,9 @@ pub(crate) struct Shared {
     pub over: AtomicBool,
     /// The relay ended its side.
     pub eof: AtomicBool,
-    /// The dial got no answer within its time (trunk ErrSilent).
-    pub silent: AtomicBool,
     /// The net error cronet failed with, or the relay's status as -status.
     pub why: AtomicI32,
     pub stream: AtomicPtr<Stream>,
-    pub engine: AtomicPtr<std::ffi::c_void>,
     rx: UnsafeCell<Box<[u8]>>,
     /// Bytes cronet read into rx and the loop has not taken (0: none, or a
     /// read is outstanding).
@@ -93,7 +91,7 @@ unsafe impl Sync for Shared {}
 unsafe impl Send for Shared {}
 
 impl Shared {
-    fn fail(&self, why: i32) {
+    pub(crate) fn fail(&self, why: i32) {
         self.why.store(why, Relaxed);
         self.stage.store(FAILED, Release);
         self.wake.ring();
@@ -127,41 +125,41 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// Begins a member: an engine and its CONNECT to the exit, its socket
-    /// from local port `from`. It returns at once; the tunnel is up when
-    /// writes are taken, and failed when a read says Gone.
-    pub fn open(form: &Arc<Form>, from: u16) -> io::Result<Conn> {
+    /// Begins a member on its wire's engine: its CONNECT to the exit over
+    /// `sock`, the member's TCP connection the loop brought up from the
+    /// member's port. It returns at once; the tunnel is up when writes are
+    /// taken, and failed when a read says Gone.
+    pub fn open(engine: &Engine, sock: OwnedFd) -> io::Result<Conn> {
         if api::api().is_none() {
             return Err(io::Error::other("cronet: libcronet is not loaded"));
         }
+        let hub = engine.hub();
         let mut rnd = [0u8; 9 + PADDED as usize];
         sys::urandom(&mut rnd);
         let cs = |s: &str| CString::new(s).expect("checked by Form::new");
         let headers = vec![
             (cs("-connect-authority"), cs(naive::HOST)),
+            (cs("-network-isolation-key"), hub.next_key()),
             (cs("padding"), cs(&naive::padding_header(rnd[..9].try_into().expect("9 bytes")))),
-            (cs("proxy-authorization"), cs(&naive::proxy_authorization(&form.key))),
+            (cs("proxy-authorization"), cs(&naive::proxy_authorization(&hub.form.key))),
         ];
         let sh = Arc::new(Shared {
             wake: Wake::new()?,
-            form: form.clone(),
-            exit_ip: cs(&form.exit.ip().to_string()),
-            from,
+            hub: hub.clone(),
+            sock: sock.try_clone()?,
             headers,
-            url: cs(&format!("https://{}:{}", form.sni, form.exit.port())),
+            url: cs(&format!("https://{}:{}", hub.form.sni, hub.form.exit.port())),
             stage: AtomicU8::new(OPENING),
             over: AtomicBool::new(false),
             eof: AtomicBool::new(false),
-            silent: AtomicBool::new(false),
             why: AtomicI32::new(0),
             stream: AtomicPtr::new(std::ptr::null_mut()),
-            engine: AtomicPtr::new(std::ptr::null_mut()),
             rx: UnsafeCell::new(vec![0; RX].into_boxed_slice()),
             rx_len: AtomicUsize::new(0),
             tx: UnsafeCell::new(vec![0; TX + naive::HEAD + naive::TAIL].into_boxed_slice()),
             tx_busy: AtomicBool::new(false),
         });
-        keeper::send(Job::Open(sh.clone()));
+        keeper::send(Job::Open(sh.clone(), sock));
         let pads = rnd[9..].try_into().expect("PADDED bytes");
         Ok(Conn { sh, pad: Pad::default(), unpad: Unpad::default(), rx_have: 0, rx_at: 0, pads })
     }
@@ -172,13 +170,9 @@ impl Conn {
         self.sh.wake.fd()
     }
 
-    /// Whether the dial got no answer (the port it came from is suspect).
-    pub fn silent(&self) -> bool {
-        self.sh.silent.load(Relaxed)
-    }
-
-    /// Why it failed: a negative net error of Chromium's, or the relay's
-    /// HTTP status (a positive number) when it was not 200.
+    /// Why it failed: a negative net error of Chromium's, the relay's HTTP
+    /// status (a positive number) when it was not 200, 0 when the keeper
+    /// could not start its stream.
     pub fn why(&self) -> i32 {
         self.sh.why.load(Relaxed)
     }
