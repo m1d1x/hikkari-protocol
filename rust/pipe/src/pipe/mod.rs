@@ -44,7 +44,7 @@ use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, ANY_WIRE};
 use crate::flow::{Flows, CLASS_VOICE};
-use crate::link::StreamWire;
+use crate::link::{Reach, StreamWire};
 use crate::member::{member_to, Member, Wire, SLOT};
 use crate::streams::Streams;
 
@@ -100,6 +100,9 @@ pub struct Alone {
     pub tcp_to: u16,
     pub tcp_exit: SocketAddrV4,
     pub tcp_members: usize,
+    /// The stream members by Chromium's CONNECT to the exit's relay at
+    /// tcp_exit instead of plain TCP (None: plain).
+    pub tcp_chromium: Option<std::sync::Arc<hikkari_cronet::Form>>,
 }
 
 pub struct Pipe {
@@ -216,10 +219,14 @@ impl Pipe {
         if let Some(addr) = a.tcp_listen {
             p.tcp_listens.push(TcpListen { fd: sys::tcp_listen(addr)?, to: a.tcp_to });
             // The pool's wire (trunk.PoolWire): the streams' only one here.
-            let mut sw = StreamWire::new(0, a.tcp_exit, a.tcp_members, health::STALL);
+            let reach = match &a.tcp_chromium {
+                Some(form) => Reach::Chromium(form.clone()),
+                None => Reach::Plain(a.tcp_exit),
+            };
+            let mut sw = StreamWire::new(0, reach, a.tcp_members, health::STALL);
             let now = now_ns();
             for l in sw.links.iter_mut() {
-                l.dial(a.tcp_exit, &p.session, now);
+                l.dial(&sw.reach, &p.session, now);
             }
             p.swires.push(sw);
         }
@@ -325,7 +332,7 @@ impl Pipe {
         }
         for (wi, w) in self.swires.iter().enumerate() {
             for (li, l) in w.links.iter().enumerate() {
-                if l.fd.is_some() {
+                if l.sock.is_some() {
                     self.slots.push(Slot::Link(wi, li));
                 }
             }
@@ -338,7 +345,7 @@ impl Pipe {
             Slot::Member(w, m) => wires[w].members[m].fd,
             Slot::TcpListen(i) => tcp_listens[i].fd.as_raw_fd(),
             Slot::Client(slot) => streams.get(slot).map_or(-1, |st| st.client.fd.as_raw_fd()),
-            Slot::Link(w, l) => swires[w].links[l].fd.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
+            Slot::Link(w, l) => swires[w].links[l].sock.as_ref().map_or(-1, |s| s.fd()),
         }));
         self.dirty = false;
     }

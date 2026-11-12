@@ -9,5 +9,6 @@ pub mod buf;
 pub mod flow;
 pub mod frame;
 pub mod health;
+pub mod naive;
 pub mod stream;
 pub mod udpwire;

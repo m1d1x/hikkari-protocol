@@ -11,6 +11,11 @@
 # its streams to the echo's port 9000 (its own UDP wire on 20447); the line
 # then has the exit's CPU per MiB too (exit_us_per_MiB, either exit).
 #
+# Impl chromium (R2.1): hk-pipe's stream members are Chromium's CONNECT
+# (hikkari-cronet, libcronet.so from $OUT) to the Go exit's relay channel
+# (goexit -naive, its certificate trusted from $OUT/naive-roots.pem); the
+# pipe is the glibc build (PIPE_GNU), since libcronet is a glibc library.
+#
 # With CUT=rst or CUT=freeze (R1.4) the members go through tcpcheck -proxy,
 # which cuts the busiest member every CUT_EVERY (3s) from CUT_AFTER (2s).
 #
@@ -23,6 +28,7 @@ EXIT_CPUS=${EXIT_CPUS:-4,5}; GEN_CPUS=${GEN_CPUS:-2,3}; ENTRY_CPUS=${ENTRY_CPUS:
 # PIPE: the hk-pipe to run as rust (another build to compare).
 CUT=${CUT:-}; CUT_EVERY=${CUT_EVERY:-3s}; CUT_AFTER=${CUT_AFTER:-2s}
 POOL=127.0.0.1:20446
+NAIVE=127.0.0.1:20445
 EXIT=${EXIT:-go}
 
 run_one() {
@@ -30,7 +36,7 @@ run_one() {
   taskset -c "$EXIT_CPUS" "$OUT/tcpcheck" -serve 127.0.0.1:9000 >"$OUT/echo.log" 2>&1 &
   epid_echo=$!
   case $EXIT in
-    go)   taskset -c "$EXIT_CPUS" "$OUT/goexit" >"$OUT/exit.log" 2>&1 & ;;
+    go)   taskset -c "$EXIT_CPUS" "$OUT/goexit" -naive "$NAIVE" >"$OUT/exit.log" 2>&1 & ;;
     rust) taskset -c "$EXIT_CPUS" "${HK_EXIT:-$OUT/hk-exit}" --pool "$POOL" --ports 9000 >"$OUT/exit.log" 2>&1 & ;;
   esac
   xpid=$!
@@ -44,6 +50,8 @@ run_one() {
   case $impl in
     go)   taskset -c "$ENTRY_CPUS" "$OUT/goentry" -pool "$pool" -tcp-listen 127.0.0.1:8444 -tcp-to 9000 -pool-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
     rust) taskset -c "$ENTRY_CPUS" "${PIPE:-$OUT/hk-pipe}" --tcp-wire "$pool" --tcp-listen 127.0.0.1:8444 --tcp-to 9000 --tcp-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
+    chromium) taskset -c "$ENTRY_CPUS" "${PIPE_GNU:-$OUT/hk-pipe-gnu}" --tcp-wire "$NAIVE" --tcp-chromium hk.example --tcp-roots "$OUT/naive-roots.pem" --cronet "$OUT/libcronet.so" \
+        --tcp-listen 127.0.0.1:8444 --tcp-to 9000 --tcp-members "$MEMBERS" >"$OUT/entry-tcp-$impl.log" 2>&1 & ;;
   esac
   epid=$!
   sleep 1.5

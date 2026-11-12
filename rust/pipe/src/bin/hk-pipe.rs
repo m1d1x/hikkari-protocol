@@ -8,7 +8,11 @@
 //! Without it (the bench) the flags fix what the brain would decide: one
 //! client port, one wire, its members, the glue window, the copies; with
 //! `--tcp-listen` also a client port of streams to the exit's `--tcp-to`,
-//! carried on `--tcp-members` plain TCP members to `--tcp-wire`.
+//! carried on `--tcp-members` plain TCP members to `--tcp-wire`; with
+//! `--tcp-chromium <domain>` the members are Chromium's CONNECT to the
+//! exit's relay at `--tcp-wire` instead (the pool's form), under the trunk
+//! key `--key`, trusting the PEM roots in `--tcp-roots` (tests) or the
+//! system's, libcronet from `--cronet` or found as the Go entry finds it.
 //!
 //! `--flow-idle-ms` (either way): a client's flow unused this long ends;
 //! the trunk's 2 minutes without it.
@@ -43,7 +47,9 @@ mod linux {
             tcp_to: 0,
             tcp_exit: "127.0.0.1:20446".parse().unwrap(),
             tcp_members: 4,
+            tcp_chromium: None,
         };
+        let (mut chromium, mut roots, mut cronet): (Option<String>, Option<String>, Option<String>) = (None, None, None);
         let mut flow_idle_ms: Option<u64> = None;
         let mut gro = true;
         let mut tick_ns = 1_000_000u64;
@@ -70,9 +76,18 @@ mod linux {
                 "--tcp-to" => a.tcp_to = v.parse().expect("--tcp-to"),
                 "--tcp-wire" => a.tcp_exit = v.parse().expect("--tcp-wire ip:port"),
                 "--tcp-members" => a.tcp_members = v.parse().expect("--tcp-members"),
+                "--tcp-chromium" => chromium = Some(v),
+                "--tcp-roots" => roots = Some(std::fs::read_to_string(&v).expect("--tcp-roots file")),
+                "--cronet" => cronet = Some(v),
                 x => panic!("unknown flag {x}"),
             }
             i += 2;
+        }
+        if let Some(sni) = chromium {
+            hikkari_cronet::load(cronet.as_deref()).expect("libcronet");
+            let form = hikkari_cronet::Form::new(a.tcp_exit, &sni, &a.key, roots).expect("--tcp-chromium");
+            a.tcp_chromium = Some(std::sync::Arc::new(form));
+            eprintln!("hk-pipe: stream members by Chromium {}", hikkari_cronet::version().unwrap_or_default());
         }
         let mut p = match ctl {
             Some(fd) => {

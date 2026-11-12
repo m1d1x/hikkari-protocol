@@ -1,10 +1,11 @@
 //! Stream members: the members of a wire that carries streams, each over a
 //! TCP connection of its own to the exit, in the pool's form (spec/trunk.md,
 //! "Member": a t1 hello, then frames one after another on the byte stream,
-//! both ways). Here the connection is plain TCP, as the bench's Go entry
-//! dials its pool; Chromium's TLS goes under it in R2. The reference is trunk
-//! session.go: a member's writeLoop (frames in order, one write for all that
-//! wait) and serve (frames read one by one).
+//! both ways). A member's connection is either Chromium's CONNECT tunnel to
+//! the exit's relay (hikkari_cronet, the pool's form: trunk/chromium) or
+//! plain TCP to the exit's member port, as the bench's Go entry dials its
+//! pool. The reference is trunk session.go: a member's writeLoop (frames in
+//! order, one write for all that wait) and serve (frames read one by one).
 //!
 //! Nothing is allocated per frame: a member writes into its out buffer and
 //! reads into its in buffer, both allocated once (hikkari_trunk::buf). A
@@ -12,7 +13,10 @@
 //! frame's head.
 
 use std::net::SocketAddrV4;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
+
+use hikkari_cronet::{Conn, Form};
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::{Out, IN};
@@ -22,20 +26,66 @@ use hikkari_trunk::stream::{CHUNK, INFLIGHT};
 
 use crate::ctl::WireTick;
 
-/// Writes what waits in a member's out buffer, as much as its socket takes.
-pub fn flush(out: &mut Out, fd: &OwnedFd) -> Io {
+/// A member's connection.
+pub enum Sock {
+    Tcp(OwnedFd),
+    Chromium(Conn),
+}
+
+impl Sock {
+    /// What the loop polls: the socket, or the tunnel's wake-up.
+    pub fn fd(&self) -> i32 {
+        match self {
+            Sock::Tcp(fd) => fd.as_raw_fd(),
+            Sock::Chromium(c) => c.fd(),
+        }
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> Io {
+        match self {
+            Sock::Tcp(fd) => sys::read(fd, buf),
+            Sock::Chromium(c) => c.read(buf),
+        }
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Io {
+        match self {
+            Sock::Tcp(fd) => sys::write(fd, buf),
+            Sock::Chromium(c) => c.write(buf),
+        }
+    }
+
+    /// Whether to poll it for writing while bytes wait: a tunnel's finished
+    /// write rings its wake-up, which is polled for reading.
+    pub fn polls_writes(&self) -> bool {
+        matches!(self, Sock::Tcp(_))
+    }
+}
+
+/// Writes what waits in a member's out buffer, as much as its connection
+/// takes.
+pub fn flush(out: &mut Out, sock: &mut Sock) -> Io {
     if !out.pending() {
         return Io::Done(0);
     }
-    let r = sys::write(fd, out.bytes());
+    let r = sock.write(out.bytes());
     if let Io::Done(n) = r {
         out.wrote(n);
     }
     r
 }
 
+/// How a wire's members reach the exit.
+#[derive(Clone)]
+pub enum Reach {
+    /// Plain TCP to the exit's member port (the bench's pool).
+    Plain(SocketAddrV4),
+    /// Chromium's CONNECT to the exit's relay (the pool's form).
+    Chromium(Arc<Form>),
+}
+
 pub struct Link {
-    pub fd: Option<OwnedFd>,
+    pub sock: Option<Sock>,
     /// Up, its pings, its debt: spec/trunk.md, "Members' health".
     pub h: Health,
     pub out: Out,
@@ -62,7 +112,7 @@ pub struct Link {
 impl Link {
     pub fn new() -> Link {
         Link {
-            fd: None,
+            sock: None,
             h: Health::new(false),
             out: Out::new(),
             inb: vec![0; IN].into_boxed_slice(),
@@ -76,21 +126,25 @@ impl Link {
     }
 
     /// A new connection to the exit, its t1 hello waiting in the out buffer:
-    /// a new member to the exit, up once the exit answers.
-    pub fn dial(&mut self, exit: SocketAddrV4, session: &[u8; 16], now: u64) {
+    /// a new member to the exit, up once the exit answers. A tunnel takes
+    /// the hello once the relay has answered its CONNECT.
+    pub fn dial(&mut self, reach: &Reach, session: &[u8; 16], now: u64) {
         self.drop_sock();
         self.gen = self.gen.wrapping_add(1);
         self.dialed_at = now;
         self.renew_at = 0;
-        if let Ok(fd) = sys::tcp_connect(exit) {
-            self.fd = Some(fd);
+        self.sock = match reach {
+            Reach::Plain(exit) => sys::tcp_connect(*exit).ok().map(Sock::Tcp),
+            Reach::Chromium(form) => Conn::open(form, 0).ok().map(Sock::Chromium),
+        };
+        if self.sock.is_some() {
             self.out.frame(29, |b| frame::hello_t1(b, session));
         }
     }
 
     /// Its socket closed and what it held forgotten.
     pub fn drop_sock(&mut self) {
-        self.fd = None;
+        self.sock = None;
         self.h.down();
         self.out.clear();
         self.in_n = 0;
@@ -121,20 +175,20 @@ pub struct StreamWire {
     /// Its members' stall (trunk Config.Stall).
     pub stall_ns: u64,
     pub links: Vec<Link>,
-    /// Where a member's new connection goes.
-    pub exit: SocketAddrV4,
+    /// How a member's new connection reaches the exit.
+    pub reach: Reach,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
     pub t: WireTick,
 }
 
 impl StreamWire {
-    pub fn new(id: u8, exit: SocketAddrV4, members: usize, stall_ns: u64) -> StreamWire {
+    pub fn new(id: u8, reach: Reach, members: usize, stall_ns: u64) -> StreamWire {
         StreamWire {
             id,
             stall_ns,
             links: (0..members).map(|_| Link::new()).collect(),
-            exit,
+            reach,
             proof: 0,
             t: WireTick { id, ..Default::default() },
         }

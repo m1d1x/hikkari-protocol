@@ -75,7 +75,7 @@ fn forget(wires: &mut [StreamWire], c: u32, len: u32) {
     }
     let (wi, li, gen) = carrier_of(c);
     let Some(l) = wires.get_mut(wi).and_then(|w| w.links.get_mut(li)) else { return };
-    if l.gen != gen || l.fd.is_none() {
+    if l.gen != gen || l.sock.is_none() {
         return;
     }
     l.inflight -= len as usize;
@@ -202,8 +202,8 @@ impl Pipe {
             }
             for _ in 0..LINK_READS {
                 let l = &mut self.swires[wi].links[li];
-                let Some(fd) = &l.fd else { break };
-                match sys::read(fd, &mut l.inb[l.in_n..]) {
+                let Some(sock) = &mut l.sock else { break };
+                match sock.read(&mut l.inb[l.in_n..]) {
                     Io::Done(k) => {
                         l.in_n += k;
                         if !self.link_frames(wi, li, now) {
@@ -292,7 +292,7 @@ impl Pipe {
             let (wi, li, gen) = carrier_of(c);
             let Some(w) = swires.get_mut(wi) else { continue };
             let Some(l) = w.links.get_mut(li) else { continue };
-            if l.gen != gen || l.fd.is_none() {
+            if l.gen != gen || l.sock.is_none() {
                 continue;
             }
             l.inflight -= len as usize;
@@ -362,8 +362,8 @@ impl Pipe {
         for wi in 0..self.swires.len() {
             for li in 0..self.swires[wi].links.len() {
                 let l = &mut self.swires[wi].links[li];
-                let Some(fd) = &l.fd else { continue };
-                if let Io::Gone = link::flush(&mut l.out, fd) {
+                let Some(sock) = &mut l.sock else { continue };
+                if let Io::Gone = link::flush(&mut l.out, sock) {
                     self.link_down(wi, li, ctl::WHY_GONE, now);
                 }
             }
@@ -384,7 +384,8 @@ impl Pipe {
                 }
                 Slot::Link(wi, li) => {
                     let l = &swires[wi].links[li];
-                    poll.want(si, l.fd.is_some(), l.out.pending());
+                    let write = l.out.pending() && l.sock.as_ref().is_some_and(|s| s.polls_writes());
+                    poll.want(si, l.sock.is_some(), write);
                 }
                 _ => {}
             }
@@ -402,13 +403,13 @@ impl Pipe {
                 let l = &mut w.links[li];
                 if l.renew_at != 0 {
                     if now >= l.renew_at {
-                        l.dial(w.exit, session, now);
+                        l.dial(&w.reach, session, now);
                         *dirty = true;
                     } else {
                         next = next.min(l.renew_at);
                     }
                 }
-                if l.fd.is_none() {
+                if l.sock.is_none() {
                     continue;
                 }
                 if !l.h.up {

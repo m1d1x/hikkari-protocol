@@ -10,3 +10,4 @@ publish.workspace = true
 libc.workspace = true
 hikkari-sys.workspace = true
 hikkari-trunk.workspace = true
+hikkari-cronet.workspace = true

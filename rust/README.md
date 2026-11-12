@@ -3,7 +3,7 @@
 The trunk's protocol, the cascade entry's pipe and the exit's. The Go side (`trunk`, `trunk/pipectl`) is the reference
 and the brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r1.7-exit-tcp` on `rust-r1.6-exit` (R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
+Status: branch `rust-r2.1-cronet` on `rust-r1.7-exit-tcp` (R2.1 stream members by Chromium's CONNECT; R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
 members' health, R1.2 datagrams whole, R1.3 clients' TCP streams, R1.4 what a dead member carried sent again, R3 the
 brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
@@ -14,12 +14,13 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 | Crate | What | Who may depend on it |
 | --- | --- | --- |
 | `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
-| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal. No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal, a pool member's Naive padding and CONNECT headers (`naive`). No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `cronet` (`hikkari-cronet`) | a pool member over Chromium's network stack: libcronet loaded at run time, the member's own TCP socket by cronet's dialer, the CONNECT tunnel read and written like a non-blocking socket; its `unsafe` is the C API's | the entry |
 | `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
 | `exit` (`hikkari-exit`) | the exit's pipe: the entry's packet members and stream members, their sessions, flows and streams to the loopback services, answers glued down; binary `hk-exit` | nothing |
 | `bench` (`hikkari-bench`) | the bench's users (`hk-loadgen`), `run.sh`, the Go entry and exit it measures against | nothing |
 
-`trunk` depends on no other crate here, `sys` on none, `pipe` and `exit` on both. Inside `pipe`: `ctl` (the brain's messages),
+`trunk` depends on no other crate here, `sys` on none, `cronet` on both, `pipe` on all three, `exit` on `sys` and `trunk`. Inside `pipe`: `ctl` (the brain's messages),
 `flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `link` (stream members over TCP),
 `streams` (clients' connections as streams), `pipe/` (the loop: `brain`, `timers`, `data`, `tcp`).
 
@@ -72,8 +73,8 @@ Streams (R1.3; spec/trunk.md, "Streams", as the Go session carries them: Carry, 
   before it is written. A stream ends when both FINs are confirmed and written; a reset either way ends it at once.
 - Stream members (`link.rs`) are the pool's form: a t1 hello, frames one after another on a TCP connection of their own,
   pings when idle a second, deaths by the same rules as any member's (`trunk/src/health.rs`: a member owes while it
-  carries an unconfirmed open, chunk or FIN). Here the connection is plain TCP, as the bench's Go entry dials its pool;
-  Chromium's TLS goes under it in R2.
+  carries an unconfirmed open, chunk or FIN). A member's connection is plain TCP to the exit's member port, as the bench's
+  Go entry dials its pool, or Chromium's CONNECT tunnel to the exit's relay (R2.1, below).
 - A member that dies (`pipe/death.rs`, trunk dropMemberLocked) resets no stream: the opens, chunks and FINs it carried
   unconfirmed wait in their streams and go again on the other members, oldest first (by stream id, then as each was
   sent) and ahead of any new chunk, a chunk only on a member under 256 KiB unconfirmed. A stream keeps the bytes of its
@@ -85,7 +86,8 @@ Streams (R1.3; spec/trunk.md, "Streams", as the Go session carries them: Carry, 
   and a stream's unconfirmed bytes in one buffer each that grows to what it holds; chunks past a hole are the only
   copies made per chunk.
 
-Left out on purpose: the Chromium pool (R2), the brain's
+Left out on purpose: the port book and replacing members spread over a second (R2.3), one engine's thread per member
+(R2.2 decides), the brain's
 messages for client ports of streams and stream wires (the bench runs them by flags), datagrams on stream members (they
 ride the packet wires), wires other than `udp` and the plain TCP members, drains and generations, observation, IPv6, GSO
 on send (the glued datagrams differ in size; answers go to different clients).
@@ -286,4 +288,37 @@ pipe built:
 cargo build --release --target aarch64-unknown-linux-musl && cp target/aarch64-unknown-linux-musl/release/hk-pipe bench/out/
 (cd ../trunk && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o ../rust/bench/out/pipectl.test ./pipectl)
 docker run --rm -v "$PWD/bench:/bench" -e HK_PIPE=/bench/out/hk-pipe debian:bookworm-slim /bench/out/pipectl.test -test.v
+```
+
+## Chromium members (R2.1)
+
+`hikkari-cronet` puts a stream member on Chromium's network stack, as `trunk/chromium` does for the Go entry: the same
+cronet build (sagernet's, Chromium 150 here), loaded at run time from `libcronet.so` (`--cronet`, else the executable's
+directory, else the dynamic linker's paths), one engine per member. The engine is set up as cronet-go
+`NaiveClient.startEngine` sets it (HTTP/2 without QUIC, its windows and socket pools), its exit's domain mapped to the
+exit's address (`HostResolverRules`) and its DNS client pointed at loopback, so no name is looked up. Its dialer
+(`Cronet_Engine_SetDialer`) opens the member's TCP socket to the exit only, from the port given (0 until the port book,
+R2.3), Nagle off and Go's keepalive; anything else it is asked for is refused. The stream is the CONNECT of
+`trunk/chromium`: `-connect-authority trunk.hikkari.arpa:443`, the `padding` header, `proxy-authorization` of the trunk
+key; the first 8 writes and reads each way carry Naive padding (`hikkari_trunk::naive`).
+
+The pipe's loop never waits on the library. A member's bytes cross in two buffers, one read and one write outstanding
+as the stream API allows; cronet's network thread rings the member's eventfd when a read or a write is done or the
+tunnel came up or failed, and the loop polls that eventfd as it polls a socket (`link::Sock`). Engines are started and
+shut down on one thread of their own (`keeper`), since both block. A relay that answers other than 200 (a wrong key
+gets its site) is a failed member.
+
+libcronet is a glibc library, so the pipe that loads it is built for `aarch64-unknown-linux-gnu`, in docker on the mac;
+the bench's box is Debian. The Go exit's `-naive` is the relay's stream channel for pool members (as the Go
+`trunk/chromium` test's exit: TLS for `hk.example`, HTTP/2 CONNECT behind the key, padding, `trunk.Exit.ServeMember`);
+it writes its certificate to `bench/out/naive-roots.pem` and logs each tunnel with how many hellos carried GREASE
+(Chromium's do, Go's TLS never).
+
+```bash
+docker run --rm -v "$PWD/..:/src" -v "$HOME/.cargo/registry:/usr/local/cargo/registry" -e CARGO_TARGET_DIR=/src/rust/target/gnu \
+  -w /src/rust rust:1.97.1-bookworm cargo build --release -p hikkari-pipe
+cp target/gnu/release/hk-pipe bench/out/hk-pipe-gnu
+cp "$(go env GOMODCACHE)"/github.com/sagernet/cronet-go/lib/linux_arm64@*/libcronet.so bench/out/
+(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goexit ./goexit)
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "rust chromium" 1073741824 1 4
 ```

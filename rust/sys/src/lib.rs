@@ -9,7 +9,9 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 mod tcp;
-pub use tcp::{accept, read, shutdown_write, tcp_connect, tcp_from_fd, tcp_listen, write, Io};
+mod wake;
+pub use wake::Wake;
+pub use tcp::{accept, into_raw, read, shutdown_write, tcp_connect, tcp_dial, tcp_from_fd, tcp_listen, write, DialErr, Io};
 
 /// An IPv4 address as the kernel keeps it: what a batch reads a datagram
 /// from and sends an answer to.

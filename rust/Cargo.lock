@@ -129,6 +129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hikkari-cronet"
+version = "0.1.0"
+dependencies = [
+ "hikkari-sys",
+ "hikkari-trunk",
+ "libc",
+]
+
+[[package]]
 name = "hikkari-exit"
 version = "0.1.0"
 dependencies = [
@@ -141,6 +150,7 @@ dependencies = [
 name = "hikkari-pipe"
 version = "0.1.0"
 dependencies = [
+ "hikkari-cronet",
  "hikkari-sys",
  "hikkari-trunk",
  "libc",

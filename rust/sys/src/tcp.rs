@@ -132,3 +132,71 @@ pub fn tcp_from_fd(fd: i32) -> io::Result<OwnedFd> {
     }
     Ok(owned)
 }
+
+/// Why a dial got no connection.
+#[derive(Debug)]
+pub enum DialErr {
+    /// Nothing answered within the timeout: the path, or the port it came
+    /// from, is suspect (trunk ErrSilent).
+    Silent,
+    /// Refused, unreachable, or the port taken.
+    Failed(io::Error),
+}
+
+/// A TCP connection to addr from local port `from` (0: the kernel's
+/// choice), waited for up to timeout_ns: a pool member's own socket, as the
+/// Go entry's chromium portDialer opens it (Nagle off, keepalive of Go's
+/// net.Dialer: 15 s idle, 15 s apart, 9 probes). It blocks the calling
+/// thread; the socket it returns is non-blocking.
+pub fn tcp_dial(addr: SocketAddrV4, from: u16, timeout_ns: u64) -> Result<OwnedFd, DialErr> {
+    let fail = |_| DialErr::Failed(io::Error::last_os_error());
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(fail(()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY, 1);
+    set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, 15);
+    set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, 15);
+    set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 9);
+    if from != 0 {
+        let local = sockaddr(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, from));
+        if unsafe { libc::bind(fd, &local as *const _ as *const _, size_of::<libc::sockaddr_in>() as _) } != 0 {
+            return Err(fail(()));
+        }
+    }
+    let sa = sockaddr(addr);
+    if unsafe { libc::connect(fd, &sa as *const _ as *const _, size_of::<libc::sockaddr_in>() as _) } == 0 {
+        return Ok(owned);
+    }
+    if last() != libc::EINPROGRESS {
+        return Err(fail(()));
+    }
+    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let ms = (timeout_ns / 1_000_000).min(i32::MAX as u64) as i32;
+    let r = loop {
+        let r = unsafe { libc::poll(&mut p, 1, ms) };
+        if r < 0 && last() == libc::EINTR {
+            continue;
+        }
+        break r;
+    };
+    if r == 0 {
+        return Err(DialErr::Silent);
+    }
+    let mut err: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut _, &mut len) };
+    match err {
+        0 => Ok(owned),
+        libc::ETIMEDOUT => Err(DialErr::Silent),
+        e => Err(DialErr::Failed(io::Error::from_raw_os_error(e))),
+    }
+}
+
+/// Hands the descriptor over: the caller closes it (a library that adopts
+/// a socket, as cronet's dialer does).
+pub fn into_raw(fd: OwnedFd) -> i32 {
+    std::os::fd::IntoRawFd::into_raw_fd(fd)
+}
