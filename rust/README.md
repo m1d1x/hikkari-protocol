@@ -3,7 +3,7 @@
 The trunk's protocol and the cascade entry's pipe. The Go side (`trunk`, `trunk/pipectl`) is the reference and the
 brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r1.4-resend` on `rust-r1.3-tcp` (R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
+Status: branch `rust-r1.5-mixed` on `rust-r1.4-resend` (R1.5 both paths benched at once; R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
 streams, R1.4 what a dead member carried sent again, R3 the brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
 `plans/research/2026-11-12-rust-pipe-*.md`.
@@ -123,6 +123,16 @@ dies by its stall) the members go through `tcpcheck -proxy`, which cuts the busi
 
 ```bash
 docker run --rm -e CUT=rst -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "rust go" 1073741824 1 4
+```
+
+Both paths at once (R1.5): `bench/mixed.sh` runs the UDP users through an entry while clients' streams download through
+the same entry (`tcpcheck -for`, at `-rate` bytes a second per stream or as fast as they go), the Go entry against
+`hk-pipe`, to the same Go exit. Each load on CPUs of its own outside the entry. `bench/mixed_summary.py` gives per load
+the price of a user's packet (runs without a download) and the CPU a download adds per MiB, with the voice gaps.
+
+```bash
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/mixed.sh 3 30 "16 64" "go rust" "none rate flood"
+python3 bench/mixed_summary.py bench/out/results-mixed.txt
 ```
 
 ## Brain and pipe (R3)

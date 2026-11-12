@@ -6,6 +6,11 @@
 // and, with -pid, the entry's CPU per MiB sent (each MiB crosses the entry
 // twice: up and echoed down).
 //
+// With -for (R1.5) each stream sends for that long instead of -bytes, and
+// with -rate no faster than that many bytes a second: a download beside the
+// bench's UDP users. The line then has the bytes each stream moved, every one
+// still compared.
+//
 // With -proxy it is a cutter between an entry's stream members and the exit
 // (R1.4): every connection to -proxy is carried to -proxy-to, and every
 // -cut-every, from -cut-after on, the connection that carried most since
@@ -42,6 +47,8 @@ func main() {
 	cutAfter := flag.Duration("cut-after", 2*time.Second, "cut members: the first cut after this")
 	cutEvery := flag.Duration("cut-every", 3*time.Second, "cut members: a cut this often")
 	cutHow := flag.String("cut", "rst", "cut members: rst or freeze")
+	dur := flag.Duration("for", 0, "send for this long instead of -bytes")
+	rate := flag.Int64("rate", 0, "bytes a second per stream (0: as fast as it goes)")
 	flag.Parse()
 	if *serve != "" {
 		echo(*serve)
@@ -55,11 +62,12 @@ func main() {
 	t0 := time.Now()
 	var wg sync.WaitGroup
 	errs := make([]error, *streams)
+	moved := make([]int64, *streams)
 	for i := range *streams {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs[i] = check(*to, uint64(i+1), *size)
+			moved[i], errs[i] = check(*to, uint64(i+1), *size, *dur, *rate)
 		}()
 	}
 	wg.Wait()
@@ -72,9 +80,13 @@ func main() {
 			log.Printf("stream %d: %v", i+1, err)
 		}
 	}
-	mib := float64(*size*int64(*streams)) / (1 << 20)
+	var all int64
+	for _, n := range moved {
+		all += n
+	}
+	mib := float64(all) / (1 << 20)
 	fmt.Printf("%s streams=%d bytes=%d ok=%d bad=%d secs=%.2f MiB/s=%.1f cpu_ms=%.0f us_per_MiB=%.1f\n",
-		*label, *streams, *size, *streams-bad, bad, dt.Seconds(), mib/dt.Seconds(), float64(cpuNs)/1e6, float64(cpuNs)/1e3/mib)
+		*label, *streams, all, *streams-bad, bad, dt.Seconds(), mib/dt.Seconds(), float64(cpuNs)/1e6, float64(cpuNs)/1e3/mib)
 	if bad > 0 {
 		os.Exit(1)
 	}
@@ -195,60 +207,104 @@ func carry(p *pair, dst, src *net.TCPConn) {
 
 // check sends size bytes of stream seed's PRNG, half-closes, and reads them
 // back, comparing every byte and expecting the end right after.
-func check(to string, seed uint64, size int64) error {
+// check sends one stream's bytes and reads them echoed, every byte
+// compared: size bytes, or with dur > 0 for that long; with rate > 0 no
+// faster than rate bytes a second. It gives the bytes that came back.
+func check(to string, seed uint64, size int64, dur time.Duration, rate int64) (int64, error) {
 	c, err := net.Dial("tcp", to)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer c.Close()
-	werr := make(chan error, 1)
+	type sent struct {
+		n   int64
+		err error
+	}
+	done := make(chan sent, 1)
 	go func() {
 		w := bufio.NewWriterSize(c, 256<<10)
 		r := rand.New(rand.NewPCG(seed, 1))
 		buf := make([]byte, 64<<10)
-		for left := size; left > 0; {
-			n := int64(len(buf))
-			if left < n {
-				n = left
+		t0 := time.Now()
+		var n int64
+		for {
+			if dur > 0 && time.Since(t0) >= dur {
+				break
 			}
-			fill(r, buf[:n])
-			if _, err := w.Write(buf[:n]); err != nil {
-				werr <- err
+			step := int64(len(buf))
+			if dur <= 0 {
+				if n >= size {
+					break
+				}
+				step = min(step, size-n)
+			}
+			fill(r, buf[:step])
+			if _, err := w.Write(buf[:step]); err != nil {
+				done <- sent{n, err}
 				return
 			}
-			left -= n
+			n += step
+			if rate > 0 {
+				if err := w.Flush(); err != nil {
+					done <- sent{n, err}
+					return
+				}
+				time.Sleep(time.Until(t0.Add(time.Duration(n * int64(time.Second) / rate))))
+			}
 		}
 		if err := w.Flush(); err != nil {
-			werr <- err
+			done <- sent{n, err}
 			return
 		}
-		werr <- c.(*net.TCPConn).CloseWrite()
+		done <- sent{n, c.(*net.TCPConn).CloseWrite()}
 	}()
+	// The sender fills blocks of 64 KiB (the last one shorter with -bytes):
+	// the expected bytes are made block by block the same way.
 	rd := bufio.NewReaderSize(c, 256<<10)
 	r := rand.New(rand.NewPCG(seed, 1))
 	want := make([]byte, 64<<10)
 	got := make([]byte, 64<<10)
 	var at int64
-	for at < size {
-		n := int64(len(want))
-		if size-at < n {
-			n = size - at
-		}
-		fill(r, want[:n])
-		if _, err := io.ReadFull(rd, got[:n]); err != nil {
-			return fmt.Errorf("read at %d of %d: %w", at, size, err)
-		}
-		for i := range n {
-			if got[i] != want[i] {
-				return fmt.Errorf("byte %d: got %#x, want %#x", at+i, got[i], want[i])
+	var block []byte // the rest of the expected block
+	for {
+		n, err := rd.Read(got)
+		for i := 0; i < n; {
+			if len(block) == 0 {
+				step := int64(len(want))
+				if dur <= 0 {
+					step = min(step, size-at-int64(i))
+				}
+				if step <= 0 {
+					return at, fmt.Errorf("after %d bytes: more (want the end)", size)
+				}
+				fill(r, want[:step])
+				block = want[:step]
 			}
+			k := min(len(block), n-i)
+			for j := range k {
+				if got[i+j] != block[j] {
+					return at, fmt.Errorf("byte %d: got %#x, want %#x", at+int64(i+j), got[i+j], block[j])
+				}
+			}
+			block = block[k:]
+			i += k
 		}
-		at += n
+		at += int64(n)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return at, fmt.Errorf("read at %d: %w", at, err)
+		}
 	}
-	if n, err := rd.Read(got[:1]); n != 0 || err != io.EOF {
-		return fmt.Errorf("after %d bytes: %d more, %v (want the end)", size, n, err)
+	s := <-done
+	if s.err != nil {
+		return at, s.err
 	}
-	return <-werr
+	if at != s.n {
+		return at, fmt.Errorf("%d bytes back of %d sent", at, s.n)
+	}
+	return at, nil
 }
 
 func fill(r *rand.Rand, b []byte) {
