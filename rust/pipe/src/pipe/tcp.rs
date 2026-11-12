@@ -2,16 +2,14 @@
 //! client connections accepted and opened to the exit, their bytes read
 //! into chunks on stream members (link.rs), the exit's chunks written back
 //! in order and acked, FINs both ways, resets, and the stream members' own
-//! talk and deaths. Nothing is sent again: a member that dies under a
-//! stream's unconfirmed bytes resets that stream (R1.4 moves them to another
-//! member, as trunk session.go dropMemberLocked does).
+//! talk. A member's death and what it carried going again: death.rs.
 
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::frame::{self, Frame, ACK_FIN, ACK_LEN, NO_GOT};
 use hikkari_trunk::health::Verdict;
-use hikkari_trunk::stream::CHUNK;
+use hikkari_trunk::stream::{CHUNK, NO_CARRIER};
 
 use super::{Event, Pipe, Slot};
 use crate::ctl;
@@ -42,8 +40,6 @@ pub(super) enum Why {
     Peer,
     /// The client failed.
     Local,
-    /// A member carrying its unconfirmed bytes died.
-    Cut,
     /// Both directions are over: no reset, it ends.
     Done,
 }
@@ -51,7 +47,7 @@ pub(super) enum Why {
 /// The member a stream's next frame goes on (trunk pickLocked): of the bulk
 /// route's wire while it has a member up, else of any wire; the one owing
 /// least; for a chunk, only one with room under INFLIGHT.
-fn pick(wires: &[StreamWire], bulk: u8, chunk: bool) -> Option<(usize, usize)> {
+pub(super) fn pick(wires: &[StreamWire], bulk: u8, chunk: bool) -> Option<(usize, usize)> {
     let only = wires.iter().any(|w| w.id == bulk && w.up() > 0);
     let mut best: Option<(usize, usize, usize)> = None;
     for (wi, w) in wires.iter().enumerate() {
@@ -73,6 +69,9 @@ fn pick(wires: &[StreamWire], bulk: u8, chunk: bool) -> Option<(usize, usize)> {
 /// What a stream owed and no longer does, without a confirmation: the
 /// member it went on carries it no more.
 fn forget(wires: &mut [StreamWire], c: u32, len: u32) {
+    if c == NO_CARRIER {
+        return;
+    }
     let (wi, li, gen) = carrier_of(c);
     let Some(l) = wires.get_mut(wi).and_then(|w| w.links.get_mut(li)) else { return };
     if l.gen != gen || l.fd.is_none() {
@@ -133,6 +132,10 @@ impl Pipe {
     /// credit and the members' room go, read straight into a member's out
     /// buffer as chunks; a client's end is its FIN.
     pub(super) fn read_streams(&mut self, now: u64) {
+        // What is owed again goes before what is new (trunk queueLocked).
+        if !self.resend(now) {
+            return;
+        }
         let Pipe { poll, slots, streams, swires, route, moved, doomed, .. } = self;
         let bulk = route[0];
         for (si, s) in slots.iter().enumerate() {
@@ -158,7 +161,7 @@ impl Pipe {
                 }
                 match sys::read(&st.client.fd, l.out.chunk_buf(k)) {
                     Io::Done(k) => {
-                        let off = st.send.chunk(k, carrier(wi, li, l.gen));
+                        let off = st.send.chunk(&l.out.chunk_buf(k)[..k], carrier(wi, li, l.gen));
                         l.out.chunk_done(st.id, off, k);
                         l.owe(k, now);
                         w.t.up_pkts += 1;
@@ -369,7 +372,7 @@ impl Pipe {
 
     /// What each stream socket is waited for in the next poll.
     pub(super) fn want_tcp(&mut self) {
-        let chunk = pick(&self.swires, self.route[0], true).is_some();
+        let chunk = self.stranded.is_empty() && pick(&self.swires, self.route[0], true).is_some();
         let Pipe { poll, slots, streams, swires, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             match *s {
@@ -431,31 +434,6 @@ impl Pipe {
         next
     }
 
-    /// Member li of wire wi is down: the streams whose unconfirmed bytes it
-    /// carried are reset (nothing is sent again before R1.4), and it is
-    /// dialed anew within a second, spread as the UDP members are.
-    pub(super) fn link_down(&mut self, wi: usize, li: usize, why: u8, now: u64) {
-        let l = &self.swires[wi].links[li];
-        let (was_up, c) = (l.h.up, carrier(wi, li, l.gen));
-        if was_up || why == ctl::WHY_GONE {
-            let wid = self.swires[wi].id;
-            self.events.push(Event { wire: wid, index: li as u8, up: false, why });
-        }
-        for slot in 0..self.streams.slots() {
-            if let Some(st) = self.streams.get(slot) {
-                if st.send.owed.iter().any(|o| o.carrier == c) {
-                    self.doomed.push((slot, Why::Cut));
-                }
-            }
-        }
-        self.end_doomed();
-        let l = &mut self.swires[wi].links[li];
-        l.drop_sock();
-        let mut r = [0u8; 8];
-        sys::urandom(&mut r);
-        l.renew_at = now + 1 + u64::from_le_bytes(r) % super::timers::SPREAD;
-        self.dirty = true;
-    }
 }
 
 /// A stream's frame from the exit (trunk session.go: dataLocked, finLocked,
@@ -519,7 +497,7 @@ fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doo
 
 /// An ack of how far the stream has the exit's bytes, answering the chunk
 /// at got (NO_GOT: none).
-fn ack(out: &mut Out, st: &mut Stream, got: u64) {
+pub(super) fn ack(out: &mut Out, st: &mut Stream, got: u64) {
     let (r, c, f) = st.recv.ack();
     out.frame(ACK_LEN, |b| frame::put_ack(b, st.id, r, c, f, got));
 }
@@ -528,7 +506,6 @@ fn count(n: &mut StreamCounts, why: Why) {
     match why {
         Why::Peer => n.reset_peer += 1,
         Why::Local => n.reset_local += 1,
-        Why::Cut => n.cut += 1,
         Why::Done => {}
     }
 }
@@ -537,13 +514,14 @@ fn count(n: &mut StreamCounts, why: Why) {
 pub(super) fn stats(streams: &Streams, wires: &[StreamWire]) -> String {
     let n = &streams.n;
     let mut s = format!(
-        " | streams open={} opened={} fin={} rst_peer={} rst_local={} cut={} up={}MiB down={}MiB",
+        " | streams open={} opened={} fin={} rst_peer={} rst_local={} hit={} resent={} up={}MiB down={}MiB",
         streams.open,
         n.opened,
         n.fin,
         n.reset_peer,
         n.reset_local,
-        n.cut,
+        n.deaths,
+        n.resent,
         n.up >> 20,
         n.down >> 20
     );

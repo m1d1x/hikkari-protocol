@@ -3,8 +3,8 @@
 The trunk's protocol and the cascade entry's pipe. The Go side (`trunk`, `trunk/pipectl`) is the reference and the
 brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r1.3-tcp` on `rust-r1.2-dgrams` (R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
-streams without resend, R3 the brain's socket); bench and tests only, not deployed. The
+Status: branch `rust-r1.4-resend` on `rust-r1.3-tcp` (R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
+streams, R1.4 what a dead member carried sent again, R3 the brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
 `plans/research/2026-11-12-rust-pipe-*.md`.
 
@@ -72,12 +72,18 @@ Streams (R1.3; spec/trunk.md, "Streams", as the Go session carries them: Carry, 
   pings when idle a second, deaths by the same rules as any member's (`trunk/src/health.rs`: a member owes while it
   carries an unconfirmed open, chunk or FIN). Here the connection is plain TCP, as the bench's Go entry dials its pool;
   Chromium's TLS goes under it in R2.
-- Nothing is sent again (R1.4): a member that dies under a stream's unconfirmed bytes resets the stream (`cut` in the
-  stats line). When a member comes up, every stream acks again on it.
+- A member that dies (`pipe/death.rs`, trunk dropMemberLocked) resets no stream: the opens, chunks and FINs it carried
+  unconfirmed wait in their streams and go again on the other members, oldest first (by stream id, then as each was
+  sent) and ahead of any new chunk, a chunk only on a member under 256 KiB unconfirmed. A stream keeps the bytes of its
+  unconfirmed chunks for this (`hikkari_trunk::stream::Kept`, at most the window). Every stream acks again elsewhere,
+  since the acks the member carried may be lost, and again on each member that comes up. The stats line counts
+  `hit` (a stream's things on a member that died) and `resent` (chunks sent again). Chunks that reach the exit before
+  their open are the exit's to hold (the Go exit does, trunk holdEarlyLocked).
 - Nothing is allocated per chunk: members' buffers are allocated once (out 1 MiB, in 256 KiB), a client's waiting bytes
-  in one buffer of its own, chunks past a hole are the only copies.
+  and a stream's unconfirmed bytes in one buffer each that grows to what it holds; chunks past a hole are the only
+  copies made per chunk.
 
-Left out on purpose: resend and moving a stream's chunks to another member (R1.4), the Chromium pool (R2), the brain's
+Left out on purpose: the Chromium pool (R2), the brain's
 messages for client ports of streams and stream wires (the bench runs them by flags), datagrams on stream members (they
 ride the packet wires), wires other than `udp` and the plain TCP members, drains and generations, observation, IPv6, GSO
 on send (the glued datagrams differ in size; answers go to different clients).
@@ -109,6 +115,14 @@ twice, up and echoed down).
 ```bash
 (cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/tcpcheck ./tcpcheck)
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "go rust" 1073741824 1 4
+```
+
+Members cut under the streams (R1.4): with `CUT=rst` (the member's socket fails) or `CUT=freeze` (it goes silent and
+dies by its stall) the members go through `tcpcheck -proxy`, which cuts the busiest member every `CUT_EVERY` (3 s).
+`PIPE=/bench/out/<build>` runs another `hk-pipe` build as `rust`.
+
+```bash
+docker run --rm -e CUT=rst -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 3 "rust go" 1073741824 1 4
 ```
 
 ## Brain and pipe (R3)

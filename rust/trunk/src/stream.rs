@@ -4,8 +4,9 @@
 //! window says how far the other end may send. The reference is trunk
 //! session.go: ackedLocked (what an ack confirms), dataLocked and takeLocked
 //! (chunks in order, the ones past a hole kept), ackGotLocked and writeLocal
-//! (what an ack says, when the freed window is told). No sockets: what
-//! carries the bytes and where they are written is the caller's.
+//! (what an ack says, when the freed window is told), dropMemberLocked (what
+//! a dead member carried goes again, oldest first). No sockets: what carries
+//! the bytes and where they are written is the caller's.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -19,6 +20,9 @@ pub const WINDOW: u64 = 2 << 20;
 /// Unconfirmed chunk bytes one member carries, at most (trunk
 /// DefaultInflight); a member owing nothing takes a chunk whatever its size.
 pub const INFLIGHT: usize = 256 << 10;
+/// The carrier of something owed that no member carries now: its member
+/// died, and it waits to be sent again.
+pub const NO_CARRIER: u32 = u32::MAX;
 
 /// Something a stream sent that the other end must confirm: its open (F_OPEN),
 /// a chunk (F_DATA, `len` bytes at `off`) or its end (F_FIN at `off`), and
@@ -31,14 +35,70 @@ pub struct Owed {
     pub carrier: u32,
 }
 
+/// The bytes of a stream's unconfirmed chunks, from the lowest one owed to
+/// what was numbered last, so a chunk can go again when its member dies.
+/// They span at most the window: an ack that gives credit up to received +
+/// WINDOW confirms everything below received. One buffer that grows to what
+/// the stream keeps and is moved down once the bytes dropped from its front
+/// are the larger half, so each byte is moved at most once on average.
+#[derive(Default)]
+pub struct Kept {
+    buf: Vec<u8>,
+    /// The stream offset of buf[at].
+    base: u64,
+    at: usize,
+}
+
+impl Kept {
+    fn push(&mut self, p: &[u8]) {
+        self.buf.extend_from_slice(p);
+    }
+
+    /// Bytes below `off` are confirmed: they are not kept any more.
+    fn drop_below(&mut self, off: u64) {
+        if off <= self.base {
+            return;
+        }
+        let n = ((off - self.base) as usize).min(self.buf.len() - self.at);
+        self.at += n;
+        self.base += n as u64;
+        if self.at == self.buf.len() {
+            self.buf.clear();
+            self.at = 0;
+        } else if self.at > self.buf.len() / 2 {
+            self.buf.drain(..self.at);
+            self.at = 0;
+        }
+    }
+
+    /// The kept bytes of [off, off+len).
+    pub fn get(&self, off: u64, len: usize) -> &[u8] {
+        let i = self.at + (off - self.base) as usize;
+        &self.buf[i..i + len]
+    }
+
+    /// Bytes kept now.
+    pub fn len(&self) -> usize {
+        self.buf.len() - self.at
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// The sending half: what was numbered, how far the other end lets it go,
-/// and what it still owes.
+/// what it still owes, and the bytes of what it owes.
 pub struct Send {
     /// Bytes numbered so far: the next chunk's offset.
     pub sent: u64,
     /// The other end takes bytes below this.
     pub credit: u64,
+    /// In the order it was sent: the open, chunks by offset, the FIN.
     pub owed: VecDeque<Owed>,
+    pub kept: Kept,
+    /// Owed things no member carries (NO_CARRIER): they wait to go again.
+    pub stranded: u32,
     /// The FIN is sent, and confirmed.
     pub fin_sent: bool,
     pub fin_done: bool,
@@ -46,7 +106,15 @@ pub struct Send {
 
 impl Default for Send {
     fn default() -> Send {
-        Send { sent: 0, credit: WINDOW, owed: VecDeque::with_capacity(16), fin_sent: false, fin_done: false }
+        Send {
+            sent: 0,
+            credit: WINDOW,
+            owed: VecDeque::with_capacity(16),
+            kept: Kept::default(),
+            stranded: 0,
+            fin_sent: false,
+            fin_done: false,
+        }
     }
 }
 
@@ -56,11 +124,13 @@ impl Send {
         self.credit.saturating_sub(self.sent)
     }
 
-    /// Numbers a chunk of n bytes on `carrier`: its offset.
-    pub fn chunk(&mut self, n: usize, carrier: u32) -> u64 {
+    /// Numbers the chunk `p` on `carrier`, keeping its bytes until they are
+    /// confirmed: its offset.
+    pub fn chunk(&mut self, p: &[u8], carrier: u32) -> u64 {
         let off = self.sent;
-        self.owed.push_back(Owed { kind: F_DATA, off, len: n as u32, carrier });
-        self.sent += n as u64;
+        self.owed.push_back(Owed { kind: F_DATA, off, len: p.len() as u32, carrier });
+        self.kept.push(p);
+        self.sent += p.len() as u64;
         off
     }
 
@@ -98,6 +168,37 @@ impl Send {
             !done
         });
         self.fin_done |= fin_done;
+        if self.stranded > 0 {
+            self.stranded = self.owed.iter().filter(|o| o.carrier == NO_CARRIER).count() as u32;
+        }
+        let low = self.owed.iter().find(|o| o.kind == F_DATA).map_or(self.sent, |o| o.off);
+        self.kept.drop_below(low);
+    }
+
+    /// The member `carrier` died (trunk dropMemberLocked): what it carried
+    /// waits to go again. Whether it carried anything of this stream.
+    pub fn strand(&mut self, carrier: u32) -> bool {
+        let mut any = false;
+        for o in self.owed.iter_mut().filter(|o| o.carrier == carrier) {
+            o.carrier = NO_CARRIER;
+            self.stranded += 1;
+            any = true;
+        }
+        any
+    }
+
+    /// The first owed thing waiting to go again, oldest first: its index.
+    pub fn next_stranded(&self) -> Option<usize> {
+        if self.stranded == 0 {
+            return None;
+        }
+        self.owed.iter().position(|o| o.carrier == NO_CARRIER)
+    }
+
+    /// Owed thing i goes again on `carrier`.
+    pub fn resent(&mut self, i: usize, carrier: u32) {
+        self.owed[i].carrier = carrier;
+        self.stranded -= 1;
     }
 }
 
@@ -189,9 +290,9 @@ mod tests {
     fn an_ack_confirms_the_open_chunks_by_got_or_received_and_the_fin_by_its_flag() {
         let mut s = Send::default();
         s.open(1);
-        let a = s.chunk(100, 1);
-        let b = s.chunk(100, 2);
-        let c = s.chunk(100, 3);
+        let a = s.chunk(&[1; 100], 1);
+        let b = s.chunk(&[2; 100], 2);
+        let c = s.chunk(&[3; 100], 3);
         assert_eq!((a, b, c, s.room()), (0, 100, 200, WINDOW - 300));
         s.fin(3);
         let mut seen = vec![];
@@ -208,6 +309,55 @@ mod tests {
         s.acked(300, 0, ACK_FIN, NO_GOT, |o| seen.push((o.kind, o.off)));
         assert_eq!(seen, [(F_DATA, 100), (F_FIN, 300)]);
         assert!(s.fin_done && s.owed.is_empty());
+    }
+
+    #[test]
+    fn a_dead_members_things_go_again_oldest_first_with_their_bytes() {
+        let mut s = Send::default();
+        s.open(1);
+        s.chunk(b"aaaa", 1);
+        s.chunk(b"bbbb", 2);
+        s.chunk(b"cccc", 1);
+        s.fin(1);
+        assert!(s.strand(1) && !s.strand(9));
+        assert_eq!(s.stranded, 4);
+        let i = s.next_stranded().unwrap();
+        assert_eq!((s.owed[i].kind, i), (F_OPEN, 0), "the open goes first");
+        s.resent(i, 3);
+        let i = s.next_stranded().unwrap();
+        let o = s.owed[i];
+        assert_eq!((o.kind, o.off, s.kept.get(o.off, o.len as usize)), (F_DATA, 0, &b"aaaa"[..]));
+        // An ack on another member confirms the first two chunks meanwhile.
+        s.acked(8, WINDOW, 0, NO_GOT, |_| {});
+        assert_eq!(s.stranded, 2, "a confirmed chunk waits no more");
+        let i = s.next_stranded().unwrap();
+        let o = s.owed[i];
+        assert_eq!((o.kind, o.off, s.kept.get(o.off, o.len as usize)), (F_DATA, 8, &b"cccc"[..]));
+        assert_eq!(s.kept.len(), 4, "the confirmed bytes are not kept");
+        s.resent(i, 3);
+        let i = s.next_stranded().unwrap();
+        assert_eq!(s.owed[i].kind, F_FIN);
+        s.resent(i, 3);
+        assert_eq!(s.next_stranded(), None);
+        s.acked(12, WINDOW, ACK_FIN, NO_GOT, |_| {});
+        assert!(s.fin_done && s.kept.is_empty());
+    }
+
+    #[test]
+    fn kept_bytes_follow_out_of_order_confirmations() {
+        let mut s = Send::default();
+        for i in 0..8u8 {
+            s.chunk(&[i; 1000], 1);
+        }
+        s.acked(0, WINDOW, 0, 1000, |_| {});
+        assert_eq!(s.kept.len(), 8000, "the lowest chunk is still owed: nothing goes");
+        s.acked(0, WINDOW, 0, 0, |_| {});
+        assert_eq!(s.kept.len(), 6000, "the two lowest confirmed by got");
+        assert_eq!(s.kept.get(5000, 1000), &[5; 1000][..]);
+        s.acked(7000, WINDOW, 0, NO_GOT, |_| {});
+        assert_eq!(s.kept.get(7000, 1000), &[7; 1000][..]);
+        s.chunk(&[8; 10], 1);
+        assert_eq!(s.kept.get(7000, 1010)[1000..], [8; 10]);
     }
 
     fn take_all(r: &mut Recv, off: u64, p: &[u8], out: &mut Vec<u8>) -> u64 {

@@ -5,6 +5,13 @@
 // reading the echo back, every byte compared. It prints the time, the speed
 // and, with -pid, the entry's CPU per MiB sent (each MiB crosses the entry
 // twice: up and echoed down).
+//
+// With -proxy it is a cutter between an entry's stream members and the exit
+// (R1.4): every connection to -proxy is carried to -proxy-to, and every
+// -cut-every, from -cut-after on, the connection that carried most since
+// the last cut is cut: -cut rst closes both sides at once (the member's
+// socket fails), -cut freeze stops carrying it either way (the member goes
+// silent and dies by its stall; its sockets close a minute later).
 package main
 
 import (
@@ -19,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,9 +37,18 @@ func main() {
 	streams := flag.Int("streams", 1, "streams at once")
 	pid := flag.Int("pid", 0, "the entry's pid, for its CPU")
 	label := flag.String("label", "", "a label for the result line")
+	proxy := flag.String("proxy", "", "cut members: listen here")
+	proxyTo := flag.String("proxy-to", "127.0.0.1:20446", "cut members: the exit's member port")
+	cutAfter := flag.Duration("cut-after", 2*time.Second, "cut members: the first cut after this")
+	cutEvery := flag.Duration("cut-every", 3*time.Second, "cut members: a cut this often")
+	cutHow := flag.String("cut", "rst", "cut members: rst or freeze")
 	flag.Parse()
 	if *serve != "" {
 		echo(*serve)
+		return
+	}
+	if *proxy != "" {
+		cutter(*proxy, *proxyTo, *cutAfter, *cutEvery, *cutHow == "freeze")
 		return
 	}
 	cpu0 := cpu(*pid)
@@ -78,6 +95,101 @@ func echo(addr string) {
 			_, _ = io.Copy(c, c)
 			_ = c.(*net.TCPConn).CloseWrite()
 		}()
+	}
+}
+
+// pair is one member's connection through the cutter.
+type pair struct {
+	in, out *net.TCPConn
+	moved   atomic.Int64 // bytes carried since the last cut
+	frozen  atomic.Bool
+}
+
+func cutter(addr, to string, after, every time.Duration, freeze bool) {
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var mu sync.Mutex
+	pairs := map[*pair]struct{}{}
+	go func() {
+		time.Sleep(after)
+		for n := 1; ; n++ {
+			mu.Lock()
+			var best *pair
+			for p := range pairs {
+				if !p.frozen.Load() && (best == nil || p.moved.Load() > best.moved.Load()) {
+					best = p
+				}
+			}
+			for p := range pairs {
+				p.moved.Store(0)
+			}
+			if best != nil {
+				delete(pairs, best)
+			}
+			live := len(pairs)
+			mu.Unlock()
+			if best != nil {
+				if freeze {
+					best.frozen.Store(true)
+					time.AfterFunc(time.Minute, func() { best.in.Close(); best.out.Close() })
+				} else {
+					best.in.SetLinger(0)
+					best.out.SetLinger(0)
+					best.in.Close()
+					best.out.Close()
+				}
+				log.Printf("cut %d (%s), %d others", n, map[bool]string{true: "freeze", false: "rst"}[freeze], live)
+			}
+			time.Sleep(every)
+		}
+	}()
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			log.Fatal(err)
+		}
+		go func() {
+			x, err := net.Dial("tcp", to)
+			if err != nil {
+				c.Close()
+				return
+			}
+			p := &pair{in: c.(*net.TCPConn), out: x.(*net.TCPConn)}
+			mu.Lock()
+			pairs[p] = struct{}{}
+			mu.Unlock()
+			done := func() {
+				mu.Lock()
+				delete(pairs, p)
+				mu.Unlock()
+				if !p.frozen.Load() {
+					p.in.Close()
+					p.out.Close()
+				}
+			}
+			go func() { carry(p, p.out, p.in); done() }()
+			carry(p, p.in, p.out)
+			done()
+		}()
+	}
+}
+
+// carry copies src to dst until either fails or the pair is frozen.
+func carry(p *pair, dst, src *net.TCPConn) {
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 && !p.frozen.Load() {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			p.moved.Add(int64(n))
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 

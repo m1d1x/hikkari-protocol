@@ -114,9 +114,10 @@ pub struct StreamCounts {
     pub reset_peer: u64,
     /// Reset here: the client failed, or the stream had nothing to go on.
     pub reset_local: u64,
-    /// Reset because a member carrying its unconfirmed bytes died (R1.3
-    /// sends nothing again; R1.4 moves them to another member).
-    pub cut: u64,
+    /// Times a member died carrying a stream's unconfirmed open, chunks or
+    /// FIN (once per stream and death), and chunks sent again for it.
+    pub deaths: u64,
+    pub resent: u64,
     /// Client bytes numbered toward the exit, and written to clients.
     pub up: u64,
     pub down: u64,

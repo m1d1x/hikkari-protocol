@@ -26,9 +26,11 @@
 
 mod brain;
 mod data;
+mod death;
 mod tcp;
 mod timers;
 
+use std::collections::BTreeSet;
 use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
@@ -117,6 +119,9 @@ pub struct Pipe {
     streams: Streams,
     /// What acks of one read confirmed: (carrier, bytes), applied after it.
     released: Vec<(u32, u32)>,
+    /// Streams with things a dead member carried, waiting to go again, by id
+    /// (the order they were opened).
+    stranded: BTreeSet<u32>,
     /// Streams to end after the pass that found them done or failed.
     doomed: Vec<(usize, Why)>,
     poll: Poll,
@@ -158,6 +163,7 @@ impl Pipe {
             swires: Vec::new(),
             streams: Streams::new(),
             released: Vec::with_capacity(256),
+            stranded: BTreeSet::new(),
             doomed: Vec::with_capacity(64),
             poll: Poll::new(),
             slots: Vec::new(),
