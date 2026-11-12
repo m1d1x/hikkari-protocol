@@ -1,10 +1,11 @@
 # rust: Hikkari in Rust
 
-The trunk's protocol and the cascade entry's pipe. The Go side (`trunk`, `trunk/pipectl`) is the reference and the
-brain; how to write code here: [../STYLE.md](../STYLE.md).
+The trunk's protocol, the cascade entry's pipe and the exit's. The Go side (`trunk`, `trunk/pipectl`) is the reference
+and the brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r1.5-mixed` on `rust-r1.4-resend` (R1.5 both paths benched at once; R1.1 members' health, R1.2 datagrams whole, R1.3 clients' TCP
-streams, R1.4 what a dead member carried sent again, R3 the brain's socket); bench and tests only, not deployed. The
+Status: branch `rust-r1.6-exit` on `rust-r1.5-mixed` (R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
+members' health, R1.2 datagrams whole, R1.3 clients' TCP streams, R1.4 what a dead member carried sent again, R3 the
+brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
 `plans/research/2026-11-12-rust-pipe-*.md`.
 
@@ -15,9 +16,10 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 | `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
 | `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal. No sockets, no clock, no threads | the entry, an exit, the messenger |
 | `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
+| `exit` (`hikkari-exit`) | the exit's pipe: the entry's packet members, their sessions, flows to the loopback services, answers glued down; binary `hk-exit` | nothing |
 | `bench` (`hikkari-bench`) | the bench's users (`hk-loadgen`), `run.sh`, the Go entry and exit it measures against | nothing |
 
-`trunk` depends on no other crate here, `sys` on none, `pipe` on both. Inside `pipe`: `ctl` (the brain's messages),
+`trunk` depends on no other crate here, `sys` on none, `pipe` and `exit` on both. Inside `pipe`: `ctl` (the brain's messages),
 `flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `link` (stream members over TCP),
 `streams` (clients' connections as streams), `pipe/` (the loop: `brain`, `timers`, `data`, `tcp`).
 
@@ -134,6 +136,66 @@ the price of a user's packet (runs without a download) and the CPU a download ad
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/mixed.sh 3 30 "16 64" "go rust" "none rate flood"
 python3 bench/mixed_summary.py bench/out/results-mixed.txt
 ```
+
+## The exit (R1.6)
+
+`hk-exit` is the UDP half of the cascade exit, as `trunk.Exit` over `trunk/udpwire` is, one thread, no runtime, on the
+same loop as `hk-pipe` (a tick of 1 ms under traffic, `recvmmsg`/`sendmmsg`, nothing allocated per packet once a flow is
+open):
+
+- One socket per wire, a member per entry address (udpwire Listener). An address's first datagram that opens under one
+  of the wire's keys (the brain hands udpwire.Key of each trunk key, never the trunk key) makes it a peer; anything else
+  is dropped unanswered. A packet member's t2 hello joins it to the session its id names (made on the first such hello,
+  its epoch random), and is answered in kind with the session's epoch in a datagram of its own, every copy again. A
+  hello without the packet flag, or with the streams flag, gets no answer: stream members are R1.7.
+- Members' health is the entry's (`trunk/src/health.rs`, judged per session): a ping every 100 ms on the members' clock of
+  25 ms, a member owing past its stall dies while another member of its session proved the entry alive, every member
+  silent dies only after Quiet (30 s, `trunk.ExitQuiet`: the exit cannot open members and waits for the entry to), and
+  the exit's own pause (a turn more than 100 ms late) restarts every debt. A dead member is forgotten: a datagram from
+  its address later is a new peer, which must say its hello first (udpwire peer.Close). An address silent 2 minutes is
+  forgotten (udpwire PeerIdle), a session without members for 2 minutes ends with its flows (trunk SessionIdle).
+- A flow is a stream id of a session (trunk flows.go on the exit): its first datagram opens a UDP socket of its own to
+  127.0.0.1:port, if the brain opened the port to the trunk (the edge's trunkLocal.DialFlow), watched by epoll; port 0
+  is the trunk's call, answered straight back with no socket. Copies are dropped by the entry's seq in a window of 1024
+  (`trunk/src/flow.rs`). The answers go as the entry sends: on one member until a copy arrives, then on 2, on the
+  members the flow last came on while they are up, else on the session's members of the flow's wire, else any. A socket
+  that fails ends its flow; a flow unused 2 minutes ends.
+- Every frame bound for one member in a tick (answers, pongs, pings) is glued into one sealed datagram of up to about
+  1200 bytes, as the entry glues its way up; the Go exit sends a datagram per frame (`writePackets`). The entry's packet
+  members read a frame sequence per datagram, so nothing changes for them but the count of datagrams.
+
+The brain is the edge process (keys from the hub, the ports open to the trunk; later observation and generations); its
+side is `trunk/pipectl` `StartExit`, `Exit.SetWire` (the wire's socket by `SCM_RIGHTS`, its keys, stall, Quiet, glue),
+`Exit.SetPorts`, `Exit.Tick`. The messages are `exit/src/ctl.rs` (version 1), both sides hold the same golden bytes:
+
+| Message | What |
+| --- | --- |
+| brain `hello` | version |
+| brain `wire` | id, form (`udp`), glue window and size, members' stall (dead_ms), Quiet (quiet_ms), the wire keys; one socket |
+| brain `ports` | the loopback ports open to the trunk; replaces the set before |
+| exit `hello` | version, pid |
+| exit `tick` | once a second: its latest pause, pauses, the latest turn past due, sessions, members up, clients' flows; since the start members joined, buried by their stall, by Quiet, forgotten idle, the clients' datagrams sent, delivered, copies dropped, flows ended idle, datagrams refused (a port not open, a relay that refused), sealed datagrams in and out, frames out, bad, dropped |
+| exit `error` | a message it could not take |
+
+Left out on purpose: stream members and streams (R1.7), drain and generations (R4), `observe` (the relay's marks of a
+tester's flow, and the edge's tracking of each flow's connection), IPv6, the pool's Chromium wire (R2), the edge's own
+use of it (R5).
+
+Tests against the Go side, on the Go exit and the Rust exit alike (`trunk/pipectl`): the health scenarios with the pipe as
+the entry (`health_linux_test.go`) and with the Go entry (`exit_health_linux_test.go`: a member cut alone buried once at
+each end, a path held 700 ms buries nothing, a path cut ends the entry's members by Quiet while the exit keeps them, the
+exit's own pause buries nothing), datagrams counted as by the Go exit (`dgram_linux_test.go`), a port not open to the
+trunk answered nothing (`TestAPortNotOpenToTheTrunkGetsNothing`). `HK_EXIT` names the exit's binary as `HK_PIPE` names
+the entry's:
+
+```bash
+cargo build --release --target aarch64-unknown-linux-musl
+cp target/aarch64-unknown-linux-musl/release/hk-pipe target/aarch64-unknown-linux-musl/release/hk-exit bench/out/
+(cd ../trunk && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o ../rust/bench/out/pipectl.test ./pipectl)
+docker run --rm -v "$PWD/bench:/bench" -e HK_PIPE=/bench/out/hk-pipe -e HK_EXIT=/bench/out/hk-exit debian:bookworm-slim /bench/out/pipectl.test -test.v
+```
+
+The bench with the Rust exit: `EXIT=rust bench/run.sh ...` (the line adds the exit's CPU, `exit_cpu_pct`).
 
 ## Brain and pipe (R3)
 

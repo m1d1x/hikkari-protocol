@@ -83,8 +83,52 @@ pub fn hello_t2(out: &mut [u8], session: &[u8; 16], wire: u8) -> usize {
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0); // the entry has no epoch; byte 0 is its capabilities (none)
     out[29] = wire;
-    out[30] = 2; // kindPacket
+    out[30] = KIND_PACKET;
     31
+}
+
+/// A hello as read from the other end: its session id, the epoch it
+/// carries (the exit's; from the entry, its capabilities and zeros), and for
+/// a t2 hello its wire and flags (spec/trunk.md, "Wires").
+pub struct Hello {
+    pub session: [u8; 16],
+    pub epoch: [u8; 8],
+    /// None for t1: a pool member, carrying everything.
+    pub t2: Option<(u8, u8)>,
+}
+
+/// A t2 hello's flag: the member carries streams (trunk kindStreams).
+pub const KIND_STREAMS: u8 = 1;
+/// A t2 hello's flag: each frame in a datagram of its own (trunk kindPacket).
+pub const KIND_PACKET: u8 = 2;
+
+/// Reads the hello frame at `p[at..]` (next_frame said it is one).
+pub fn read_hello(p: &[u8], at: usize) -> Option<Hello> {
+    let b = at + 1;
+    let t2 = match p.get(b..b + 4)? {
+        b"HKT1" => None,
+        b"HKT2" => Some((*p.get(b + 28)?, *p.get(b + 29)?)),
+        _ => return None,
+    };
+    Some(Hello { session: p.get(b + 4..b + 20)?.try_into().ok()?, epoch: p[b + 20..b + 28].try_into().ok()?, t2 })
+}
+
+/// The exit's answer to a hello: the same session id, the exit's epoch, in
+/// kind (trunk appendHelloFor: t1 for a pool member, t2 with the same wire
+/// and flags for any other).
+pub fn put_hello(out: &mut [u8], session: &[u8; 16], epoch: &[u8; 8], t2: Option<(u8, u8)>) -> usize {
+    out[0] = F_HELLO;
+    out[1..5].copy_from_slice(if t2.is_some() { b"HKT2" } else { b"HKT1" });
+    out[5..21].copy_from_slice(session);
+    out[21..29].copy_from_slice(epoch);
+    match t2 {
+        Some((wire, flags)) => {
+            out[29] = wire;
+            out[30] = flags;
+            31
+        }
+        None => 29,
+    }
 }
 
 #[inline]
@@ -210,6 +254,28 @@ mod tests {
         }
         assert_eq!(seen, ["d7/1/443/abc", "p42", "d8/16909060/0/"]);
         assert!(next_frame(&b[..5], 0).is_none());
+    }
+
+    /// A hello read back as trunk wire.go's readFrame reads it, and the
+    /// exit's answer in kind as appendHelloFor writes it.
+    #[test]
+    fn hellos_read_and_answered_in_kind() {
+        let mut b = [0u8; 64];
+        let n = hello_t2(&mut b, &[7; 16], 2);
+        let (f, next) = next_frame(&b[..n], 0).unwrap();
+        assert!(matches!(f, Frame::Hello) && next == n);
+        let h = read_hello(&b[..n], 0).unwrap();
+        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [0; 8], Some((2, KIND_PACKET))));
+        let m = put_hello(&mut b, &h.session, &[9; 8], h.t2);
+        let go = [&[1u8][..], b"HKT2", &[7; 16], &[9; 8], &[2, 2]].concat();
+        assert_eq!(&b[..m], &go[..]);
+        let n = hello_t1(&mut b, &[5; 16]);
+        let h = read_hello(&b[..n], 0).unwrap();
+        assert!(h.t2.is_none());
+        assert_eq!(put_hello(&mut b, &h.session, &[1; 8], None), 29);
+        assert_eq!(&b[1..5], b"HKT1");
+        b[1] = b'X';
+        assert!(read_hello(&b[..29], 0).is_none(), "a hello of no trunk");
     }
 
     /// The bytes of trunk wire.go's appendOpen, appendData, appendAck,

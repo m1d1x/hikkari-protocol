@@ -129,6 +129,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hikkari-exit"
+version = "0.1.0"
+dependencies = [
+ "hikkari-sys",
+ "hikkari-trunk",
+ "libc",
+]
+
+[[package]]
 name = "hikkari-pipe"
 version = "0.1.0"
 dependencies = [

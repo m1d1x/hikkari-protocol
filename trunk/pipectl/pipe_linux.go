@@ -9,7 +9,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
-	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -96,28 +95,9 @@ func Start(cfg Config) (*Pipe, error) {
 	if cfg.Spread == 0 {
 		cfg.Spread = time.Second
 	}
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	cmd, conn, err := spawn(cfg.Bin, append([]string{"--ctl-fd", "3"}, cfg.Args...), cfg.Stderr)
 	if err != nil {
-		return nil, fmt.Errorf("pipectl: socketpair: %w", err)
-	}
-	mine := os.NewFile(uintptr(fds[0]), "pipectl-brain")
-	theirs := os.NewFile(uintptr(fds[1]), "pipectl-pipe")
-	defer theirs.Close()
-	fc, err := net.FileConn(mine)
-	mine.Close()
-	if err != nil {
-		return nil, fmt.Errorf("pipectl: %w", err)
-	}
-	conn := fc.(*net.UnixConn)
-	_ = conn.SetReadBuffer(4 << 20)
-	_ = conn.SetWriteBuffer(4 << 20)
-	cmd := exec.Command(cfg.Bin, append([]string{"--ctl-fd", "3"}, cfg.Args...)...)
-	cmd.ExtraFiles = []*os.File{theirs}
-	cmd.Stderr = cfg.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-	if err := cmd.Start(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("pipectl: %w", err)
+		return nil, err
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
 		listens: map[byte]*net.UDPConn{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{})}
@@ -166,42 +146,7 @@ func (p *Pipe) Done() <-chan struct{} { return p.done }
 
 // send writes one message with the sockets of conns.
 func (p *Pipe) send(msg []byte, conns ...*net.UDPConn) error {
-	var fds []int
-	var raws []syscall.RawConn
-	for _, c := range conns {
-		rc, err := c.SyscallConn()
-		if err != nil {
-			return err
-		}
-		raws = append(raws, rc)
-	}
-	// The descriptors stay the brain's: the kernel copies them into the
-	// message, and the pipe gets descriptors of its own.
-	var werr error
-	var hold func(i int)
-	hold = func(i int) {
-		if i == len(raws) {
-			p.wmu.Lock()
-			defer p.wmu.Unlock()
-			var oob []byte
-			if len(fds) > 0 {
-				oob = syscall.UnixRights(fds...)
-			}
-			_, _, werr = p.conn.WriteMsgUnix(msg, oob, nil)
-			return
-		}
-		if err := raws[i].Control(func(fd uintptr) {
-			fds = append(fds, int(fd))
-			hold(i + 1)
-		}); err != nil {
-			werr = err
-		}
-	}
-	hold(0)
-	if werr != nil {
-		return fmt.Errorf("pipectl: %w", werr)
-	}
-	return nil
+	return sendWith(p.conn, &p.wmu, msg, conns...)
 }
 
 // Listen gives the pipe a client port: its datagrams are flows of class,

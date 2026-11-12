@@ -2,7 +2,7 @@
 # and the cascade entry's pipe. The Go side is the reference and the brain.
 [workspace]
 resolver = "2"
-members = ["sys", "trunk", "pipe", "bench"]
+members = ["sys", "trunk", "pipe", "exit", "bench"]
 
 [workspace.package]
 version = "0.1.0"

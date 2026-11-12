@@ -1,0 +1,12 @@
+[package]
+name = "hikkari-exit"
+description = "The cascade exit's pipe: every packet the exit carries for the entry's members, run by the Go brain (trunk/pipectl)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+hikkari-sys.workspace = true
+hikkari-trunk.workspace = true

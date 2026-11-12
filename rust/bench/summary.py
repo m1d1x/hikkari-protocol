@@ -9,14 +9,17 @@ for line in open(sys.argv[1] if len(sys.argv) > 1 else "bench/out/results.txt"):
         continue
     impl = kv["label"].split("#")[0]
     rows[(impl, int(kv["users"]))].append(kv)
-keys = ["us_per_pkt", "us_per_user_dgram", "cpu_pct", "gaps60_per_min", "gaps150_per_min", "gap_max_ms", "rtt_p50_ms", "rtt_p99_ms"]
+keys = ["us_per_pkt", "us_per_user_dgram", "cpu_pct", "exit_cpu_pct", "gaps60_per_min", "gaps150_per_min", "gap_max_ms", "rtt_p50_ms", "rtt_p99_ms"]
 print("| impl | users | n | pkt/s | " + " | ".join(keys) + " | lost voice/game/ack |")
 print("|" + "---|" * (len(keys) + 5))
 for (impl, u) in sorted(rows, key=lambda k: (k[1], k[0])):
     rs = rows[(impl, u)]
     cells = []
     for k in keys:
-        v = [float(r[k]) for r in rs]
+        v = [float(r[k]) for r in rs if k in r]
+        if not v:
+            cells.append("-")
+            continue
         cells.append(f"{statistics.median(v):.2f} ({min(v):.2f}–{max(v):.2f})" if len(v) > 1 else f"{v[0]:.2f}")
     lost = []
     for k in ("voice", "game", "ack"):

@@ -392,3 +392,89 @@ impl SeqPacket {
         true
     }
 }
+
+/// Readiness of many sockets by epoll, read without waiting: what a loop on
+/// a tick asks once per turn, when the sockets are too many to read each
+/// one (the exit's sockets to its relay, one per flow). Level-triggered: a
+/// socket not read to its end is ready again on the next turn.
+pub struct Epoll {
+    pub fd: i32,
+    ev: Vec<libc::epoll_event>,
+}
+
+impl Epoll {
+    /// An epoll set that reports up to `max` ready sockets per wait.
+    pub fn new(max: usize) -> io::Result<Epoll> {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Epoll { fd, ev: vec![libc::epoll_event { events: 0, u64: 0 }; max.max(1)] })
+    }
+
+    /// Watches fd for reading; `data` comes back with it when it is ready.
+    pub fn add(&self, fd: i32, data: u64) -> io::Result<()> {
+        let mut e = libc::epoll_event { events: libc::EPOLLIN as u32, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut e) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Stops watching fd (before it is closed).
+    pub fn del(&self, fd: i32) {
+        unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+    }
+
+    /// The sockets ready now, without waiting: how many; data(i) says which.
+    pub fn ready(&mut self) -> usize {
+        let n = unsafe { libc::epoll_wait(self.fd, self.ev.as_mut_ptr(), self.ev.len() as _, 0) };
+        n.max(0) as usize
+    }
+
+    #[inline]
+    pub fn data(&self, i: usize) -> u64 {
+        self.ev[i].u64
+    }
+}
+
+impl Drop for Epoll {
+    fn drop(&mut self) {
+        close_fd(self.fd);
+    }
+}
+
+/// A UDP socket of its own to 127.0.0.1:port, non-blocking: a flow's way to
+/// a loopback service (trunk Local.DialFlow), the service seeing one source
+/// port per flow as from the Go exit.
+pub fn udp_to_loopback(port: u16) -> io::Result<UdpSocket> {
+    let s = UdpSocket::bind("127.0.0.1:0")?;
+    s.connect(("127.0.0.1", port))?;
+    s.set_nonblocking(true)?;
+    let buf: libc::c_int = 1 << 20;
+    unsafe {
+        libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF, &buf as *const _ as *const _, 4);
+    }
+    Ok(s)
+}
+
+/// One datagram on a connected socket without waiting; false when the
+/// socket refused it (its buffer full, or the service gone).
+pub fn send_nowait(fd: i32, b: &[u8]) -> bool {
+    unsafe { libc::send(fd, b.as_ptr() as *const _, b.len(), libc::MSG_DONTWAIT) >= 0 }
+}
+
+/// One datagram from fd without waiting: Ok(Some(n)), Ok(None) for none
+/// now, Err when the socket failed (on a connected socket: the service
+/// behind it is gone, as an ICMP port unreachable tells).
+pub fn recv_dgram(fd: i32, buf: &mut [u8]) -> io::Result<Option<usize>> {
+    let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), libc::MSG_DONTWAIT) };
+    if n >= 0 {
+        return Ok(Some(n as usize));
+    }
+    let e = io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(None),
+        _ => Err(e),
+    }
+}

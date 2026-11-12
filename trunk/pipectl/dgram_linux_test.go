@@ -16,8 +16,8 @@ import (
 	"github.com/m1d1x/hikkari-protocol/trunk/udpwire"
 )
 
-// Datagrams of the pipe against the Go exit, each scenario run through the
-// Go entry as well (R1.2, hikkari-client
+// Datagrams of the pipe against each exit (the Go exit, and the Rust exit's
+// pipe of R1.6), each scenario run through the Go entry as well (R1.2, hikkari-client
 // plans/2026-11-11-entry-hot-path-and-unit-economics.md, «Труба на Rust»):
 // copies 1 and 2, copies dropped by seq at both ends (spec/trunk.md,
 // "Datagrams"), and a client's flow ended unused. The Go entry is what the
@@ -27,48 +27,47 @@ import (
 const dgramWire trunk.WireID = 2
 
 // dgramEntry is either entry under test: a client port in front of it, the
-// trunk's counts of its clients' datagrams, and the Go exit behind it.
+// trunk's counts of its clients' datagrams, and the exit behind it.
 type dgramEntry struct {
 	name   string
 	client netip.AddrPort
-	exit   *trunk.Exit
+	exit   testExit
 	counts func() (flows int, out, in, copies, idle int64)
 }
 
 // entries are both entries under test, the reference first.
 var entries = []struct {
 	name string
-	mk   func(*testing.T, context.Context, int, time.Duration) *dgramEntry
+	mk   func(*testing.T, context.Context, exitMaker, int, time.Duration) *dgramEntry
 }{{"go", goEntry}, {"pipe", pipeEntry}}
 
-// onEach runs f on a stand of each entry, in a subtest of its own: its
-// pipe, its exit and its sockets end with it.
+type exitMaker = func(*testing.T, context.Context, ...uint16) testExit
+
+// onEach runs f on a stand of each entry before each exit, in a subtest of
+// its own: its pipes, its exit and its sockets end with it.
 func onEach(t *testing.T, name string, copies int, idle time.Duration, f func(*testing.T, *dgramEntry)) {
-	for _, en := range entries {
-		t.Run(name+"/"+en.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			t.Cleanup(cancel)
-			f(t, en.mk(t, ctx, copies, idle))
-		})
+	for _, x := range exits {
+		for _, en := range entries {
+			t.Run(name+"/"+en.name+"/"+x.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				t.Cleanup(cancel)
+				f(t, en.mk(t, ctx, x.mk, copies, idle))
+			})
+		}
 	}
 }
 
-// newDgramExit is a Go exit over the udp wire, the relay behind it an echo.
-func newDgramExit(t *testing.T, ctx context.Context) (*trunk.Exit, netip.AddrPort, uint16) {
-	x := trunk.NewExit(trunk.Config{}, local{})
-	go x.Run(ctx)
-	l, err := udpwire.Listen("127.0.0.1:0", []string{testKey}, func(c io.ReadWriteCloser) { _ = x.ServeMember(c) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { l.Close() })
-	return x, l.Addr(), udpEcho(t)
+// newDgramExit is an exit over the udp wire, the relay behind it an echo.
+func newDgramExit(t *testing.T, ctx context.Context, mk exitMaker) (testExit, netip.AddrPort, uint16) {
+	echo := udpEcho(t)
+	x := mk(t, ctx, echo)
+	return x, x.addr(), echo
 }
 
 // pipeEntry: the pipe under this brain, one udp wire of 2 members, a
 // client port of `copies` copies; flows unused for idle end.
-func pipeEntry(t *testing.T, ctx context.Context, copies int, idle time.Duration) *dgramEntry {
-	x, wire, echo := newDgramExit(t, ctx)
+func pipeEntry(t *testing.T, ctx context.Context, mk exitMaker, copies int, idle time.Duration) *dgramEntry {
+	x, wire, echo := newDgramExit(t, ctx, mk)
 	var args []string
 	if idle > 0 {
 		args = []string{"--flow-idle-ms", strconv.Itoa(int(idle / time.Millisecond))}
@@ -99,21 +98,9 @@ func pipeEntry(t *testing.T, ctx context.Context, copies int, idle time.Duration
 
 // goEntry: the Go entry the same way, its one pool member a plain pipe to
 // the exit (the pool carries no datagram here: the route is the udp wire).
-func goEntry(t *testing.T, ctx context.Context, copies int, idle time.Duration) *dgramEntry {
-	x, wire, echo := newDgramExit(t, ctx)
-	ports, err := trunk.NewPortBook(20000, 30000, time.Minute)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pool := func(ctx context.Context, _ int) (io.ReadWriteCloser, error) {
-		a, b := net.Pipe()
-		go func() { _ = x.ServeMember(b) }()
-		return a, nil
-	}
-	e, err := trunk.NewEntry(trunk.Config{FlowIdle: idle}, 1, pool, ports, t.Logf)
-	if err != nil {
-		t.Fatal(err)
-	}
+func goEntry(t *testing.T, ctx context.Context, mk exitMaker, copies int, idle time.Duration) *dgramEntry {
+	x, wire, echo := newDgramExit(t, ctx, mk)
+	e := newGoEntry(t, idle)
 	if err := e.AddWire(trunk.Wire{ID: dgramWire, Name: "udp", Shape: "random", Members: 2, Packet: true,
 		Dial: udpwire.Dialer{Exit: wire, Key: testKey}.Dial}); err != nil {
 		t.Fatal(err)
@@ -132,6 +119,25 @@ func goEntry(t *testing.T, ctx context.Context, copies int, idle time.Duration) 
 			st := e.Session().Stats()
 			return st.Flows, st.DgramsOut, st.DgramsIn, st.DgramsCopy, -1 // Stats has no idle count
 		}}
+}
+
+// newGoEntry is the Go entry the tests add their udp wire to. Its pool
+// never comes up: the Rust exit serves no stream member yet (R1.7), and the
+// datagrams go on the udp wire, the route of both classes.
+func newGoEntry(t *testing.T, idle time.Duration) *trunk.Entry {
+	ports, err := trunk.NewPortBook(20000, 30000, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := func(ctx context.Context, _ int) (io.ReadWriteCloser, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	e, err := trunk.NewEntry(trunk.Config{FlowIdle: idle}, 1, pool, ports, t.Logf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 // serveGoPort is trunkentry's udpPort: a flow per client address, opened on
@@ -227,7 +233,8 @@ func (b *burst) answers() (once, twice int) {
 // datagram on one member, no copy at either end. Two: each on both members;
 // the exit drops one of every two and, once a copy came, answers on two as
 // well, so the entry drops the copies of nearly every answer. The client
-// hears each datagram once, and the pipe counts what the Go entry counts.
+// hears each datagram once, and the pipe counts what the Go entry counts,
+// the Rust exit what the Go exit counts.
 func TestCopiesAreCountedAndDroppedAsByTheGoEntry(t *testing.T) {
 	const n = 200
 	for _, copies := range []int{1, 2} {
@@ -248,8 +255,7 @@ func TestCopiesAreCountedAndDroppedAsByTheGoEntry(t *testing.T) {
 				r.flows, r.out, r.in, r.cp, _ = e.counts()
 				return r.in == n
 			})
-			_, xs := e.exit.Stats()
-			r.xin, r.xcopy = xs.DgramsIn, xs.DgramsCopy
+			_, r.xin, r.xcopy = e.exit.counts()
 			t.Logf("%s copies %d: flows %d, out %d, in %d, copies dropped %d; exit: relayed %d, copies dropped %d",
 				e.name, copies, r.flows, r.out, r.in, r.cp, r.xin, r.xcopy)
 			if r.flows != 1 || r.out != n || r.xin != n {
@@ -269,11 +275,12 @@ func TestCopiesAreCountedAndDroppedAsByTheGoEntry(t *testing.T) {
 			}
 			rows = append(rows, r)
 		})
-		if len(rows) != 2 {
-			continue
-		}
-		if g, p := rows[0], rows[1]; g.out != p.out || g.in != p.in || g.xin != p.xin || g.xcopy != p.xcopy || absDiff(g.cp, p.cp) > 2 {
-			t.Errorf("copies %d: the pipe counts %+v, the Go entry %+v", copies, p, g)
+		// The Go entry before the Go exit is the reference for every other
+		// pair (a pair skipped for a pipe not built is missing).
+		for i := 1; i < len(rows); i++ {
+			if g, p := rows[0], rows[i]; g.out != p.out || g.in != p.in || g.xin != p.xin || g.xcopy != p.xcopy || absDiff(g.cp, p.cp) > 2 {
+				t.Errorf("copies %d: pair %d counts %+v, the Go entry before the Go exit %+v", copies, i, p, g)
+			}
 		}
 	}
 }
@@ -288,7 +295,8 @@ func absDiff(a, b int64) int64 {
 // TestAClientsFlowUnusedEndsAndItsNextDatagramOpensANewOne: a client's flow
 // ends after FlowIdle unused (1 s here, 2 minutes in the trunk); the next
 // datagram from the same address opens a new flow, a new stream id at the
-// exit, and is answered as the first one was. The Go entry the same.
+// exit, and is answered as the first one was. The Go entry the same, before
+// either exit.
 func TestAClientsFlowUnusedEndsAndItsNextDatagramOpensANewOne(t *testing.T) {
 	onEach(t, "idle", 1, time.Second, func(t *testing.T, e *dgramEntry) {
 		b := newBurst(t, e.client)
@@ -311,11 +319,11 @@ func TestAClientsFlowUnusedEndsAndItsNextDatagramOpensANewOne(t *testing.T) {
 			_, out, in, _, _ := e.counts()
 			return out == 40 && in == 40
 		})
-		_, xs := e.exit.Stats()
+		xflows, _, _ := e.exit.counts()
 		f, out, in, _, _ := e.counts()
-		t.Logf("%s: flows %d, out %d, in %d; exit flows %d (its own idle is 2 min)", e.name, f, out, in, xs.Flows)
-		if f != 1 || xs.Flows != 2 {
-			t.Errorf("%s: %d flows at the entry, %d at the exit; want 1 and 2 (a new stream id for the address)", e.name, f, xs.Flows)
+		t.Logf("%s: flows %d, out %d, in %d; exit flows %d (its own idle is 2 min)", e.name, f, out, in, xflows)
+		if f != 1 || xflows != 2 {
+			t.Errorf("%s: %d flows at the entry, %d at the exit; want 1 and 2 (a new stream id for the address)", e.name, f, xflows)
 		}
 	})
 }
