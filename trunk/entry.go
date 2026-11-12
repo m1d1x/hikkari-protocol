@@ -478,7 +478,12 @@ func (e *Entry) slot(ctx context.Context, g *generation, w Wire, n int) {
 				backoff *= 2
 			}
 		}
-		port, release := w.Ports.Take()
+		port, release, err := w.Ports.Take()
+		if err != nil {
+			e.logf("trunk: %s: %v", name, err)
+			grow()
+			continue
+		}
 		conn, err := w.Dial(ctx, port)
 		if err != nil {
 			release()
@@ -602,71 +607,3 @@ func exchangeHello(conn io.ReadWriteCloser, id SessionID, observe bool, k member
 
 // helloAgain is how often a packet member says its hello until answered.
 var helloAgain = 250 * time.Millisecond
-
-// PortBook hands out source ports for members and remembers the ones the
-// path killed. A flow killed by source port dies again on that port (the
-// same verdict 62 s later, plans/2026-11-02-tcp-flow-loss.md), so a dead port
-// is not offered again for DeadFor.
-type PortBook struct {
-	lo, hi  int
-	deadFor time.Duration
-
-	mu    sync.Mutex
-	dead  map[int]time.Time
-	inUse map[int]bool
-	kills int64
-}
-
-// DefaultDeadFor is how long a killed port stays out of use.
-const DefaultDeadFor = time.Hour
-
-// NewPortBook offers ports in [lo, hi].
-func NewPortBook(lo, hi int, deadFor time.Duration) (*PortBook, error) {
-	if lo < 1024 || hi > 65535 || hi-lo < 256 {
-		return nil, fmt.Errorf("trunk: source ports %d-%d: need at least 256 above 1023", lo, hi)
-	}
-	if deadFor <= 0 {
-		deadFor = DefaultDeadFor
-	}
-	return &PortBook{lo: lo, hi: hi, deadFor: deadFor, dead: map[int]time.Time{}, inUse: map[int]bool{}}, nil
-}
-
-// Take picks a port neither dead nor in use; release gives it back.
-func (b *PortBook) Take() (int, func()) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := time.Now()
-	for port, at := range b.dead {
-		if now.Sub(at) > b.deadFor {
-			delete(b.dead, port)
-		}
-	}
-	span := int64(b.hi - b.lo + 1)
-	for {
-		n, _ := rand.Int(rand.Reader, big.NewInt(span))
-		port := b.lo + int(n.Int64())
-		if _, d := b.dead[port]; d || b.inUse[port] {
-			continue
-		}
-		b.inUse[port] = true
-		var once sync.Once
-		return port, func() {
-			once.Do(func() { b.mu.Lock(); delete(b.inUse, port); b.mu.Unlock() })
-		}
-	}
-}
-
-// Dead marks a port the path killed.
-func (b *PortBook) Dead(port int) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.dead[port] = time.Now()
-	b.kills++
-}
-
-// Counts says how many ports are out of use now and how many kills it saw.
-func (b *PortBook) Counts() (dead int, kills int64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.dead), b.kills
-}
