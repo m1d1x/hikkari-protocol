@@ -3,4 +3,8 @@
 
 pub mod wire;
 #[cfg(target_os = "linux")]
+pub mod ctl;
+#[cfg(target_os = "linux")]
+pub mod pipe;
+#[cfg(target_os = "linux")]
 pub mod sys;

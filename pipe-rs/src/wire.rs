@@ -109,6 +109,15 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
     }
 }
 
+/// The wire's key for a trunk key: HKDF-SHA256(trunk key, "hikkari trunk
+/// udp wire"), as udpwire.Key.
+pub fn key(trunk_key: &str) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, trunk_key.as_bytes());
+    let mut k = [0u8; 32];
+    hk.expand(b"hikkari trunk udp wire", &mut k).expect("hkdf 32");
+    k
+}
+
 /// The wire's cipher: AES-256-GCM under HKDF-SHA256(trunk key, "hikkari
 /// trunk udp wire"), as trunk/udpwire. The nonce is a random prefix and a
 /// counter, not 12 random bytes per datagram as udpwire draws: unique per
@@ -121,10 +130,12 @@ pub struct Seal {
 
 impl Seal {
     pub fn new(trunk_key: &str, prefix: [u8; 4]) -> Seal {
-        let hk = Hkdf::<Sha256>::new(None, trunk_key.as_bytes());
-        let mut k = [0u8; 32];
-        hk.expand(b"hikkari trunk udp wire", &mut k).expect("hkdf 32");
-        Seal { aead: Aes256Gcm::new_from_slice(&k).expect("key"), prefix, ctr: 0 }
+        Seal::from_key(&key(trunk_key), prefix)
+    }
+
+    /// The seal under the wire's key itself (key), as the brain hands it.
+    pub fn from_key(k: &[u8; 32], prefix: [u8; 4]) -> Seal {
+        Seal { aead: Aes256Gcm::new_from_slice(k).expect("key"), prefix, ctr: 0 }
     }
 
     /// Seals in place: `buf[12..12 + n]` holds the plaintext; writes the

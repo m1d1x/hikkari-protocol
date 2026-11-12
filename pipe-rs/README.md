@@ -1,6 +1,6 @@
 # pipe-rs: the entry's pipe in Rust (prototype)
 
-Status: prototype on branch `rust-pipe-proto`, bench only. Not deployed, not for `main`. The question and the numbers:
+Status: prototype on branch `rust-pipe-proto`, the brain's socket (R2) on `pipe-ctl`; bench and tests only. Not deployed, not for `main`. The question and the numbers:
 hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
 «Труба на Rust».
 
@@ -21,8 +21,8 @@ hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2
 - A member speaks the t2 hello of a packet member (wire 2, flags packet), says it again every 250 ms until answered, pings
   every 100 ms and answers the exit's pings.
 
-Left out on purpose: streams (TCP) and the pool, other wires, the selector, the trunk's calls, drains and generations,
-observation, flow idle ends, IPv6, GSO on send (the glued datagrams differ in size; answers go to different clients).
+Left out on purpose: streams (TCP) and the pool, wires other than `udp`, drains and generations, observation, flow idle
+ends, IPv6, GSO on send (the glued datagrams differ in size; answers go to different clients).
 
 `hk-loadgen` is the bench's users (cascade-load-v1 per user: voice 50/s, game 200/s, acks 125/s, in the sizes the entry's
 capture saw). `bench/go` holds the Go side: `goentry` (the production entry's UDP path over `trunk` and `udpwire`) and
@@ -41,31 +41,48 @@ docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/run.sh 3 30 "
 The entry runs on CPUs 0–1 (`taskset`), the users and the exit on CPUs of their own; `hk-loadgen` reads the entry's CPU
 from `/proc/<pid>/stat` at the start and the end of its window.
 
-## Brain and pipe (interface, not built)
+## Brain and pipe (R2)
 
-The brain is the Go entry as it is (selector, the trunk's calls and downloads, knobs from the hub, minute lines,
-generations); the pipe carries every packet. One local `SOCK_SEQPACKET` socket between them, one message per datagram,
-and the brain owns the sockets.
+The brain is the Go entry (selector, the trunk's calls and downloads, knobs from the hub, minute lines, generations);
+the pipe carries every packet. One local `SOCK_SEQPACKET` socket between them, one message per datagram, and the brain
+owns the sockets: it binds them and passes them with the message that uses them by `SCM_RIGHTS`, so a reload can hand
+the same sockets to the next pipe (R3). The brain's side is `trunk/pipectl`: it starts `hk-pipe --ctl-fd 3` on its end
+of a socketpair, and its `Pipe` is a `trunk.Steered` (the selector reads the wires from the pipe's ticks and sets the
+route, `trunk.SteerOn`) and a `trunk.CallCarrier` (the trunk's call on each wire runs through the pipe as a client's
+datagrams do, `trunk.RunCallOn`). The messages are `src/ctl.rs`; integers little-endian; both sides test the same golden
+bytes.
 
 Brain → pipe:
 
 | Message | What |
 | --- | --- |
-| `sockets` | the listened client ports and the wires' member sockets, by `SCM_RIGHTS`: the brain binds them, so a reload hands the same sockets to the next generation as today |
-| `wires` | each wire: id, form (`udp`, later `quic`, `h3`), members, the exit, the key's derived cipher key, glue window and size |
-| `route` | the wire of each class (voice, bulk) and the one kept warm; the pipe moves the next datagram, nothing to migrate |
-| `pin` | a flow held to one wire (the brain's own call on a wire) |
-| `ceiling` | later: a limit per flow or per client address |
-| `drain` | stop taking new client addresses, hand them over (the generations of 2.2б) |
+| `hello` | version |
+| `listen` | a client port (one socket): id, class (bulk, voice), the exit's loopback port, copies |
+| `wire` | a wire and its members (one connected socket each): id, form (`udp`; later `quic`, `h3`), glue window and size, how long a member may owe an answer before it is down, the wire's own key (udpwire.Key of the trunk key: the pipe never sees the trunk key) |
+| `unwire` | a wire taken away; its flows go on by the route |
+| `route` | the wire of each class; the pipe moves the next datagram, nothing to migrate: the exit answers a flow on the wire the entry last sent it on |
+| `open`, `dgram`, `close` | a flow of the brain's own (its call on a wire, pinned: dropped while the wire has no member up) and its datagrams |
+| `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer |
 
 Pipe → brain:
 
 | Message | What |
 | --- | --- |
-| `tick` | once a second per wire and member: up, owed since, last proof, round trip of pings, packets and bytes each way, frames per datagram, drops; and the pipe's own late ticks (`entry_paused` comes from here) |
-| `member` | a member up or dead, and why |
-| `observe` | an exit's `observe` frame, passed up as it came; the pipe counts a marked flow and reports it at its end |
-| `flow` | a flow opened or ended (count only; no address leaves the pipe, as no address leaves the entry today) |
+| `hello` | version, pid |
+| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms past due), pauses, the latest turn in the second, flows; per wire members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
+| `member` | a member up (hello answered) or down (owed past the wire's limit) |
+| `dgram` | an answer on a brain's flow |
+| `error` | a message the pipe could not take |
 
-The trunk's call stays in the brain: 50 datagrams a second over the socket are nothing, and the call then hears the pipe
-the way a client does. What the brain decides a second at a time never sits in the path of a packet.
+Left for later: `drain` and generations (R3), `ceiling`, `observe` (the exit's marks of a tester's flow), flow idle
+ends, IPv6, the forms other than `udp` (R4) and streams with the pool (R5). The pipe passes over a wire with no member
+up for any wire that has one, as `trunk.Route` does, before the selector moves the route.
+
+The test of the whole loop (a Go exit, two `udp` wires to it through cutters, the selector over the pipe's ticks, four
+clients calling): `trunk/pipectl` `TestTheSelectorMovesVoiceOffACutWire`, run on Linux with the pipe built:
+
+```bash
+cargo build --release --target aarch64-unknown-linux-musl && cp target/aarch64-unknown-linux-musl/release/hk-pipe bench/out/
+(cd ../trunk && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o ../pipe-rs/bench/out/pipectl.test ./pipectl)
+docker run --rm -v "$PWD/bench:/bench" -e HK_PIPE=/bench/out/hk-pipe debian:bookworm-slim /bench/out/pipectl.test -test.v
+```

@@ -203,25 +203,52 @@ impl SendBatch {
     }
 }
 
-/// Waits for any of fds to be readable, at most `timeout_ns`; returns the
-/// revents bits (bit i: fds[i] readable).
-pub fn wait(fds: &[i32], timeout_ns: u64) -> u64 {
-    let mut p = [libc::pollfd { fd: -1, events: 0, revents: 0 }; 8];
-    for (i, &fd) in fds.iter().enumerate() {
-        p[i] = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+/// Readiness of a set of sockets by ppoll: the set is rebuilt when the
+/// sockets change, not per wait.
+pub struct Poll {
+    pub fds: Vec<libc::pollfd>,
+}
+
+impl Poll {
+    pub fn new() -> Poll {
+        Poll { fds: Vec::new() }
     }
-    let ts = libc::timespec { tv_sec: (timeout_ns / 1_000_000_000) as _, tv_nsec: (timeout_ns % 1_000_000_000) as _ };
-    let r = unsafe { libc::ppoll(p.as_mut_ptr(), fds.len() as _, &ts, std::ptr::null()) };
-    if r <= 0 {
-        return 0;
+
+    pub fn set(&mut self, fds: impl Iterator<Item = i32>) {
+        self.fds.clear();
+        self.fds.extend(fds.map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 }));
     }
-    let mut bits = 0;
-    for i in 0..fds.len() {
-        if p[i].revents & libc::POLLIN != 0 {
-            bits |= 1 << i;
+
+    /// Waits for any of the set to be readable, at most `timeout_ns`;
+    /// whether one is (readable(i) says which).
+    pub fn wait(&mut self, timeout_ns: u64) -> bool {
+        for p in self.fds.iter_mut() {
+            p.revents = 0;
+        }
+        let ts = libc::timespec { tv_sec: (timeout_ns / 1_000_000_000) as _, tv_nsec: (timeout_ns % 1_000_000_000) as _ };
+        let r = unsafe { libc::ppoll(self.fds.as_mut_ptr(), self.fds.len() as _, &ts, std::ptr::null()) };
+        r > 0
+    }
+
+    /// Marks every socket readable: on a tick the pipe reads them all.
+    pub fn all(&mut self) {
+        for p in self.fds.iter_mut() {
+            p.revents = libc::POLLIN;
         }
     }
-    bits
+
+    #[inline]
+    pub fn readable(&self, i: usize) -> bool {
+        self.fds[i].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+    }
+}
+
+/// A UDP socket from a descriptor the brain passed, non-blocking.
+pub fn udp_from_fd(fd: i32) -> io::Result<UdpSocket> {
+    use std::os::fd::FromRawFd;
+    let s = unsafe { UdpSocket::from_raw_fd(fd) };
+    s.set_nonblocking(true)?;
+    Ok(s)
 }
 
 /// The CPU time a process has had, all its threads, in ns: user and
