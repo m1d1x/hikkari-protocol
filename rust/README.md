@@ -1,8 +1,24 @@
-# pipe-rs: the entry's pipe in Rust (prototype)
+# rust: Hikkari in Rust
 
-Status: prototype on branch `rust-pipe-proto`, the brain's socket (R2) on `pipe-ctl`; bench and tests only. Not deployed, not for `main`. The question and the numbers:
-hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
-«Труба на Rust».
+The trunk's protocol and the cascade entry's pipe. The Go side (`trunk`, `trunk/pipectl`) is the reference and the
+brain; how to write code here: [../STYLE.md](../STYLE.md).
+
+Status: branch `rust-pipe-r1` (R1.1 members' health, R3 the brain's socket); bench and tests only, not deployed. The
+plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
+`plans/research/2026-11-12-rust-pipe-*.md`.
+
+## Layout
+
+| Crate | What | Who may depend on it |
+| --- | --- | --- |
+| `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
+| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, the `udp` wire's seal. No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
+| `bench` (`hikkari-bench`) | the bench's users (`hk-loadgen`), `run.sh`, the Go entry and exit it measures against | nothing |
+
+`trunk` depends on no other crate here, `sys` on none, `pipe` on both. Inside `pipe`: `ctl` (the brain's messages),
+`flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `pipe/` (the loop: `brain`, `timers`,
+`data`).
 
 ## What it is
 
@@ -20,7 +36,7 @@ hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2
   are sent straight out of the receive buffer. UDP GRO is on for the client socket.
 - A member speaks the t2 hello of a packet member (wire 2, flags packet), says it again every 250 ms until answered, pings
   every 100 ms and answers the exit's pings.
-- Members' health is `spec/trunk.md` as the Go session judges it (`src/health.rs`, any wire's members, on the members'
+- Members' health is `spec/trunk.md` as the Go session judges it (`trunk/src/health.rs`, any wire's members, on the members'
   clock of 25 ms as Go's tick): a member owing a pong past max(Stall, 4 × smoothed RTT) + 100 ms dies only while another
   member, of any wire, proved the exit alive after its debt began (`why` silent); every member silent at once dies only
   after Quiet, 1 s (`why` quiet); a turn of the loop more than 100 ms after the one before is the pipe's own pause, and
@@ -39,6 +55,7 @@ capture saw). `bench/go` holds the Go side: `goentry` (the production entry's UD
 ## Build and bench
 
 ```bash
+cargo clippy --all-targets && cargo test          # on the mac: trunk and ctl; the rest builds to a stub
 rustup target add aarch64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 cp target/aarch64-unknown-linux-musl/release/hk-pipe target/aarch64-unknown-linux-musl/release/hk-loadgen bench/out/
@@ -49,7 +66,7 @@ docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/run.sh 3 30 "
 The entry runs on CPUs 0–1 (`taskset`), the users and the exit on CPUs of their own; `hk-loadgen` reads the entry's CPU
 from `/proc/<pid>/stat` at the start and the end of its window.
 
-## Brain and pipe (R2)
+## Brain and pipe (R3)
 
 The brain is the Go entry (selector, the trunk's calls and downloads, knobs from the hub, minute lines, generations);
 the pipe carries every packet. One local `SOCK_SEQPACKET` socket between them, one message per datagram, and the brain
@@ -57,7 +74,7 @@ owns the sockets: it binds them and passes them with the message that uses them 
 the same sockets to the next pipe (R3). The brain's side is `trunk/pipectl`: it starts `hk-pipe --ctl-fd 3` on its end
 of a socketpair, and its `Pipe` is a `trunk.Steered` (the selector reads the wires from the pipe's ticks and sets the
 route, `trunk.SteerOn`) and a `trunk.CallCarrier` (the trunk's call on each wire runs through the pipe as a client's
-datagrams do, `trunk.RunCallOn`). The messages are `src/ctl.rs`; integers little-endian; both sides test the same golden
+datagrams do, `trunk.RunCallOn`). The messages are `pipe/src/ctl.rs`; integers little-endian; both sides test the same golden
 bytes.
 
 Brain → pipe:
@@ -95,6 +112,6 @@ pipe built:
 
 ```bash
 cargo build --release --target aarch64-unknown-linux-musl && cp target/aarch64-unknown-linux-musl/release/hk-pipe bench/out/
-(cd ../trunk && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o ../pipe-rs/bench/out/pipectl.test ./pipectl)
+(cd ../trunk && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go test -c -o ../rust/bench/out/pipectl.test ./pipectl)
 docker run --rm -v "$PWD/bench:/bench" -e HK_PIPE=/bench/out/hk-pipe debian:bookworm-slim /bench/out/pipectl.test -test.v
 ```

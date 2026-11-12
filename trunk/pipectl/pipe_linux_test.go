@@ -18,7 +18,7 @@ import (
 	"github.com/m1d1x/hikkari-protocol/trunk/udpwire"
 )
 
-// The pipe is pipe-rs's hk-pipe, built for this box (pipe-rs/README.md):
+// The pipe is rust/pipe's hk-pipe, built for this box (rust/README.md):
 // HK_PIPE=/path/to/hk-pipe go test ./pipectl. Without it the tests that run
 // a pipe are skipped.
 func pipeBin(t *testing.T) string {

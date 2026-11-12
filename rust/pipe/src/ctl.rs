@@ -2,10 +2,8 @@
 //! SOCK_SEQPACKET socket, one message per datagram, the brain's sockets
 //! passed with the message that uses them by SCM_RIGHTS. Integers are
 //! little-endian. The Go side is trunk/pipectl (msg.go); both sides hold the
-//! same golden bytes in their tests.
-
-use std::io;
-use std::mem::zeroed;
+//! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
+//! here are only the messages, so they are tested on any platform.
 
 pub const VERSION: u16 = 1;
 
@@ -189,78 +187,6 @@ pub fn put_dgram(out: &mut [u8], tag: u32, payload: &[u8]) -> usize {
     out[1..5].copy_from_slice(&tag.to_le_bytes());
     out[5..5 + payload.len()].copy_from_slice(payload);
     5 + payload.len()
-}
-
-/// The pipe's end of the socket.
-pub struct Ctl {
-    pub fd: i32,
-    cmsg: Vec<u8>,
-    /// Messages to the brain the socket refused (its buffer full).
-    pub dropped: u64,
-}
-
-impl Ctl {
-    pub fn new(fd: i32) -> Ctl {
-        let big: libc::c_int = 4 << 20;
-        unsafe {
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &big as *const _ as *const _, 4);
-            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &big as *const _ as *const _, 4);
-        }
-        let space = unsafe { libc::CMSG_SPACE((MAX_FDS * 4) as u32) } as usize;
-        Ctl { fd, cmsg: vec![0; space], dropped: 0 }
-    }
-
-    /// One message without waiting, its sockets appended to fds: Ok(None)
-    /// for none now, Ok(Some(0)) once the brain is gone. A message torn by
-    /// the buffer is an error, its sockets closed.
-    pub fn recv(&mut self, buf: &mut [u8], fds: &mut Vec<i32>) -> io::Result<Option<usize>> {
-        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
-        let mut h: libc::msghdr = unsafe { zeroed() };
-        h.msg_iov = &mut iov;
-        h.msg_iovlen = 1;
-        h.msg_control = self.cmsg.as_mut_ptr() as *mut _;
-        h.msg_controllen = self.cmsg.len() as _;
-        let n = unsafe { libc::recvmsg(self.fd, &mut h, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            return match e.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(None),
-                _ => Err(e),
-            };
-        }
-        let first = fds.len();
-        unsafe {
-            let mut c = libc::CMSG_FIRSTHDR(&h);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                    let p = libc::CMSG_DATA(c) as *const i32;
-                    for i in 0..len / 4 {
-                        fds.push(std::ptr::read_unaligned(p.add(i)));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&h, c);
-            }
-        }
-        if h.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
-            for fd in fds.drain(first..) {
-                unsafe { libc::close(fd) };
-            }
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "a message from the brain torn by the buffer"));
-        }
-        Ok(Some(n as usize))
-    }
-
-    /// Sends one message without waiting; false (and counted) when the
-    /// socket refuses it.
-    pub fn send(&mut self, msg: &[u8]) -> bool {
-        let n = unsafe { libc::send(self.fd, msg.as_ptr() as *const _, msg.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
-        if n < 0 {
-            self.dropped += 1;
-            return false;
-        }
-        true
-    }
 }
 
 #[cfg(test)]

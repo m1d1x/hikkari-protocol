@@ -1,0 +1,292 @@
+//! The pipe: everything the entry does with each packet of a client's UDP
+//! (README.md). It is blind, as the Go entry: a client's datagram channel is
+//! QUIC end to end with the exit's relay, so the pipe reads client datagrams
+//! as opaque bytes, gives each client address a flow, and carries every
+//! datagram as a dgram frame on a wire to the exit.
+//!
+//! What to carry it on is the brain's (trunk/pipectl): the brain binds the
+//! sockets and hands them over, says which wire each class goes on (route),
+//! opens flows of its own (its calls on each wire) and reads a tick a second
+//! of every wire: members up, how long they have owed an answer, when one
+//! last heard the exit. A route changed moves the next datagram, nothing to
+//! migrate: the exit answers a flow on the wire the entry last sent it on
+//! (trunk flows.go), so no flow is reset by a change of wire.
+//!
+//! Without a brain (flags, the bench) the pipe binds its own sockets: one
+//! client port, one wire, voice and bulk on it.
+//!
+//! One thread, no runtime, nothing allocated per packet. Under traffic the
+//! loop runs on a tick: it sleeps to the next one and takes everything each
+//! socket has with recvmmsg, sends with sendmmsg, and glues the frames of all
+//! flows bound for one member into one sealed datagram for the tick.
+//!
+//! The loop is here; its parts: brain.rs (the brain's messages and the
+//! ticks to it), timers.rs (members' hello, pings and deaths), data.rs
+//! (clients → wires → clients).
+
+mod brain;
+mod data;
+mod timers;
+
+use std::io;
+use std::net::{SocketAddrV4, UdpSocket};
+use std::os::fd::AsRawFd;
+
+use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
+use hikkari_trunk::health::{self, Judge};
+use hikkari_trunk::udpwire;
+
+use crate::ctl::{self, ANY_WIRE};
+use crate::flow::{Flows, CLASS_VOICE};
+use crate::member::{member_to, Member, Wire, SLOT};
+
+const MAX_CLIENT: usize = 1500;
+
+struct Listen {
+    id: u8,
+    sock: UdpSocket,
+    class: u8,
+    to: u16,
+    copies: u8,
+    down: SendBatch,
+}
+
+/// What a socket in the poll set is.
+#[derive(Clone, Copy)]
+enum Slot {
+    Ctl,
+    Listen(usize),
+    Member(usize, usize),
+}
+
+/// A member event for the brain, sent after the walk that found it.
+#[derive(Clone, Copy)]
+struct Event {
+    wire: u8,
+    index: u8,
+    up: bool,
+    why: u8,
+}
+
+/// Flags of a pipe without a brain (the bench).
+pub struct Alone {
+    pub listen: SocketAddrV4,
+    pub exit: SocketAddrV4,
+    pub key: String,
+    pub members: usize,
+    pub glue_ns: u64,
+    pub glue_max: usize,
+    pub to: u16,
+    pub wire: u8,
+}
+
+pub struct Pipe {
+    ctl: Option<SeqPacket>,
+    session: [u8; 16],
+    gro: bool,
+    tick_ns: u64,
+    listens: Vec<Listen>,
+    wires: Vec<Wire>,
+    /// The wire of each class, by class (CLASS_BULK, CLASS_VOICE).
+    route: [u8; 2],
+    flows: Flows,
+    poll: Poll,
+    slots: Vec<Slot>,
+    dirty: bool,
+    crecv: RecvBatch,
+    wrecv: RecvBatch,
+    msg: Vec<u8>,
+    out: Vec<u8>,
+    fds: Vec<i32>,
+    events: Vec<Event>,
+    tok: u64,
+    /// The session's proof and the pipe's own pauses.
+    judge: Judge,
+    clock_at: u64,
+    late_max: u64,
+    tick_at: u64,
+    stats_at: u64,
+    moved: u64,
+    bad: u64,
+}
+
+impl Pipe {
+    fn new(ctl: Option<SeqPacket>, gro: bool, tick_ns: u64) -> Pipe {
+        let mut session = [0u8; 16];
+        sys::urandom(&mut session);
+        let now = now_ns();
+        Pipe {
+            ctl,
+            session,
+            gro,
+            tick_ns,
+            listens: Vec::new(),
+            wires: Vec::new(),
+            route: [ANY_WIRE, ANY_WIRE],
+            flows: Flows::new(),
+            poll: Poll::new(),
+            slots: Vec::new(),
+            dirty: true,
+            // With GRO one read may hold many datagrams of one client.
+            crecv: RecvBatch::new(if gro { 65536 } else { MAX_CLIENT }),
+            wrecv: RecvBatch::new(SLOT),
+            msg: vec![0; 65536],
+            out: vec![0; 65536],
+            fds: Vec::with_capacity(ctl::MAX_FDS),
+            events: Vec::with_capacity(64),
+            tok: 0,
+            judge: Judge::new(health::QUIET),
+            clock_at: now,
+            late_max: 0,
+            tick_at: now + timers::TICK_EVERY,
+            stats_at: now,
+            moved: 0,
+            bad: 0,
+        }
+    }
+
+    /// A pipe the brain runs over the socket at fd (the pipe's end of the
+    /// brain's socketpair). It says hello and waits for the brain's.
+    pub fn with_brain(fd: i32, gro: bool, tick_ns: u64) -> Pipe {
+        let mut c = SeqPacket::new(fd, ctl::MAX_FDS);
+        let mut b = [0u8; 16];
+        let n = ctl::put_hello(&mut b, std::process::id());
+        c.send(&b[..n]);
+        Pipe::new(Some(c), gro, tick_ns)
+    }
+
+    /// A pipe without a brain: its own client port and one wire, voice and
+    /// bulk on it (the bench's flags).
+    pub fn alone(a: &Alone, tick_ns: u64, gro: bool) -> io::Result<Pipe> {
+        let mut p = Pipe::new(None, gro, tick_ns);
+        let sock = UdpSocket::bind(a.listen)?;
+        sys::tune(&sock, gro)?;
+        p.listens.push(Listen { id: 0, sock, class: CLASS_VOICE, to: a.to, copies: 1, down: SendBatch::new() });
+        let key = udpwire::key(&a.key);
+        let mut w = Wire::new(a.wire, key, health::STALL);
+        w.glue_ns = a.glue_ns;
+        w.glue_max = a.glue_max;
+        w.exit = Some(a.exit);
+        for _ in 0..a.members {
+            w.members.push(Member::new(Some(member_to(a.exit)?), &key));
+        }
+        p.wires.push(w);
+        p.route = [a.wire, a.wire];
+        Ok(p)
+    }
+
+    /// Runs until the brain is gone (forever without one).
+    pub fn run(&mut self) {
+        let mut sleep_at = 0u64;
+        let mut busy = false;
+        let mut prev = 0u64;
+        loop {
+            let now = now_ns();
+            // Before the clock: a member's debt counts from the end of a
+            // pause of the pipe's own.
+            self.judge.turn(prev, now);
+            prev = now;
+            let next = self.timers(now);
+            if self.dirty {
+                self.rebuild_poll();
+            }
+            // Under traffic the loop runs on a tick: a wakeup is paid once per
+            // tick and not once per packet. A tick that moved nothing goes
+            // back to waiting for the first packet (an idle pipe sleeps).
+            let due = if self.tick_ns > 0 && busy {
+                sleep_at = if sleep_at + self.tick_ns > now { sleep_at + self.tick_ns } else { now + self.tick_ns };
+                let due = sleep_at.min(next.max(now));
+                sys::sleep_until(due);
+                self.poll.all();
+                due
+            } else {
+                let due = next.max(now);
+                self.poll.wait(due - now);
+                sleep_at = now_ns();
+                due
+            };
+            let now = now_ns();
+            if now > due {
+                let late = now - due;
+                self.late_max = self.late_max.max(late);
+            }
+            let moved0 = self.moved;
+            if !self.read_brain() {
+                return;
+            }
+            if self.dirty {
+                // The sockets changed under the poll: read every one once.
+                self.rebuild_poll();
+                self.poll.all();
+            }
+            self.read_clients();
+            self.seal_due();
+            self.read_wires();
+            busy = self.moved != moved0;
+        }
+    }
+
+    fn rebuild_poll(&mut self) {
+        self.slots.clear();
+        if self.ctl.is_some() {
+            self.slots.push(Slot::Ctl);
+        }
+        for i in 0..self.listens.len() {
+            self.slots.push(Slot::Listen(i));
+        }
+        for (wi, w) in self.wires.iter().enumerate() {
+            for (mi, m) in w.members.iter().enumerate() {
+                if m.fd >= 0 {
+                    self.slots.push(Slot::Member(wi, mi));
+                }
+            }
+        }
+        let (listens, wires, ctl) = (&self.listens, &self.wires, &self.ctl);
+        self.poll.set(self.slots.iter().map(|s| match *s {
+            Slot::Ctl => ctl.as_ref().unwrap().fd,
+            Slot::Listen(i) => listens[i].sock.as_raw_fd(),
+            Slot::Member(w, m) => wires[w].members[m].fd,
+        }));
+        self.dirty = false;
+    }
+
+    /// Seals what waited its window (on a tick: the tick is the window) and
+    /// sends every member's batch.
+    fn seal_due(&mut self) {
+        let now = now_ns();
+        let tick = self.tick_ns > 0;
+        for w in self.wires.iter_mut() {
+            for m in w.members.iter_mut() {
+                if m.glue_since != 0 && (tick || w.glue_ns == 0 || now - m.glue_since >= w.glue_ns) {
+                    m.seal_glue();
+                }
+                m.flush_out();
+            }
+        }
+    }
+
+    fn log_stats(&self) {
+        let mut s = format!(
+            "hk-pipe: flows={} route=bulk:{},voice:{} pauses={} bad={}",
+            self.flows.live, self.route[0], self.route[1], self.judge.pauses, self.bad
+        );
+        for w in &self.wires {
+            let dgrams = w.members.iter().map(|m| m.dgrams).sum::<u64>();
+            s += &format!(
+                " | wire {} up={}/{} in={} out={} dgrams={} frames/dgram={:.2}",
+                w.id,
+                w.up(),
+                w.members.len(),
+                w.t.up_pkts,
+                w.t.down_pkts,
+                dgrams,
+                w.t.up_pkts as f64 / dgrams.max(1) as f64
+            );
+        }
+        eprintln!("{s}");
+    }
+}
+
+fn ms(ns: u64) -> u32 {
+    (ns / 1_000_000).min(u32::MAX as u64 - 1) as u32
+}

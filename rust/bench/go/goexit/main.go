@@ -2,7 +2,7 @@
 // with the bare UDP wire (trunk/udpwire) and a plain TCP pool member for the
 // Go entry (no TLS: the bench measures the entry's UDP path, not the pool).
 // Flows to port 0 are the exit's echo (trunk.EchoPort), so no relay is
-// needed behind it. Bench only (pipe-rs/README.md).
+// needed behind it. Bench only (rust/README.md).
 package main
 
 import (

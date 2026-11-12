@@ -1,4 +1,4 @@
-// Package pipectl is the brain's end of the entry's pipe (pipe-rs, hk-pipe):
+// Package pipectl is the brain's end of the entry's pipe (rust/pipe, hk-pipe):
 // the Go entry decides (selector, the trunk's calls, knobs from the hub,
 // minute lines) and the pipe carries every packet of the clients' UDP.
 //
@@ -11,7 +11,7 @@
 // the route. What the brain decides a second at a time never sits in the
 // path of a packet.
 //
-// The messages are pipe-rs/src/ctl.rs; integers are little-endian, and both
+// The messages are rust/pipe/src/ctl.rs; integers are little-endian, and both
 // sides hold the same golden bytes in their tests.
 package pipectl
 

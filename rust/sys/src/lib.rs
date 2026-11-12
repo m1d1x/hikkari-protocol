@@ -1,10 +1,16 @@
 //! Batched UDP on Linux: recvmmsg and sendmmsg over buffers allocated once,
-//! UDP GRO on receive. IPv4 only (the prototype's bench).
+//! UDP GRO on receive. IPv4 only (the prototype's bench). Every unsafe call
+//! of the workspace lives here, behind a safe function.
+#![cfg(target_os = "linux")]
 
 use std::io;
 use std::mem::{size_of, zeroed};
 use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
+
+/// An IPv4 address as the kernel keeps it: what a batch reads a datagram
+/// from and sends an answer to.
+pub use libc::sockaddr_in;
 
 pub const BATCH: usize = 64;
 const CMSG: usize = 64;
@@ -135,6 +141,12 @@ pub struct SendBatch {
     pub calls: u64,
 }
 
+impl Default for SendBatch {
+    fn default() -> SendBatch {
+        SendBatch::new()
+    }
+}
+
 impl SendBatch {
     pub fn new() -> SendBatch {
         SendBatch {
@@ -209,6 +221,12 @@ pub struct Poll {
     pub fds: Vec<libc::pollfd>,
 }
 
+impl Default for Poll {
+    fn default() -> Poll {
+        Poll::new()
+    }
+}
+
 impl Poll {
     pub fn new() -> Poll {
         Poll { fds: Vec::new() }
@@ -267,8 +285,95 @@ pub fn urandom(b: &mut [u8]) {
     std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(b)).expect("urandom");
 }
 
+/// One datagram from fd without waiting: its size, or below 0 for none
+/// (or an error).
+pub fn recv_nowait(fd: i32, buf: &mut [u8]) -> isize {
+    unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), libc::MSG_DONTWAIT) }
+}
+
 /// Sleeps until the monotonic clock reads `at` (ns).
 pub fn sleep_until(at: u64) {
     let ts = libc::timespec { tv_sec: (at / 1_000_000_000) as _, tv_nsec: (at % 1_000_000_000) as _ };
     unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
+}
+
+/// Closes a descriptor no one took (a socket passed with a message that
+/// did not use it).
+pub fn close_fd(fd: i32) {
+    unsafe { libc::close(fd) };
+}
+
+/// A local SOCK_SEQPACKET socket: one message per datagram, descriptors
+/// passed with a message by SCM_RIGHTS (the brain ↔ pipe socket).
+pub struct SeqPacket {
+    pub fd: i32,
+    cmsg: Vec<u8>,
+    /// Messages the socket refused (its buffer full).
+    pub dropped: u64,
+}
+
+impl SeqPacket {
+    /// The socket at fd, with buffers of 4 MiB each way and room for up to
+    /// max_fds descriptors in one message.
+    pub fn new(fd: i32, max_fds: usize) -> SeqPacket {
+        let big: libc::c_int = 4 << 20;
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &big as *const _ as *const _, 4);
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, &big as *const _ as *const _, 4);
+        }
+        let space = unsafe { libc::CMSG_SPACE((max_fds * 4) as u32) } as usize;
+        SeqPacket { fd, cmsg: vec![0; space], dropped: 0 }
+    }
+
+    /// One message without waiting, its descriptors appended to fds:
+    /// Ok(None) for none now, Ok(Some(0)) once the other end is gone. A
+    /// message torn by the buffer is an error, its descriptors closed.
+    pub fn recv(&mut self, buf: &mut [u8], fds: &mut Vec<i32>) -> io::Result<Option<usize>> {
+        let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut _, iov_len: buf.len() };
+        let mut h: libc::msghdr = unsafe { zeroed() };
+        h.msg_iov = &mut iov;
+        h.msg_iovlen = 1;
+        h.msg_control = self.cmsg.as_mut_ptr() as *mut _;
+        h.msg_controllen = self.cmsg.len() as _;
+        let n = unsafe { libc::recvmsg(self.fd, &mut h, libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(None),
+                _ => Err(e),
+            };
+        }
+        let first = fds.len();
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&h);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let len = (*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
+                    let p = libc::CMSG_DATA(c) as *const i32;
+                    for i in 0..len / 4 {
+                        fds.push(std::ptr::read_unaligned(p.add(i)));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&h, c);
+            }
+        }
+        if h.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+            for fd in fds.drain(first..) {
+                close_fd(fd);
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a message torn by the buffer"));
+        }
+        Ok(Some(n as usize))
+    }
+
+    /// Sends one message without waiting; false (and counted) when the
+    /// socket refuses it.
+    pub fn send(&mut self, msg: &[u8]) -> bool {
+        let n = unsafe { libc::send(self.fd, msg.as_ptr() as *const _, msg.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+        if n < 0 {
+            self.dropped += 1;
+            return false;
+        }
+        true
+    }
 }

@@ -1,0 +1,27 @@
+# Hikkari in Rust (README.md): the trunk's protocol, the syscalls under it,
+# and the cascade entry's pipe. The Go side is the reference and the brain.
+[workspace]
+resolver = "2"
+members = ["sys", "trunk", "pipe", "bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Versions pinned exactly: a crate change is a commit of its own.
+[workspace.dependencies]
+libc = "=0.2.184"
+aes-gcm = { version = "=0.10.3", default-features = false, features = ["aes"] }
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+hikkari-sys = { path = "sys" }
+hikkari-trunk = { path = "trunk" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1

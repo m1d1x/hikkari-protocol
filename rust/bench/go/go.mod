@@ -1,4 +1,4 @@
-module github.com/m1d1x/hikkari-protocol/pipe-rs/bench/go
+module github.com/m1d1x/hikkari-protocol/rust/bench/go
 
 go 1.26.0
 

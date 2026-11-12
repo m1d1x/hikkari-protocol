@@ -4,7 +4,7 @@
 // to the client socket) over trunk.Entry with the bare UDP wire, voice routed
 // to it as the selector routes it. What it leaves out: the Chromium pool (one
 // plain TCP member instead), the trunk's own calls, the wire stand, the
-// handoff between generations. Bench only (pipe-rs/README.md).
+// handoff between generations. Bench only (rust/README.md).
 package main
 
 import (

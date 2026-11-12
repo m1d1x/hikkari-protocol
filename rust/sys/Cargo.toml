@@ -1,0 +1,10 @@
+[package]
+name = "hikkari-sys"
+description = "Batched UDP, poll and time on Linux: every unsafe call of the workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true

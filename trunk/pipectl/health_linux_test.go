@@ -21,7 +21,7 @@ import (
 // and a member that dies alone, with the pipe as the entry and the Go exit
 // (trunk.Exit over udpwire) as the other end, a cutter on the path between.
 // The pipe's own unit tests run the same rules on a clock of their own
-// (pipe-rs/src/health.rs).
+// (rust/trunk/src/health.rs).
 
 const healthWire trunk.WireID = 2
 

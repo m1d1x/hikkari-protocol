@@ -40,7 +40,7 @@ const MaxDatagram = 65507
 const overhead = 12 + 16
 
 // Key is the wire's key for a trunk key: what the entry's pipe seals with
-// (pipe-rs, handed over by trunk/pipectl).
+// (rust/pipe, handed over by trunk/pipectl).
 func Key(trunkKey string) ([]byte, error) {
 	return hkdf.Key(sha256.New, []byte(trunkKey), nil, "hikkari trunk udp wire", 32)
 }

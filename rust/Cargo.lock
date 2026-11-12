@@ -122,12 +122,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "hikkari-bench"
+version = "0.1.0"
+dependencies = [
+ "hikkari-sys",
+]
+
+[[package]]
 name = "hikkari-pipe"
+version = "0.1.0"
+dependencies = [
+ "hikkari-sys",
+ "hikkari-trunk",
+ "libc",
+]
+
+[[package]]
+name = "hikkari-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "hikkari-trunk"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "hkdf",
- "libc",
  "sha2",
 ]
 
