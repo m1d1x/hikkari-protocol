@@ -1,14 +1,16 @@
 //! What the exit does on time rather than on packets (trunk session.go tick
 //! and Exit.Run, udpwire's reap): members' pings and deaths on the members'
-//! clock, flows unused past idle, entry addresses silent past PeerIdle,
-//! sessions left without members past SessionIdle, the brain's tick, the
-//! stats line.
+//! clock (stream members' in tcp.rs), flows unused past idle, entry
+//! addresses silent past PeerIdle, ended streams' ids and held early frames
+//! past their memory, sessions left without members past SessionIdle, the
+//! brain's tick, the stats line.
 
 use hikkari_trunk::frame::{self, F_PING};
 use hikkari_trunk::health::Verdict;
 
 use super::Exit;
 use crate::session::SESSION_IDLE;
+use crate::streams::{CLOSED_MEMORY, EARLY_FOR};
 
 /// The members' clock (trunk's tick): pings are sent and debts judged on it,
 /// not on every turn of the loop (hk-pipe timers.rs says why).
@@ -27,6 +29,8 @@ impl Exit {
         if now >= self.clock_at {
             self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
             self.members_clock(now);
+            self.link_clock(now);
+            self.end_doomed(now);
         }
         let mut next = self.clock_at;
         if self.tick_ns == 0 {
@@ -75,8 +79,10 @@ impl Exit {
     }
 
     /// Once a second: flows unused past idle end, addresses silent past
-    /// PeerIdle are forgotten, sessions without members past SessionIdle end
-    /// with their flows. A second late changes nothing.
+    /// PeerIdle are forgotten, ended streams' ids and early frames are
+    /// forgotten past their memory, sessions without members past
+    /// SessionIdle end with their flows and streams. A second late changes
+    /// nothing.
     fn sweep(&mut self, now: u64) {
         for pi in 0..self.peers.len() {
             let p = &self.peers[pi];
@@ -93,14 +99,29 @@ impl Exit {
                 self.t.flows_idle += 1;
             }
         }
+        for x in self.sessions.all.iter_mut().filter(|x| x.live) {
+            x.closed.retain(|_, at| now.saturating_sub(*at) <= CLOSED_MEMORY);
+            x.early.retain(|_, e| now.saturating_sub(e.since) <= EARLY_FOR);
+            x.early_bytes = x.early.values().map(|e| e.bytes).sum();
+        }
         for s in 0..self.sessions.all.len() {
             let x = &self.sessions.all[s];
-            if !x.live || !x.members.is_empty() || now.saturating_sub(x.empty_since) <= SESSION_IDLE {
+            if !x.live || !x.no_members() || now.saturating_sub(x.empty_since) <= SESSION_IDLE {
                 continue;
             }
             let flows: Vec<usize> = x.flows.values().copied().collect();
+            let streams: Vec<usize> = x.streams.values().copied().collect();
             for fi in flows {
                 self.end_flow(fi);
+            }
+            // No member is left to tell: the streams end without a reset
+            // (trunk Session.Close).
+            for slot in streams {
+                if let Some(fd) = self.streams.all[slot].local.as_ref().and_then(|l| l.fd()) {
+                    self.tcp.del(std::os::fd::AsRawFd::as_raw_fd(fd));
+                }
+                self.streams.n.reset_local += 1;
+                self.streams.end(slot);
             }
             self.sessions.end(s);
         }

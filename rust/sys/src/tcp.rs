@@ -118,3 +118,17 @@ pub fn write(fd: &OwnedFd, buf: &[u8]) -> Io {
 pub fn shutdown_write(fd: &OwnedFd) {
     unsafe { libc::shutdown(fd.as_raw_fd(), libc::SHUT_WR) };
 }
+
+/// A TCP socket from a descriptor the brain passed (a listening socket it
+/// bound), made non-blocking.
+pub fn tcp_from_fd(fd: i32) -> io::Result<OwnedFd> {
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
+}

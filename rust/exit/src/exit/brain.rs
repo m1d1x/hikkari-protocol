@@ -2,7 +2,7 @@
 
 use hikkari_sys as sys;
 
-use super::Exit;
+use super::{Exit, Pool};
 use crate::ctl::{self, Msg};
 use crate::peer::Wire;
 
@@ -60,6 +60,18 @@ impl Exit {
                 self.dirty = true;
                 Ok(())
             }
+            Msg::Pool { dead_ms, quiet_ms } => {
+                if self.pool.is_some() {
+                    return Err("exit: the pool's port is set already".into());
+                }
+                if fds.len() != 1 {
+                    return Err(format!("exit: the pool came with {} sockets, want 1", fds.len()));
+                }
+                let fd = sys::tcp_from_fd(fds.remove(0)).map_err(|e| format!("exit: the pool's socket: {e}"))?;
+                let p = Pool { fd, stall_ns: dead_ms as u64 * 1_000_000, quiet_ns: quiet_ms as u64 * 1_000_000 };
+                self.set_pool(p).map_err(|e| format!("exit: the pool's socket: {e}"))?;
+                Ok(())
+            }
             Msg::Ports { ports } => {
                 self.ports.iter_mut().for_each(|p| *p = false);
                 for i in 0..ports.len() / 2 {
@@ -88,6 +100,10 @@ impl Exit {
         self.late_max = 0;
         t.sessions = self.sessions.live();
         t.flows = self.flows.clients;
+        t.streams = self.streams.open;
+        let n = &self.streams.n;
+        (t.streams_opened, t.streams_fin, t.reset_peer, t.reset_local) = (n.opened, n.fin, n.reset_peer, n.reset_local);
+        (t.hit, t.resent, t.up, t.down, t.early, t.early_dropped) = (n.deaths, n.resent, n.up, n.down, n.early, n.early_dropped);
         t.w_out = self.wires.iter().map(|w| w.dgrams).sum();
         t.frames_out = self.wires.iter().map(|w| w.frames).sum();
         t.dropped = self.wires.iter().map(|w| w.send.dropped).sum();

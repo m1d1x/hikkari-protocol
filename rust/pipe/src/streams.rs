@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 
 use hikkari_sys::{self as sys, Io};
+use hikkari_trunk::buf::Behind;
 use hikkari_trunk::stream::{Recv, Send};
 
 use crate::flow::FxMap;
@@ -21,14 +22,13 @@ use crate::flow::FxMap;
 /// A stream's client side: its connection, and what waits for it.
 pub struct Client {
     pub fd: OwnedFd,
-    /// Received in order and not yet taken by the client, at down[down_at..].
-    down: Vec<u8>,
-    down_at: usize,
+    /// Received in order and not yet taken by the client.
+    down: Behind,
 }
 
 impl Client {
     pub fn down_pending(&self) -> bool {
-        self.down_at < self.down.len()
+        self.down.pending()
     }
 
     /// Bytes for the client: written now while nothing waits before them,
@@ -36,34 +36,26 @@ impl Client {
     /// None when the client is gone.
     pub fn give(&mut self, p: &[u8]) -> Option<usize> {
         let mut n = 0;
-        if !self.down_pending() {
+        if !self.down.pending() {
             match sys::write(&self.fd, p) {
                 Io::Done(k) => n = k,
                 Io::Again => {}
                 Io::Eof | Io::Gone => return None,
             }
-            self.down.clear();
-            self.down_at = 0;
         }
-        self.down.extend_from_slice(&p[n..]);
+        self.down.push(&p[n..]);
         Some(n)
     }
 
     /// Writes what waits for the client: how many bytes it took; None when
     /// it is gone.
     pub fn flush_down(&mut self) -> Option<usize> {
-        if !self.down_pending() {
+        if !self.down.pending() {
             return Some(0);
         }
-        match sys::write(&self.fd, &self.down[self.down_at..]) {
+        match sys::write(&self.fd, self.down.bytes()) {
             Io::Done(k) => {
-                self.down_at += k;
-                // A client always behind would grow the buffer by all it was
-                // ever sent: what it took goes once it is the larger half.
-                if self.down_at > self.down.len() / 2 {
-                    self.down.drain(..self.down_at);
-                    self.down_at = 0;
-                }
+                self.down.took(k);
                 Some(k)
             }
             Io::Again => Some(0),
@@ -151,7 +143,7 @@ impl Streams {
     pub fn add(&mut self, fd: OwnedFd, port: u16) -> usize {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let st = Stream {
-            client: Client { fd, down: Vec::new(), down_at: 0 },
+            client: Client { fd, down: Behind::default() },
             id: self.next_id,
             port,
             opened: false,

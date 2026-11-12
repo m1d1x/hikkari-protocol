@@ -7,110 +7,31 @@
 //! wait) and serve (frames read one by one).
 //!
 //! Nothing is allocated per frame: a member writes into its out buffer and
-//! reads into its in buffer, both allocated once. A chunk of a client's bytes
-//! is read straight into the out buffer behind its frame's head.
+//! reads into its in buffer, both allocated once (hikkari_trunk::buf). A
+//! chunk of a client's bytes is read straight into the out buffer behind its
+//! frame's head.
 
 use std::net::SocketAddrV4;
 use std::os::fd::OwnedFd;
 
 use hikkari_sys::{self as sys, Io};
-use hikkari_trunk::frame::{self, DATA_HEAD};
+use hikkari_trunk::buf::{Out, IN};
+use hikkari_trunk::frame;
 use hikkari_trunk::health::Health;
 use hikkari_trunk::stream::{CHUNK, INFLIGHT};
 
 use crate::ctl::WireTick;
 
-/// A member's out buffer: four times its chunks in flight, so the kernel's
-/// buffer can take what the window lets out while the frames that are not
-/// chunks keep their room.
-const OUT: usize = 4 * INFLIGHT;
-/// Room in the out buffer chunks leave to the other frames (acks, pings,
-/// opens, FINs, resets): a member whose buffer fills even this is not taking
-/// writes, and dies by its stall.
-const SPARE: usize = 64 << 10;
-/// A member's in buffer: room for several frames of the largest chunk a
-/// frame can carry (n is u16).
-const IN: usize = 256 << 10;
-
-/// Bytes waiting for the member's socket, at buf[head..tail].
-pub struct Out {
-    buf: Box<[u8]>,
-    head: usize,
-    tail: usize,
-}
-
-impl Out {
-    fn new() -> Out {
-        Out { buf: vec![0; OUT].into_boxed_slice(), head: 0, tail: 0 }
+/// Writes what waits in a member's out buffer, as much as its socket takes.
+pub fn flush(out: &mut Out, fd: &OwnedFd) -> Io {
+    if !out.pending() {
+        return Io::Done(0);
     }
-
-    fn clear(&mut self) {
-        self.head = 0;
-        self.tail = 0;
+    let r = sys::write(fd, out.bytes());
+    if let Io::Done(n) = r {
+        out.wrote(n);
     }
-
-    pub fn pending(&self) -> bool {
-        self.tail > self.head
-    }
-
-    /// Makes `need` bytes free after the tail, moving what waits to the
-    /// front when it must; whether they are. What waits is moved only when
-    /// it is no more than the room the move frees, so a byte is moved at
-    /// most once on average: a slow socket with most of the buffer waiting
-    /// would otherwise have it all moved for every chunk.
-    fn room(&mut self, need: usize) -> bool {
-        if self.head == self.tail {
-            self.clear();
-        }
-        if OUT - self.tail < need && self.head >= self.tail - self.head {
-            self.buf.copy_within(self.head..self.tail, 0);
-            self.tail -= self.head;
-            self.head = 0;
-        }
-        OUT - self.tail >= need
-    }
-
-    /// One frame of at most `need` bytes, written by `put`; false when the
-    /// buffer has no room for it.
-    #[inline]
-    pub fn frame(&mut self, need: usize, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
-        if !self.room(need) {
-            return false;
-        }
-        self.tail += put(&mut self.buf[self.tail..]);
-        true
-    }
-
-    /// Room for a chunk of up to `n` bytes, leaving SPARE: the bytes a chunk
-    /// may have now (0: none).
-    pub fn chunk_room(&mut self, n: usize) -> usize {
-        self.room(DATA_HEAD + n + SPARE);
-        (OUT - self.tail).saturating_sub(SPARE + DATA_HEAD).min(n)
-    }
-
-    /// Where a chunk's bytes go: after its head, at the tail.
-    pub fn chunk_buf(&mut self, n: usize) -> &mut [u8] {
-        let at = self.tail + DATA_HEAD;
-        &mut self.buf[at..at + n]
-    }
-
-    /// The chunk of n bytes read into chunk_buf is a frame now.
-    pub fn chunk_done(&mut self, stream: u32, off: u64, n: usize) {
-        frame::put_data_head(&mut self.buf[self.tail..], stream, off, n as u16);
-        self.tail += DATA_HEAD + n;
-    }
-
-    /// Writes what waits, as much as the socket takes.
-    pub fn flush(&mut self, fd: &OwnedFd) -> Io {
-        if !self.pending() {
-            return Io::Done(0);
-        }
-        let r = sys::write(fd, &self.buf[self.head..self.tail]);
-        if let Io::Done(n) = r {
-            self.head += n;
-        }
-        r
-    }
+    r
 }
 
 pub struct Link {

@@ -54,6 +54,7 @@ type Exit struct {
 	mu     sync.Mutex
 	pid    int
 	wires  map[trunk.WireID]*net.UDPConn
+	pool   *net.TCPListener
 	tick   ExitTick
 	tickAt time.Time
 
@@ -92,7 +93,7 @@ func StartExit(cfg ExitConfig) (*Exit, error) {
 	return x, nil
 }
 
-func (x *Exit) send(msg []byte, conns ...*net.UDPConn) error {
+func (x *Exit) send(msg []byte, conns ...syscall.Conn) error {
 	return sendWith(x.conn, &x.wmu, msg, conns...)
 }
 
@@ -124,9 +125,29 @@ func (x *Exit) SetWire(w ExitWire) error {
 	return nil
 }
 
+// SetPool gives the exit the pool's port: stream members (plain TCP here;
+// Chromium's TLS under them is R2) connect to l, bound by the brain, which
+// keeps it. Their stall and the session's Quiet as in ExitWire
+// (trunk.DefaultStall, trunk.ExitQuiet when 0). Given once.
+func (x *Exit) SetPool(l *net.TCPListener, stall, quiet time.Duration) error {
+	if stall == 0 {
+		stall = trunk.DefaultStall
+	}
+	if quiet == 0 {
+		quiet = trunk.ExitQuiet
+	}
+	if err := x.send(putExitPool(stall, quiet), l); err != nil {
+		return err
+	}
+	x.mu.Lock()
+	x.pool = l
+	x.mu.Unlock()
+	return nil
+}
+
 // SetPorts says which loopback ports are open to the trunk (trunk
-// Local.DialFlow refuses the others); the set replaces the one before. The
-// trunk's call, port 0, is always answered.
+// Local.DialFlow and DialStream refuse the others); the set replaces the one
+// before. The trunk's call and download, port 0, are always answered.
 func (x *Exit) SetPorts(ports []uint16) error { return x.send(putExitPorts(ports)) }
 
 // Tick is the latest tick and when it came.
@@ -150,6 +171,9 @@ func (x *Exit) Close() error {
 	defer x.mu.Unlock()
 	for _, c := range x.wires {
 		c.Close()
+	}
+	if x.pool != nil {
+		x.pool.Close()
 	}
 	return nil
 }

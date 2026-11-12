@@ -9,7 +9,7 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 mod tcp;
-pub use tcp::{accept, read, shutdown_write, tcp_connect, tcp_listen, write, Io};
+pub use tcp::{accept, read, shutdown_write, tcp_connect, tcp_from_fd, tcp_listen, write, Io};
 
 /// An IPv4 address as the kernel keeps it: what a batch reads a datagram
 /// from and sends an answer to.
@@ -421,6 +421,19 @@ impl Epoll {
         Ok(())
     }
 
+    /// Watches a stream socket for both ways, edge-triggered: `data` comes
+    /// back once each time it turns readable or writable, or fails. The loop
+    /// keeps what it was told (a TCP socket's flags) and reads or writes
+    /// until the socket would block; it is told again only after that.
+    pub fn add_io(&self, fd: i32, data: u64) -> io::Result<()> {
+        let events = (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
+        let mut e = libc::epoll_event { events, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut e) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Stops watching fd (before it is closed).
     pub fn del(&self, fd: i32) {
         unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
@@ -435,6 +448,15 @@ impl Epoll {
     #[inline]
     pub fn data(&self, i: usize) -> u64 {
         self.ev[i].u64
+    }
+
+    /// What ready socket i is: readable (data, its end, or its failure),
+    /// writable (room, or its failure).
+    #[inline]
+    pub fn ways(&self, i: usize) -> (bool, bool) {
+        let e = self.ev[i].events as i32;
+        let gone = e & (libc::EPOLLERR | libc::EPOLLHUP) != 0;
+        (gone || e & (libc::EPOLLIN | libc::EPOLLRDHUP) != 0, gone || e & libc::EPOLLOUT != 0)
     }
 }
 

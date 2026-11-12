@@ -41,9 +41,10 @@ func spawn(bin string, args []string, stderr io.Writer) (*exec.Cmd, *net.UnixCon
 	return cmd, conn, nil
 }
 
-// sendWith writes one message on conn with the sockets of conns, one
-// writer at a time (wmu): a message and its sockets go together.
-func sendWith(conn *net.UnixConn, wmu *sync.Mutex, msg []byte, conns ...*net.UDPConn) error {
+// sendWith writes one message on conn with the sockets of conns (UDP
+// sockets, a listening TCP socket), one writer at a time (wmu): a message
+// and its sockets go together.
+func sendWith(conn *net.UnixConn, wmu *sync.Mutex, msg []byte, conns ...syscall.Conn) error {
 	var fds []int
 	var raws []syscall.RawConn
 	for _, c := range conns {

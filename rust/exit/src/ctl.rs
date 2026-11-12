@@ -5,12 +5,13 @@
 //! trunk/pipectl (exitmsg.go); both sides hold the same golden bytes in their
 //! tests. Here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 // Brain → exit.
 pub const B_HELLO: u8 = 0x01; // ver u16
 pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; one fd: the wire's bound socket
 pub const B_PORTS: u8 = 0x0a; // n u16, port u16 × n
+pub const B_POOL: u8 = 0x0b; // dead_ms u16, quiet_ms u32; one fd: the pool's listening TCP socket
 
 // Exit → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -21,7 +22,7 @@ pub const P_ERROR: u8 = 0x85; // text
 pub const FORM_UDP: u8 = 1;
 /// A duration the exit has no value for (no pause yet).
 pub const NONE_MS: u32 = u32::MAX;
-/// Most sockets one message may carry: a wire's one.
+/// Most sockets one message may carry: a wire's one, the pool's one.
 pub const MAX_FDS: usize = 1;
 /// Most trunk keys one wire opens under (the hub's keys of this exit).
 pub const MAX_KEYS: usize = 16;
@@ -32,9 +33,12 @@ pub enum Msg<'a> {
     /// A wire: its socket comes with the message. `keys` holds `n` wire
     /// keys (udpwire.Key of each trunk key: the exit never sees a trunk key).
     Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, quiet_ms: u32, keys: &'a [u8] },
-    /// The loopback ports open to the trunk (trunk Local.DialFlow refuses
-    /// the others); the set replaces the one before.
+    /// The loopback ports open to the trunk (trunk Local.DialFlow and
+    /// DialStream refuse the others); the set replaces the one before.
     Ports { ports: &'a [u8] },
+    /// The pool's port: stream members connect to its listening socket,
+    /// which comes with the message; their stall and the session's Quiet.
+    Pool { dead_ms: u16, quiet_ms: u32 },
 }
 
 struct Rd<'a> {
@@ -76,6 +80,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
             let n = r.u16()? as usize;
             Msg::Ports { ports: r.take(2 * n)? }
         }
+        B_POOL => Msg::Pool { dead_ms: r.u16()?, quiet_ms: r.u32()? },
         _ => return None,
     };
     if r.at != m.len() {
@@ -116,15 +121,19 @@ pub struct Tick {
     /// The latest turn of the loop past due in the last second.
     pub late_max_us: u32,
     pub sessions: u32,
-    /// Members up: entry addresses whose hello was answered and that are
-    /// not dead.
+    /// Packet members up: entry addresses whose hello was answered and that
+    /// are not dead.
     pub members: u32,
     /// The clients' flows open.
     pub flows: u32,
-    /// Members joined (trunk Stats.MembersJoined); buried by their stall
-    /// while another member proved the entry alive, and by Quiet (both
-    /// trunk Stats.MembersStall); forgotten after PeerIdle with nothing
-    /// from them (udpwire's reap).
+    /// Stream members up, and streams open.
+    pub links: u32,
+    pub streams: u32,
+    /// Members of either kind joined (trunk Stats.MembersJoined); buried by
+    /// their stall while another member proved the entry alive, and by Quiet
+    /// (both trunk Stats.MembersStall); gone: a packet member's address
+    /// forgotten after PeerIdle with nothing from it (udpwire's reap), a
+    /// stream member's connection failed or ended (MembersBroken).
     pub joined: u64,
     pub silent: u64,
     pub quiet: u64,
@@ -148,12 +157,35 @@ pub struct Tick {
     pub bad: u64,
     /// Sealed datagrams the wire's socket refused.
     pub dropped: u64,
+    /// Streams opened, ended with both FINs, reset by the entry, reset here
+    /// (trunk StreamsOpened, StreamsReset is the two resets).
+    pub streams_opened: u64,
+    pub streams_fin: u64,
+    pub reset_peer: u64,
+    pub reset_local: u64,
+    /// Times a member died carrying a stream's unconfirmed chunks or FIN,
+    /// chunks sent again (trunk Resent).
+    pub hit: u64,
+    pub resent: u64,
+    /// Stream bytes read from local ends, written to them (trunk Up, Down).
+    pub up: u64,
+    pub down: u64,
+    /// Chunks and FINs held for streams not open yet, and dropped past the
+    /// bounds.
+    pub early: u64,
+    pub early_dropped: u64,
+    /// Opens to a port not open to the trunk or that refused (DialStream's
+    /// errors), and datagrams that came on stream members (dropped: R2).
+    pub refused_streams: u64,
+    pub link_dgrams: u64,
 }
 
-pub const TICK_LEN: usize = 1 + 6 * 4 + 14 * 8;
+const HEADS: usize = 8;
+const COUNTERS: usize = 26;
+pub const TICK_LEN: usize = 1 + HEADS * 4 + COUNTERS * 8;
 
 impl Tick {
-    fn counters(&self) -> [u64; 14] {
+    fn counters(&self) -> [u64; COUNTERS] {
         [
             self.joined,
             self.silent,
@@ -169,17 +201,30 @@ impl Tick {
             self.frames_out,
             self.bad,
             self.dropped,
+            self.streams_opened,
+            self.streams_fin,
+            self.reset_peer,
+            self.reset_local,
+            self.hit,
+            self.resent,
+            self.up,
+            self.down,
+            self.early,
+            self.early_dropped,
+            self.refused_streams,
+            self.link_dgrams,
         ]
     }
 
     pub fn put(&self, out: &mut [u8]) -> usize {
         out[0] = P_TICK;
-        let heads = [self.pause_ago_ms, self.pauses, self.late_max_us, self.sessions, self.members, self.flows];
+        let heads: [u32; HEADS] = [self.pause_ago_ms, self.pauses, self.late_max_us, self.sessions, self.members, self.flows, self.links, self.streams];
         for (k, v) in heads.iter().enumerate() {
             out[1 + 4 * k..5 + 4 * k].copy_from_slice(&v.to_le_bytes());
         }
+        let at = 1 + HEADS * 4;
         for (k, v) in self.counters().iter().enumerate() {
-            out[25 + 8 * k..33 + 8 * k].copy_from_slice(&v.to_le_bytes());
+            out[at + 8 * k..at + 8 + 8 * k].copy_from_slice(&v.to_le_bytes());
         }
         TICK_LEN
     }
@@ -189,10 +234,11 @@ impl Tick {
 mod tests {
     use super::*;
 
-    /// The same bytes as trunk/pipectl exitmsg_test.go exitWireGolden and
-    /// exitTickGolden.
+    /// The same bytes as trunk/pipectl exitmsg_test.go exitWireGolden,
+    /// exitTickGolden and exitPoolGolden.
     const WIRE_GOLDEN: &str = "030201e8030000b0042c013075000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const TICK_GOLDEN: &str = "82ffffffff0100000039050000020000000400000003000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000000000000";
+    const TICK_GOLDEN: &str = "82ffffffff01000000390500000200000004000000030000001300000014000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000000000000150000000000000016000000000000001700000000000000180000000000000019000000000000001a000000000000001b000000000000001c000000000000001d000000000000001e000000000000001f000000000000002000000000000000";
+    const POOL_GOLDEN: &str = "0b2c0130750000";
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -215,9 +261,10 @@ mod tests {
             _ => panic!("ports"),
         }
         assert!(parse(&[B_HELLO, 1, 0, 9]).is_none(), "a byte too many");
+        assert!(matches!(parse(&unhex(POOL_GOLDEN)), Some(Msg::Pool { dead_ms: 300, quiet_ms: 30000 })));
         let mut b = [0u8; 16];
         let n = put_hello(&mut b, 0x0102_0304);
-        assert_eq!(&b[..n], &[P_HELLO, 1, 0, 4, 3, 2, 1]);
+        assert_eq!(&b[..n], &[P_HELLO, 2, 0, 4, 3, 2, 1]);
         let t = Tick {
             pause_ago_ms: NONE_MS,
             pauses: 1,
@@ -225,6 +272,8 @@ mod tests {
             sessions: 2,
             members: 4,
             flows: 3,
+            links: 19,
+            streams: 20,
             joined: 5,
             silent: 6,
             quiet: 7,
@@ -239,6 +288,18 @@ mod tests {
             frames_out: 16,
             bad: 17,
             dropped: 18,
+            streams_opened: 21,
+            streams_fin: 22,
+            reset_peer: 23,
+            reset_local: 24,
+            hit: 25,
+            resent: 26,
+            up: 27,
+            down: 28,
+            early: 29,
+            early_dropped: 30,
+            refused_streams: 31,
+            link_dgrams: 32,
         };
         let mut out = [0u8; TICK_LEN];
         assert_eq!(t.put(&mut out), TICK_LEN);

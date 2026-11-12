@@ -2,16 +2,20 @@
 //! members joining it by the id in their hello, its epoch random per session
 //! (an entry that sees it change knows the exit lost its flows), its
 //! members' proof and Quiet (hikkari_trunk::health::Judge: the exit's Quiet
-//! is 30 s, it cannot open members and waits for the entry to), its flows by
-//! stream id. A session left without members for SESSION_IDLE ends with its
-//! flows: the entry is gone, and so are its clients.
+//! is 30 s, it cannot open members and waits for the entry to), its flows and
+//! its streams by stream id. A session left without members for SESSION_IDLE
+//! ends with its flows and streams: the entry is gone, and so are its
+//! clients. Its packet members are peers (peer.rs), its stream members links
+//! (link.rs); both prove the entry alive for each other, as the Go session's
+//! proof is the session's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use hikkari_sys as sys;
 use hikkari_trunk::health::Judge;
 
 use crate::flow::Seen;
+use crate::streams::Early;
 
 /// trunk SessionIdle.
 pub const SESSION_IDLE: u64 = 120_000_000_000;
@@ -21,14 +25,26 @@ pub struct Session {
     pub id: [u8; 16],
     pub epoch: [u8; 8],
     pub judge: Judge,
-    /// Its members (peer slots and their gens), up ones only.
+    /// Its packet members (peer slots and their gens), up ones only.
     pub members: Vec<Seen>,
+    /// Its stream members up: link slots and their wires.
+    pub links: Vec<(usize, u8)>,
     /// The members of each wire, by wire id: what an answer of a flow
     /// whose own members are gone goes on (flow::Flow::carriers).
     pub by_wire: Vec<(u8, Vec<Seen>)>,
     /// Since when it has had no member (0 while it has one).
     pub empty_since: u64,
     pub flows: HashMap<u32, usize>,
+    /// Its streams by id (stream slots), the ids of those that ended with
+    /// when (trunk closed), what came of streams not open yet (trunk early)
+    /// and its bytes in all.
+    pub streams: HashMap<u32, usize>,
+    pub closed: HashMap<u32, u64>,
+    pub early: HashMap<u32, Early>,
+    pub early_bytes: usize,
+    /// Streams with things a dead member carried, waiting to go again, by
+    /// id: the oldest first (trunk dropMemberLocked sorts by stream id).
+    pub stranded: BTreeSet<u32>,
 }
 
 impl Session {
@@ -41,9 +57,15 @@ impl Session {
             epoch,
             judge: Judge::new(quiet_ns),
             members: Vec::new(),
+            links: Vec::new(),
             by_wire: Vec::new(),
             empty_since: 0,
             flows: HashMap::with_capacity(256),
+            streams: HashMap::new(),
+            closed: HashMap::new(),
+            early: HashMap::new(),
+            early_bytes: 0,
+            stranded: BTreeSet::new(),
         }
     }
 
@@ -61,9 +83,30 @@ impl Session {
         for (_, ms) in self.by_wire.iter_mut() {
             ms.retain(|&x| x != m);
         }
-        if self.members.is_empty() {
+        self.maybe_empty(now);
+    }
+
+    /// A stream member joins.
+    pub fn link_join(&mut self, slot: usize, wire: u8) {
+        self.links.push((slot, wire));
+        self.empty_since = 0;
+    }
+
+    /// A stream member leaves.
+    pub fn link_leave(&mut self, slot: usize, now: u64) {
+        self.links.retain(|&(x, _)| x != slot);
+        self.maybe_empty(now);
+    }
+
+    fn maybe_empty(&mut self, now: u64) {
+        if self.no_members() {
             self.empty_since = now;
         }
+    }
+
+    /// It has no member of either kind.
+    pub fn no_members(&self) -> bool {
+        self.members.is_empty() && self.links.is_empty()
     }
 
     /// Its members up on `wire`.

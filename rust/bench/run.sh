@@ -8,7 +8,7 @@
 # whole run (warm-up too) is in the line as exit_cpu_pct.
 #
 #   run.sh <reps> <secs> "<users...>" [impls]    e.g. run.sh 3 30 "1 4 16 64" "go rust"
-#   EXIT=rust run.sh 3 30 "16 64" rust
+#   EXIT=rust run.sh 3 30 "16 64" rust      (HK_EXIT: another hk-exit build)
 set -eu
 OUT=${OUT:-/bench/out}
 REPS=${1:-3}; SECS=${2:-30}; USERS=${3:-"1 4 16 64"}; IMPLS=${4:-"go rust"}
@@ -21,7 +21,7 @@ run_one() {
   impl=$1; users=$2; rep=$3
   case $EXIT in
     go)   taskset -c "$EXIT_CPUS" "$OUT/goexit" >"$OUT/exit.log" 2>&1 & ;;
-    rust) taskset -c "$EXIT_CPUS" "$OUT/hk-exit" --glue-us "$GLUE_US" >"$OUT/exit.log" 2>&1 & ;;
+    rust) taskset -c "$EXIT_CPUS" "${HK_EXIT:-$OUT/hk-exit}" --glue-us "$GLUE_US" >"$OUT/exit.log" 2>&1 & ;;
   esac
   xpid=$!
   sleep 0.5

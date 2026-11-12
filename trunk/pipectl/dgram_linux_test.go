@@ -319,8 +319,10 @@ func TestAClientsFlowUnusedEndsAndItsNextDatagramOpensANewOne(t *testing.T) {
 			_, out, in, _, _ := e.counts()
 			return out == 40 && in == 40
 		})
-		xflows, _, _ := e.exit.counts()
+		// The entry's first: the Rust exit's counts wait for its next tick,
+		// up to a second, and the entry's flow here ends unused in one.
 		f, out, in, _, _ := e.counts()
+		xflows, _, _ := e.exit.counts()
 		t.Logf("%s: flows %d, out %d, in %d; exit flows %d (its own idle is 2 min)", e.name, f, out, in, xflows)
 		if f != 1 || xflows != 2 {
 			t.Errorf("%s: %d flows at the entry, %d at the exit; want 1 and 2 (a new stream id for the address)", e.name, f, xflows)

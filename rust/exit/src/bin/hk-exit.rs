@@ -6,8 +6,9 @@
 //! come over it. The exit ends when the brain does.
 //!
 //! Without it (the bench) the flags fix what the brain would decide: one
-//! wire on `--listen` under `--key`, the ports in `--ports` (the call's port
-//! 0 always), the glue window, the stall and Quiet.
+//! wire on `--listen` under `--key`, the pool's port of plain TCP stream
+//! members on `--pool`, the ports in `--ports` (the call's port 0 always),
+//! the glue window, the stall and Quiet.
 //!
 //! `--flow-idle-ms` (either way): a flow unused this long ends; the trunk's
 //! 2 minutes without it.
@@ -38,6 +39,7 @@ mod linux {
             stall_ns: STALL,
             quiet_ns: EXIT_QUIET,
             ports: Vec::new(),
+            pool: None,
         };
         let mut flow_idle_ms: Option<u64> = None;
         let mut tick_ns = 1_000_000u64;
@@ -55,6 +57,7 @@ mod linux {
                 "--glue-max" => a.glue_max = v.parse().expect("--glue-max"),
                 "--dead-ms" => a.stall_ns = v.parse::<u64>().expect("--dead-ms") * 1_000_000,
                 "--quiet-ms" => a.quiet_ns = v.parse::<u64>().expect("--quiet-ms") * 1_000_000,
+                "--pool" => a.pool = Some(v.parse().expect("--pool ip:port")),
                 "--ports" => a.ports = v.split(',').filter(|s| !s.is_empty()).map(|s| s.parse().expect("--ports p,q")).collect(),
                 "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
                 "--tick-us" => tick_ns = v.parse::<u64>().expect("--tick-us") * 1000,
@@ -69,9 +72,10 @@ mod linux {
             }
             None => {
                 eprintln!(
-                    "hk-exit: wire {} (id {}), glue {} us / {} B, ports {:?}, tick {} us",
+                    "hk-exit: wire {} (id {}), pool {:?}, glue {} us / {} B, ports {:?}, tick {} us",
                     a.listen,
                     a.wire,
+                    a.pool,
                     a.glue_ns / 1000,
                     a.glue_max,
                     a.ports,

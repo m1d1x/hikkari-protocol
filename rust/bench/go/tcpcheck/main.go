@@ -4,7 +4,7 @@
 // sending -bytes of a stream of its own (a PRNG by the stream's number) and
 // reading the echo back, every byte compared. It prints the time, the speed
 // and, with -pid, the entry's CPU per MiB sent (each MiB crosses the entry
-// twice: up and echoed down).
+// twice: up and echoed down); with -exit-pid, the exit's the same way (R1.7).
 //
 // With -for (R1.5) each stream sends for that long instead of -bytes, and
 // with -rate no faster than that many bytes a second: a download beside the
@@ -41,6 +41,7 @@ func main() {
 	size := flag.Int64("bytes", 1<<30, "bytes per stream")
 	streams := flag.Int("streams", 1, "streams at once")
 	pid := flag.Int("pid", 0, "the entry's pid, for its CPU")
+	exitPid := flag.Int("exit-pid", 0, "the exit's pid, for its CPU")
 	label := flag.String("label", "", "a label for the result line")
 	proxy := flag.String("proxy", "", "cut members: listen here")
 	proxyTo := flag.String("proxy-to", "127.0.0.1:20446", "cut members: the exit's member port")
@@ -58,7 +59,7 @@ func main() {
 		cutter(*proxy, *proxyTo, *cutAfter, *cutEvery, *cutHow == "freeze")
 		return
 	}
-	cpu0 := cpu(*pid)
+	cpu0, xcpu0 := cpu(*pid), cpu(*exitPid)
 	t0 := time.Now()
 	var wg sync.WaitGroup
 	errs := make([]error, *streams)
@@ -73,6 +74,7 @@ func main() {
 	wg.Wait()
 	dt := time.Since(t0)
 	cpuNs := cpu(*pid) - cpu0
+	xcpuNs := cpu(*exitPid) - xcpu0
 	bad := 0
 	for i, err := range errs {
 		if err != nil {
@@ -85,8 +87,12 @@ func main() {
 		all += n
 	}
 	mib := float64(all) / (1 << 20)
-	fmt.Printf("%s streams=%d bytes=%d ok=%d bad=%d secs=%.2f MiB/s=%.1f cpu_ms=%.0f us_per_MiB=%.1f\n",
+	fmt.Printf("%s streams=%d bytes=%d ok=%d bad=%d secs=%.2f MiB/s=%.1f cpu_ms=%.0f us_per_MiB=%.1f",
 		*label, *streams, all, *streams-bad, bad, dt.Seconds(), mib/dt.Seconds(), float64(cpuNs)/1e6, float64(cpuNs)/1e3/mib)
+	if *exitPid != 0 {
+		fmt.Printf(" exit_cpu_ms=%.0f exit_us_per_MiB=%.1f", float64(xcpuNs)/1e6, float64(xcpuNs)/1e3/mib)
+	}
+	fmt.Println()
 	if bad > 0 {
 		os.Exit(1)
 	}

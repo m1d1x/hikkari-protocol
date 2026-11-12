@@ -1,26 +1,36 @@
-//! The exit: everything the exit does with each packet of the entry's packet
-//! members (README.md, «The exit»), as trunk.Exit over udpwire does it, with
-//! the frames bound for one member glued into one datagram for a tick.
+//! The exit: everything the exit does with each packet of the entry's
+//! members (README.md, «The exit»), as trunk.Exit does it: packet members
+//! over udpwire, with the frames bound for one member glued into one
+//! datagram for a tick, and stream members over TCP with the streams they
+//! carry to the loopback services.
 //!
 //! What is the brain's (trunk/pipectl): it binds the wire's socket and hands
 //! it over with the wire keys (the exit never sees a trunk key), the members'
-//! stall and Quiet, and the loopback ports open to the trunk; it reads a tick
-//! a second. Without a brain (flags, the bench) the exit binds its own.
+//! stall and Quiet, the pool's listening socket, and the loopback ports open
+//! to the trunk; it reads a tick a second. Without a brain (flags, the
+//! bench) the exit binds its own.
 //!
 //! One thread, no runtime, nothing allocated per packet once a flow is open.
 //! Under traffic the loop runs on a tick: it sleeps to the next one, takes
 //! everything each wire has with recvmmsg and every relay socket epoll says
-//! is ready, and sends with sendmmsg.
+//! is ready, and sends with sendmmsg; stream sockets are read and written as
+//! their epoll says they can be.
 //!
 //! Its parts: wire.rs (the entry's datagrams: hellos, pings, a flow's
-//! datagrams), relay.rs (flows to and from the loopback services), timers.rs
-//! (members' health on their clock, idle flows, members and sessions),
-//! brain.rs (the brain's messages, the tick).
+//! datagrams), relay.rs (flows to and from the loopback services), tcp.rs
+//! (stream members and their streams), death.rs (what a dead stream member
+//! carried, again), timers.rs (members' health on their clock, idle flows,
+//! members and sessions), brain.rs (the brain's messages, the tick).
 
 mod brain;
+mod death;
 mod relay;
+mod stream;
+mod tcp;
 mod timers;
 mod wire;
+
+pub use tcp::Pool;
 
 use std::collections::HashMap;
 use std::io;
@@ -33,8 +43,10 @@ use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, Tick};
 use crate::flow::{Flows, Seen};
+use crate::link::Links;
 use crate::peer::{Peer, Wire, NONE, SLOT};
 use crate::session::Sessions;
+use crate::streams::Streams;
 
 /// The exit's Quiet (trunk ExitQuiet): every member silent at once is the
 /// entry paused or the whole path, and the exit, which cannot open members,
@@ -42,6 +54,9 @@ use crate::session::Sessions;
 pub const EXIT_QUIET: u64 = 30_000_000_000;
 /// Most entry addresses served at once (udpwire MaxPeers).
 pub const MAX_PEERS: usize = 1024;
+/// Events the stream sockets' epoll reports per call; more are taken by the
+/// next call in the same turn.
+const TCP_EVENTS: usize = 1024;
 
 /// Flags of an exit without a brain (the bench).
 pub struct Alone {
@@ -54,6 +69,8 @@ pub struct Alone {
     pub quiet_ns: u64,
     /// The loopback ports open to the trunk; the call's port 0 always is.
     pub ports: Vec<u16>,
+    /// The pool's port: plain TCP stream members (None: none).
+    pub pool: Option<SocketAddrV4>,
 }
 
 pub struct Exit {
@@ -66,6 +83,16 @@ pub struct Exit {
     by_addr: HashMap<u64, usize>,
     sessions: Sessions,
     flows: Flows,
+    pool: Option<Pool>,
+    links: Links,
+    streams: Streams,
+    /// The stream sockets: the pool's, the members', the local ends'.
+    tcp: Epoll,
+    /// What acks of one read confirmed: (carrier, bytes), applied after it.
+    released: Vec<(u32, u32)>,
+    /// Streams to end after the pass that found them done or failed (slot,
+    /// gen, why).
+    doomed: Vec<(usize, u32, stream::Why)>,
     /// The loopback ports open to the trunk, by port.
     ports: Vec<bool>,
     /// The flows' relay sockets, by flow slot and gen.
@@ -104,6 +131,12 @@ impl Exit {
             by_addr: HashMap::with_capacity(64),
             sessions: Sessions::new(),
             flows: Flows::new(),
+            pool: None,
+            links: Links::new(),
+            streams: Streams::new(),
+            tcp: Epoll::new(TCP_EVENTS)?,
+            released: Vec::with_capacity(256),
+            doomed: Vec::with_capacity(64),
             ports: vec![false; 1 << 16],
             relays: Epoll::new(256)?,
             poll: Poll::new(),
@@ -143,6 +176,9 @@ impl Exit {
         x.wires.push(Wire::new(a.wire, sock, keys, a.stall_ns, a.quiet_ns, a.glue_ns, a.glue_max));
         for &p in &a.ports {
             x.ports[p as usize] = true;
+        }
+        if let Some(addr) = a.pool {
+            x.set_pool(Pool { fd: sys::tcp_listen(addr)?, stall_ns: a.stall_ns, quiet_ns: a.quiet_ns })?;
         }
         Ok(x)
     }
@@ -202,20 +238,26 @@ impl Exit {
             let now = now_ns();
             self.read_wires(now);
             self.read_relays(now);
+            self.tcp_events(now);
+            self.read_links(now);
+            self.read_locals(now);
+            self.write_locals(now);
+            self.flush_links(now);
             self.seal_due(now_ns());
             busy = self.moved != moved0;
         }
     }
 
-    /// The poll set: the brain, each wire, the relays' epoll (readable when
-    /// any relay socket is).
+    /// The poll set: the brain, each wire, the relays' epoll and the stream
+    /// sockets' (each readable when any of its sockets has something).
     fn rebuild_poll(&mut self) {
-        let mut fds: Vec<i32> = Vec::with_capacity(2 + self.wires.len());
+        let mut fds: Vec<i32> = Vec::with_capacity(3 + self.wires.len());
         if let Some(c) = &self.ctl {
             fds.push(c.fd);
         }
         fds.extend(self.wires.iter().map(|w| w.fd()));
         fds.push(self.relays.fd);
+        fds.push(self.tcp.fd);
         self.poll.set(fds.into_iter());
         self.dirty = false;
     }
@@ -310,5 +352,24 @@ impl Exit {
             t.bad,
             self.wires.iter().map(|w| w.send.dropped).sum::<u64>()
         );
+        if self.pool.is_some() {
+            let n = &self.streams.n;
+            eprintln!(
+                "hk-exit: links={} streams open={} opened={} fin={} rst_peer={} rst_local={} hit={} resent={} early={}/{} up={}MiB down={}MiB link_dgrams={}",
+                t.links,
+                self.streams.open,
+                n.opened,
+                n.fin,
+                n.reset_peer,
+                n.reset_local,
+                n.deaths,
+                n.resent,
+                n.early,
+                n.early_dropped,
+                n.up >> 20,
+                n.down >> 20,
+                t.link_dgrams
+            );
+        }
     }
 }

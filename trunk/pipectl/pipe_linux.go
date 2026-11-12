@@ -146,7 +146,11 @@ func (p *Pipe) Done() <-chan struct{} { return p.done }
 
 // send writes one message with the sockets of conns.
 func (p *Pipe) send(msg []byte, conns ...*net.UDPConn) error {
-	return sendWith(p.conn, &p.wmu, msg, conns...)
+	sc := make([]syscall.Conn, len(conns))
+	for i, c := range conns {
+		sc[i] = c
+	}
+	return sendWith(p.conn, &p.wmu, msg, sc...)
 }
 
 // Listen gives the pipe a client port: its datagrams are flows of class,

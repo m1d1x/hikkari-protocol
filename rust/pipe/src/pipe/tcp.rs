@@ -7,13 +7,14 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use hikkari_sys::{self as sys, Io};
+use hikkari_trunk::buf::Out;
 use hikkari_trunk::frame::{self, Frame, ACK_FIN, ACK_LEN, NO_GOT};
 use hikkari_trunk::health::Verdict;
 use hikkari_trunk::stream::{CHUNK, NO_CARRIER};
 
 use super::{Event, Pipe, Slot};
 use crate::ctl;
-use crate::link::{carrier, carrier_of, Link, Out, StreamWire};
+use crate::link::{self, carrier, carrier_of, Link, StreamWire};
 use crate::streams::{Stream, StreamCounts, Streams};
 
 /// A client port of streams: its listening socket and the exit's port.
@@ -362,7 +363,7 @@ impl Pipe {
             for li in 0..self.swires[wi].links.len() {
                 let l = &mut self.swires[wi].links[li];
                 let Some(fd) = &l.fd else { continue };
-                if let Io::Gone = l.out.flush(fd) {
+                if let Io::Gone = link::flush(&mut l.out, fd) {
                     self.link_down(wi, li, ctl::WHY_GONE, now);
                 }
             }

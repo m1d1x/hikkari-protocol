@@ -7,6 +7,10 @@
 # Runs inside a Linux box (docker on the mac, README.md); the entry on CPUs
 # 0-1, the exit and echo on 4-5, the clients on 2-3.
 #
+# With EXIT=rust (R1.7) the exit is hk-exit, its pool on the same port and
+# its streams to the echo's port 9000 (its own UDP wire on 20447); the line
+# then has the exit's CPU per MiB too (exit_us_per_MiB, either exit).
+#
 # With CUT=rst or CUT=freeze (R1.4) the members go through tcpcheck -proxy,
 # which cuts the busiest member every CUT_EVERY (3s) from CUT_AFTER (2s).
 #
@@ -19,12 +23,16 @@ EXIT_CPUS=${EXIT_CPUS:-4,5}; GEN_CPUS=${GEN_CPUS:-2,3}; ENTRY_CPUS=${ENTRY_CPUS:
 # PIPE: the hk-pipe to run as rust (another build to compare).
 CUT=${CUT:-}; CUT_EVERY=${CUT_EVERY:-3s}; CUT_AFTER=${CUT_AFTER:-2s}
 POOL=127.0.0.1:20446
+EXIT=${EXIT:-go}
 
 run_one() {
   impl=$1; rep=$2
   taskset -c "$EXIT_CPUS" "$OUT/tcpcheck" -serve 127.0.0.1:9000 >"$OUT/echo.log" 2>&1 &
   epid_echo=$!
-  taskset -c "$EXIT_CPUS" "$OUT/goexit" >"$OUT/exit.log" 2>&1 &
+  case $EXIT in
+    go)   taskset -c "$EXIT_CPUS" "$OUT/goexit" >"$OUT/exit.log" 2>&1 & ;;
+    rust) taskset -c "$EXIT_CPUS" "${HK_EXIT:-$OUT/hk-exit}" --pool "$POOL" --ports 9000 >"$OUT/exit.log" 2>&1 & ;;
+  esac
   xpid=$!
   pool=$POOL; cpid=
   if [ -n "$CUT" ]; then
@@ -39,12 +47,13 @@ run_one() {
   esac
   epid=$!
   sleep 1.5
-  line=$(taskset -c "$GEN_CPUS" "$OUT/tcpcheck" -to 127.0.0.1:8444 -bytes "$BYTES" -streams "$STREAMS" -pid "$epid" -label "$impl#$rep m$MEMBERS s$STREAMS") || true
+  line=$(taskset -c "$GEN_CPUS" "$OUT/tcpcheck" -to 127.0.0.1:8444 -bytes "$BYTES" -streams "$STREAMS" -pid "$epid" -exit-pid "$xpid" -label "$impl-$EXIT#$rep m$MEMBERS s$STREAMS${CUT:+ cut=$CUT}") || true
   echo "$line" | tee -a "$RES"
   sleep 1
   kill $epid $xpid $epid_echo $cpid 2>/dev/null || true
   wait $epid $xpid $epid_echo $cpid 2>/dev/null || true
   tail -n 2 "$OUT/entry-tcp-$impl.log" | sed "s/^/  [$impl] /"
+  tail -n 2 "$OUT/exit.log" | sed "s/^/  [exit $EXIT] /"
   [ -z "$CUT" ] || echo "  [$impl] cuts: $(grep -c '^.*cut ' "$OUT/cut-$impl.log")"
 }
 
