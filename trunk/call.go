@@ -115,17 +115,37 @@ type callBucket struct {
 	rtts     []time.Duration
 	arrivals []time.Time
 	sessions map[*Session]bool
+	last     *Session // the session of the last send, to skip the map
+	closed   bool     // reported: its datagrams' answers no longer count
+}
+
+// callSent is one datagram sent and not yet past its window's Grace.
+type callSent struct {
+	at       time.Time
+	b        *callBucket // its window; nil for a seq never sent
+	answered bool
 }
 
 // call is a running call's state, shared by its sender and the answers.
+//
+// The datagrams sent are a ring in seq order (the sender numbers them one
+// after another), so an answer finds its datagram by its seq, and a tick only
+// looks at the windows still open (two or three) and drops from the ring's
+// head what their reports took: no tick walks the minute of datagrams sent.
 type call struct {
 	cfg   CallConfig
 	start time.Time
 
 	mu      sync.Mutex
-	buckets map[time.Time]*callBucket
-	answers map[uint64]bool // seqs answered, of the windows still open
-	sentAt  map[uint64]time.Time
+	buckets []*callBucket // the open windows, oldest first
+	ring    []callSent    // a power of two long
+	head    int           // the oldest datagram's place in ring
+	n       int           // datagrams in ring
+	base    uint64        // the oldest datagram's seq
+}
+
+func newCall(cfg CallConfig, start time.Time) *call {
+	return &call{cfg: cfg, start: start, ring: make([]callSent, 64)}
 }
 
 // RunCall keeps a call going on the session session gives (the entry's
@@ -133,7 +153,7 @@ type call struct {
 // once its Grace is over. report runs on the call's own goroutine.
 func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, report func(CallWindow)) {
 	cfg = cfg.withDefaults()
-	c := &call{cfg: cfg, start: time.Now(), buckets: map[time.Time]*callBucket{}, answers: map[uint64]bool{}, sentAt: map[uint64]time.Time{}}
+	c := newCall(cfg, time.Now())
 	var (
 		cur  *Session
 		flow *Flow
@@ -178,14 +198,46 @@ func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, repor
 	}
 }
 
+// bucketLocked is the open window at falls in, opened if there is none.
 func (c *call) bucketLocked(at time.Time) *callBucket {
-	from := at.Truncate(c.cfg.Window)
-	b := c.buckets[from]
-	if b == nil {
-		b = &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[*Session]bool{}}
-		c.buckets[from] = b
+	for i := len(c.buckets) - 1; i >= 0; i-- {
+		if b := c.buckets[i]; !at.Before(b.from) && at.Before(b.to) {
+			return b
+		}
 	}
+	from := at.Truncate(c.cfg.Window)
+	per := min(int(c.cfg.Window/c.cfg.Every)+1, 1<<14)
+	b := &callBucket{from: from, to: from.Add(c.cfg.Window), sessions: map[*Session]bool{},
+		rtts: make([]time.Duration, 0, per), arrivals: make([]time.Time, 0, per)}
+	i := len(c.buckets)
+	for i > 0 && c.buckets[i-1].from.After(from) {
+		i--
+	}
+	c.buckets = append(c.buckets, nil)
+	copy(c.buckets[i+1:], c.buckets[i:])
+	c.buckets[i] = b
 	return b
+}
+
+// slot is seq's place in the ring, if it is there.
+func (c *call) slot(seq uint64) *callSent {
+	if seq < c.base || seq-c.base >= uint64(c.n) {
+		return nil
+	}
+	return &c.ring[(c.head+int(seq-c.base))&(len(c.ring)-1)]
+}
+
+// push adds one datagram at the ring's tail, growing it when full.
+func (c *call) push(r callSent) {
+	if c.n == len(c.ring) {
+		grown := make([]callSent, 2*len(c.ring))
+		for i := 0; i < c.n; i++ {
+			grown[i] = c.ring[(c.head+i)&(len(c.ring)-1)]
+		}
+		c.ring, c.head = grown, 0
+	}
+	c.ring[(c.head+c.n)&(len(c.ring)-1)] = r
+	c.n++
 }
 
 func (c *call) sent(seq uint64, at time.Time, s *Session) {
@@ -193,29 +245,45 @@ func (c *call) sent(seq uint64, at time.Time, s *Session) {
 	defer c.mu.Unlock()
 	b := c.bucketLocked(at)
 	b.sent++
-	b.sessions[s] = true
-	c.sentAt[seq] = at
+	if b.last != s || len(b.sessions) == 0 {
+		b.sessions[s] = true
+		b.last = s
+	}
+	if c.n == 0 {
+		c.base = seq
+	}
+	switch {
+	case seq < c.base:
+		// Older than every datagram kept: RunCall never numbers back.
+	case seq-c.base < uint64(c.n):
+		r := c.slot(seq)
+		r.at, r.b = at, b
+	default:
+		for c.base+uint64(c.n) < seq {
+			c.push(callSent{}) // a seq skipped: nothing was sent under it
+		}
+		c.push(callSent{at: at, b: b})
+	}
 }
 
 // answer takes one datagram back. It runs with the session locked (a flow's
 // deliver), so it only notes it.
-func (c *call) answer(p []byte) {
-	now := time.Now()
+func (c *call) answer(p []byte) { c.answerAt(time.Now(), p) }
+
+func (c *call) answerAt(now time.Time, p []byte) {
 	if len(p) < 8 {
 		return
 	}
 	seq := binary.BigEndian.Uint64(p)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	at, ok := c.sentAt[seq]
-	if !ok || c.answers[seq] {
+	r := c.slot(seq)
+	if r == nil || r.b == nil || r.b.closed || r.answered {
 		return // a window already reported, or a copy the replay window let by
 	}
-	c.answers[seq] = true
-	if sb := c.buckets[at.Truncate(c.cfg.Window)]; sb != nil {
-		sb.got++
-		sb.rtts = append(sb.rtts, now.Sub(at))
-	}
+	r.answered = true
+	r.b.got++
+	r.b.rtts = append(r.b.rtts, now.Sub(r.at))
 	ab := c.bucketLocked(now)
 	ab.arrivals = append(ab.arrivals, now)
 }
@@ -224,17 +292,36 @@ func (c *call) answer(p []byte) {
 func (c *call) due(now time.Time) []CallWindow {
 	c.mu.Lock()
 	var done []*callBucket
-	for from, b := range c.buckets {
+	open := c.buckets[:0]
+	for _, b := range c.buckets {
 		if now.Sub(b.to) >= c.cfg.Grace {
+			b.closed = true
 			done = append(done, b)
-			delete(c.buckets, from)
+		} else {
+			open = append(open, b)
 		}
 	}
-	for seq, at := range c.sentAt {
-		if now.Sub(at.Truncate(c.cfg.Window).Add(c.cfg.Window)) >= c.cfg.Grace {
-			delete(c.sentAt, seq)
-			delete(c.answers, seq)
+	for i := len(open); i < len(c.buckets); i++ {
+		c.buckets[i] = nil
+	}
+	c.buckets = open
+	if done == nil {
+		c.mu.Unlock()
+		return nil
+	}
+	// The datagrams of the windows reported leave from the ring's head. A
+	// wall clock set back can leave a later window's datagrams before an
+	// earlier one's: those stay until the head goes, and their answers do
+	// not count, their window being closed.
+	for c.n > 0 {
+		r := &c.ring[c.head]
+		if r.b != nil && !r.b.closed {
+			break
 		}
+		*r = callSent{}
+		c.head = (c.head + 1) & (len(c.ring) - 1)
+		c.n--
+		c.base++
 	}
 	c.mu.Unlock()
 	sort.Slice(done, func(i, j int) bool { return done[i].from.Before(done[j].from) })
