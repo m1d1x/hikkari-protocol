@@ -174,13 +174,12 @@ fn main() {
     let mut session = [0u8; 16];
     sys::urandom(&mut session);
     let mut members: Vec<Member> = (0..o.members)
-        .map(|i| {
+        .map(|_| {
             let s = UdpSocket::bind("0.0.0.0:0").expect("bind member");
             s.connect(o.exit).expect("connect exit");
             sys::tune(&s, false).expect("member socket");
-            let mut prefix = [0u8; 4];
-            sys::urandom(&mut prefix);
-            prefix[0] = prefix[0].wrapping_add(i as u8);
+            let mut seed = [0u8; 12];
+            sys::urandom(&mut seed);
             let fd = s.as_raw_fd();
             Member {
                 sock: s,
@@ -195,7 +194,7 @@ fn main() {
                 glue: [0; SLOT],
                 glue_n: 0,
                 glue_since: 0,
-                seal: Seal::new(&o.key, prefix),
+                seal: Seal::new(&o.key, seed),
             }
         })
         .collect();
@@ -339,7 +338,7 @@ fn main() {
                     let mut at = 0;
                     while let Some((fr, nx)) = wire::next_frame(p, at) {
                         match fr {
-                            Frame::Dgram { stream, off, len } => {
+                            Frame::Dgram { stream, off, len, .. } => {
                                 if let Some(f) = flows.get((stream as usize).wrapping_sub(1)) {
                                     if down.full() {
                                         down.flush(cfd);
@@ -349,7 +348,7 @@ fn main() {
                                     st.c_out += 1;
                                 }
                             }
-                            Frame::Hello => m.up = true,
+                            Frame::Hello { .. } => m.up = true,
                             Frame::Ping(t) => {
                                 let now = now_ns();
                                 m.glue_frame(9, o.glue_max, now, &mut st, |b| wire::put_ping(b, wire::F_PONG, t));

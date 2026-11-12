@@ -11,7 +11,7 @@ hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2
 - It is blind, as the Go entry: a client's datagram channel is QUIC end to end with the exit's relay. The pipe reads client
   UDP datagrams on the listened port as opaque bytes, gives each client address a flow (stream id, seq), and carries every
   datagram as a `dgram` frame (one copy, as the entry carries a one-copy port) over the bare UDP wire (`trunk/udpwire`:
-  AES-256-GCM under HKDF-SHA256(trunk key, "hikkari trunk udp wire")) to an unchanged Go exit.
+  AES-256-GCM under HKDF-SHA256(trunk key, "hikkari trunk udp wire")) to the exit (`hk-exit`, or the Go `goexit`).
 - It glues the frames of all clients bound for one member into one sealed datagram, for one tick (1 ms) or up to about
   1200 bytes. The wire already allows it: a packet member reads one frame sequence per datagram.
 - Under traffic it runs on a tick: it sleeps to the next millisecond, then takes everything each socket has with
@@ -24,18 +24,35 @@ hikkari-client `plans/research/2026-11-12-rust-pipe-prototype.md`; why: `plans/2
 Left out on purpose: streams (TCP) and the pool, other wires, the selector, the trunk's calls, drains and generations,
 observation, flow idle ends, IPv6, GSO on send (the glued datagrams differ in size; answers go to different clients).
 
+`hk-exit` is the UDP half of the exit, the R1 of the hot-path plan: the end of the same bare UDP wire, one socket, a peer
+per entry member address. It opens each sealed datagram, answers the hello with the session's epoch, pongs the entry's
+pings, and for every `dgram` frame either echoes it (port 0, `trunk.EchoPort`: the bench's users and the trunk's own call)
+or relays it to a loopback socket of the flow's own. Unlike `goexit` (whose packet member writes every frame in a datagram
+of its own, `trunk/session.go writePackets`) it glues the frames bound for one peer into one sealed datagram per tick, the
+way `hk-pipe` glues the way up. So the way down is as batched as the way up, and the entry pays one `recvmmsg` and one AES
+open for several datagrams rather than one each. Copies are dropped by the sender's sequence (`trunk.replay`). It leaves out
+the same things `hk-pipe` does; the relay half (port != 0) is built but the bench runs on echo, as `goexit` does.
+
 `hk-loadgen` is the bench's users (cascade-load-v1 per user: voice 50/s, game 200/s, acks 125/s, in the sizes the entry's
 capture saw). `bench/go` holds the Go side: `goentry` (the production entry's UDP path over `trunk` and `udpwire`) and
-`goexit` (`trunk.Exit` with the wire, echo on port 0).
+`goexit` (`trunk.Exit` with the wire, echo on port 0). `EXIT=go|rust` in `run.sh` picks which exit the entry is measured
+against.
 
 ## Build and bench
 
 ```bash
 rustup target add aarch64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
-cp target/aarch64-unknown-linux-musl/release/hk-pipe target/aarch64-unknown-linux-musl/release/hk-loadgen bench/out/
+T=target/aarch64-unknown-linux-musl/release
+cp "$T/hk-pipe" "$T/hk-loadgen" "$T/hk-exit" bench/out/
 (cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goentry ./goentry && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goexit ./goexit)
+# The entry (go/rust/rustev) against the Go exit, as the first prototype did:
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/run.sh 3 30 "1 4 16 64" "go rust rustev"
+# R1: the Rust entry against the Rust exit (frames glued down per tick) and the Go exit, to compare:
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim sh -c '
+  EXIT=rust RES=/bench/out/r1-rustexit.txt /bench/run.sh 3 30 "1 4 16 64" "rust"
+  EXIT=go   RES=/bench/out/r1-goexit.txt   /bench/run.sh 3 30 "1 4 16 64" "rust"'
+python3 bench/summary.py bench/out/r1-rustexit.txt
 ```
 
 The entry runs on CPUs 0–1 (`taskset`), the users and the exit on CPUs of their own; `hk-loadgen` reads the entry's CPU

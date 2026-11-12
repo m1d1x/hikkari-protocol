@@ -20,8 +20,28 @@ pub const F_OBSERVE: u8 = 11;
 
 /// A dgram frame's head: type, stream u32, seq u32, port u16, n u16.
 pub const DGRAM_HEAD: usize = 13;
+/// The port of the exit's echo (trunk.EchoPort): no loopback service has it,
+/// so a dgram to it is the trunk's own call or the bench's users, sent back.
+pub const ECHO_PORT: u16 = 0;
 /// What the seal adds: a 12-byte nonce and a 16-byte tag.
 pub const OVERHEAD: usize = 12 + 16;
+
+/// The exit's answer to a hello: the same session id, the exit session's
+/// epoch, and for a t2 hello the same wire and flags.
+pub fn put_hello(out: &mut [u8], session: &[u8], epoch: &[u8; 8], t2: Option<(u8, u8)>) -> usize {
+    out[0] = F_HELLO;
+    out[1..5].copy_from_slice(if t2.is_some() { b"HKT2" } else { b"HKT1" });
+    out[5..21].copy_from_slice(&session[..16]);
+    out[21..29].copy_from_slice(epoch);
+    match t2 {
+        Some((wire, flags)) => {
+            out[29] = wire;
+            out[30] = flags;
+            31
+        }
+        None => 29,
+    }
+}
 
 /// A t2 hello of a packet member of `wire` (flags: packet, no streams).
 pub fn hello_t2(out: &mut [u8], session: &[u8; 16], wire: u8) -> usize {
@@ -54,8 +74,13 @@ pub fn put_ping(out: &mut [u8], typ: u8, token: u64) -> usize {
 
 /// One frame read from a datagram's plaintext.
 pub enum Frame {
-    Hello,
-    Dgram { stream: u32, off: usize, len: usize },
+    /// A hello: its session id at `at..at + 16`, then the epoch [8]; a t2
+    /// one has the wire and its flags after the epoch.
+    Hello { at: usize, t2: bool },
+    /// A dgram: its stream, its sender's sequence (the receiver drops copies
+    /// by it), the destination port (0 is the exit's echo), and the payload
+    /// at `off..off + len`.
+    Dgram { stream: u32, seq: u32, port: u16, off: usize, len: usize },
     Ping(u64),
     Pong(u64),
     Drain,
@@ -77,8 +102,12 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
             if rest < 28 {
                 return None;
             }
-            let n = if &p[b..b + 4] == b"HKT2" { 30 } else { 28 };
-            Some((Frame::Hello, fixed(n)?))
+            let t2 = &p[b..b + 4] == b"HKT2";
+            if !t2 && &p[b..b + 4] != b"HKT1" {
+                return None;
+            }
+            let n = if t2 { 30 } else { 28 };
+            Some((Frame::Hello { at: b + 4, t2 }, fixed(n)?))
         }
         F_DGRAM => {
             if rest < 12 {
@@ -88,7 +117,9 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
             if rest < 12 + n {
                 return None;
             }
-            Some((Frame::Dgram { stream: be32(b), off: b + 12, len: n }, b + 12 + n))
+            let seq = be32(b + 4);
+            let port = u16::from_be_bytes([p[b + 8], p[b + 9]]);
+            Some((Frame::Dgram { stream: be32(b), seq, port, off: b + 12, len: n }, b + 12 + n))
         }
         F_PING => Some((Frame::Ping(be64(fixed(8)? - 8)), b + 8)),
         F_PONG => Some((Frame::Pong(be64(fixed(8)? - 8)), b + 8)),
@@ -109,10 +140,56 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
     }
 }
 
+/// Drops copies: a sliding window of the last 1024 sequence numbers, as
+/// trunk.replay (trunk/flows.go). A packet member sends each datagram once,
+/// so a repeat is a copy from another member or a replayed recording; seq 0
+/// is always a copy (an unseqd datagram). The exit dedups a flow this way
+/// before it echoes or relays.
+#[derive(Default)]
+pub struct Replay {
+    top: u32,
+    bits: [u64; 16],
+}
+
+impl Replay {
+    /// Whether `seq` was seen before (so it is a copy and must be dropped).
+    pub fn seen(&mut self, seq: u32) -> bool {
+        const SIZE: u32 = 1024;
+        if seq == 0 {
+            return true;
+        }
+        if seq > self.top {
+            let shift = seq - self.top;
+            if shift >= SIZE {
+                self.bits = [0; 16];
+            } else {
+                let mut i = self.top + 1;
+                while i <= seq {
+                    self.bits[((i % SIZE) / 64) as usize] &= !(1u64 << (i % 64));
+                    i += 1;
+                }
+            }
+            self.top = seq;
+        } else if self.top - seq >= SIZE {
+            return true; // too old to tell: dropped as a late copy
+        }
+        let word = ((seq % SIZE) / 64) as usize;
+        let bit = 1u64 << (seq % 64);
+        if self.bits[word] & bit != 0 {
+            return true;
+        }
+        self.bits[word] |= bit;
+        false
+    }
+}
+
 /// The wire's cipher: AES-256-GCM under HKDF-SHA256(trunk key, "hikkari
 /// trunk udp wire"), as trunk/udpwire. The nonce is a random prefix and a
-/// counter, not 12 random bytes per datagram as udpwire draws: unique per
-/// key all the same, and no read of the random source per packet.
+/// counter from a random start, not 12 random bytes per datagram as udpwire
+/// draws: every sealer (each member of the entry, each peer of the exit, all
+/// under one key) draws its own 12 random bytes once, so two of them meet
+/// on a nonce no likelier than udpwire's, and no read of the random source
+/// per packet.
 pub struct Seal {
     aead: Aes256Gcm,
     prefix: [u8; 4],
@@ -120,18 +197,30 @@ pub struct Seal {
 }
 
 impl Seal {
-    pub fn new(trunk_key: &str, prefix: [u8; 4]) -> Seal {
+    /// The sealer of a trunk key, its nonces from `seed`: 12 random bytes.
+    pub fn new(trunk_key: &str, seed: [u8; 12]) -> Seal {
+        Seal::with_aead(Seal::aead(trunk_key), seed)
+    }
+
+    /// The wire's cipher for a trunk key (derived once, cloned per sealer).
+    pub fn aead(trunk_key: &str) -> Aes256Gcm {
         let hk = Hkdf::<Sha256>::new(None, trunk_key.as_bytes());
         let mut k = [0u8; 32];
         hk.expand(b"hikkari trunk udp wire", &mut k).expect("hkdf 32");
-        Seal { aead: Aes256Gcm::new_from_slice(&k).expect("key"), prefix, ctr: 0 }
+        Aes256Gcm::new_from_slice(&k).expect("key")
+    }
+
+    pub fn with_aead(aead: Aes256Gcm, seed: [u8; 12]) -> Seal {
+        let mut prefix = [0u8; 4];
+        prefix.copy_from_slice(&seed[..4]);
+        Seal { aead, prefix, ctr: u64::from_be_bytes(seed[4..].try_into().unwrap()) }
     }
 
     /// Seals in place: `buf[12..12 + n]` holds the plaintext; writes the
     /// nonce before it and the tag after it, and returns the datagram's size.
     #[inline]
     pub fn seal(&mut self, buf: &mut [u8], n: usize) -> usize {
-        self.ctr += 1;
+        self.ctr = self.ctr.wrapping_add(1);
         buf[..4].copy_from_slice(&self.prefix);
         buf[4..12].copy_from_slice(&self.ctr.to_be_bytes());
         let (head, body) = buf.split_at_mut(12);
@@ -165,7 +254,7 @@ mod tests {
 
     #[test]
     fn seal_opens() {
-        let mut s = Seal::new("k", [1, 2, 3, 4]);
+        let mut s = Seal::new("k", [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
         let mut b = [0u8; 64];
         b[12..17].copy_from_slice(b"hello");
         let n = s.seal(&mut b, 5);
@@ -195,5 +284,38 @@ mod tests {
         }
         assert_eq!(seen, ["d7/3", "p42", "d8/0"]);
         assert!(next_frame(&b[..5], 0).is_none());
+    }
+
+    #[test]
+    fn replay_drops_copies() {
+        let mut r = Replay::default();
+        assert!(r.seen(0), "seq 0 is always a copy");
+        assert!(!r.seen(1), "the first of a seq is new");
+        assert!(r.seen(1), "the same seq again is a copy");
+        for s in 2..=100 {
+            assert!(!r.seen(s), "{s} is new");
+        }
+        assert!(r.seen(50), "a seq within the window is a copy");
+        assert!(!r.seen(200), "a jump forward is new");
+        assert!(!r.seen(150), "a late one still in the window is new");
+        assert!(r.seen(150), "but only once");
+        let _ = r.seen(5000);
+        assert!(r.seen(200), "too old to tell is dropped as a copy");
+        assert!(!r.seen(9000), "far ahead, past the whole window, is new");
+    }
+
+    #[test]
+    fn hello_answered_in_kind() {
+        let sid = [7u8; 16];
+        let mut b = [0u8; 64];
+        let n = hello_t2(&mut b, &sid, 2);
+        let Some((Frame::Hello { at, t2: true }, end)) = next_frame(&b[..n], 0) else { panic!("no t2 hello") };
+        assert_eq!((end, &b[at..at + 16]), (n, &sid[..]));
+        let mut a = [0u8; 64];
+        let m = put_hello(&mut a, &b[at..at + 16], &[9; 8], Some((b[at + 24], b[at + 25])));
+        assert_eq!((m, &a[..5], a[29], a[30]), (31, &b"\x01HKT2"[..], 2, 2));
+        let k = put_hello(&mut a, &sid, &[9; 8], None);
+        let Some((Frame::Hello { t2: false, .. }, end)) = next_frame(&a[..k], 0) else { panic!("no t1 hello") };
+        assert_eq!(end, 29);
     }
 }

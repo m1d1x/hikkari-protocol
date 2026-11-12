@@ -245,3 +245,62 @@ pub fn sleep_until(at: u64) {
     let ts = libc::timespec { tv_sec: (at / 1_000_000_000) as _, tv_nsec: (at % 1_000_000_000) as _ };
     unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, libc::TIMER_ABSTIME, &ts, std::ptr::null_mut()) };
 }
+
+/// Readiness of many sockets at once (the exit's sockets to its relay, one
+/// per flow): one epoll_wait per tick instead of a read per socket.
+pub struct Epoll {
+    pub fd: i32,
+    ev: Vec<libc::epoll_event>,
+}
+
+impl Epoll {
+    pub fn new() -> io::Result<Epoll> {
+        let fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Epoll { fd, ev: vec![libc::epoll_event { events: 0, u64: 0 }; 256] })
+    }
+
+    pub fn add(&self, fd: i32, data: u64) -> io::Result<()> {
+        let mut e = libc::epoll_event { events: libc::EPOLLIN as u32, u64: data };
+        if unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_ADD, fd, &mut e) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The data of every socket readable now, without waiting; level
+    /// triggered, so one not read empty comes again.
+    pub fn ready(&mut self) -> impl Iterator<Item = u64> + '_ {
+        let n = unsafe { libc::epoll_wait(self.fd, self.ev.as_mut_ptr(), self.ev.len() as _, 0) };
+        let n = n.max(0) as usize;
+        self.ev[..n].iter().map(|e| e.u64)
+    }
+}
+
+/// A UDP socket to 127.0.0.1:port from an ephemeral port of its own (one
+/// flow's socket to the relay), non-blocking.
+pub fn udp_to_loopback(port: u16) -> io::Result<UdpSocket> {
+    let s = UdpSocket::bind("127.0.0.1:0")?;
+    s.connect(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, port))?;
+    s.set_nonblocking(true)?;
+    Ok(s)
+}
+
+/// Sends one datagram to `to` on an unconnected socket (the exit's one socket
+/// answers many entry addresses). A refused send is dropped, as a full buffer
+/// would drop it.
+#[inline]
+pub fn send_to(fd: i32, buf: &[u8], to: &libc::sockaddr_in) {
+    unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const _,
+            buf.len(),
+            0,
+            to as *const _ as *const libc::sockaddr,
+            size_of::<libc::sockaddr_in>() as u32,
+        );
+    }
+}
