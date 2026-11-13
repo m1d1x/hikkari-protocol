@@ -19,13 +19,14 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 4
+const Version = 5
 
 // Brain → pipe.
 const (
@@ -40,6 +41,16 @@ const (
 	bMember = 0x09 // wire u8, index u8; one socket
 	bDrain  = 0x0a // one socket: the old end of a handoff
 	bAdopt  = 0x0b // one socket: the new end of a handoff
+	// tcp_listen and pool: the streams' part (rust/pipe/src/pipe/pool.rs).
+	bTCPListen = 0x0c // id u8, to u16; one socket: a listening TCP socket
+	bPool      = 0x0d // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots
+)
+
+// A pool's forms: stream members over plain TCP to the exit's member port,
+// or Chromium's CONNECT to the exit's relay (trunk/chromium).
+const (
+	poolPlain    = 1
+	poolChromium = 2
 )
 
 // Pipe → brain.
@@ -84,6 +95,64 @@ func putListen(id byte, class trunk.Class, to uint16, copies int) []byte {
 	return append(b, byte(copies))
 }
 
+// Pool is a wire of stream members the pipe dials itself, as the Go
+// entry's pool (trunk.Entry): Members connections from source ports of
+// Ports (lo, hi), each a member of the session, judged by Stall.
+type Pool struct {
+	ID      trunk.WireID
+	Members int
+	Stall   time.Duration
+	Ports   [2]uint16
+	// Exit is the exit's member port (plain TCP), or its relay for
+	// Chromium's form.
+	Exit netip.AddrPort
+	// Chromium, when set, is the pool's form: Chromium's CONNECT to the
+	// relay (trunk/chromium); nil is plain TCP (tests, the bench).
+	Chromium *ChromiumForm
+}
+
+// ChromiumForm is what a Chromium member's CONNECT needs: the relay's
+// domain (its certificate is checked against it), the trunk key the relay
+// admits, libcronet's path ("": found as the Go entry finds it) and PEM
+// roots that replace the system's ("": the system's).
+type ChromiumForm struct {
+	SNI, Key, Cronet, Roots string
+}
+
+func putTCPListen(id byte, to uint16) []byte {
+	return binary.LittleEndian.AppendUint16([]byte{bTCPListen, id}, to)
+}
+
+func putPool(w Pool) ([]byte, error) {
+	if w.Members < 1 || w.Members > 255 {
+		return nil, fmt.Errorf("pipectl: pool %d: %d members, want 1-255", w.ID, w.Members)
+	}
+	if !w.Exit.Addr().Is4() {
+		return nil, fmt.Errorf("pipectl: pool %d: exit %v is not IPv4", w.ID, w.Exit)
+	}
+	form := byte(poolPlain)
+	if w.Chromium != nil {
+		form = poolChromium
+	}
+	b := []byte{bPool, byte(w.ID), form, byte(w.Members)}
+	b = binary.LittleEndian.AppendUint16(b, uint16(w.Stall/time.Millisecond))
+	b = binary.LittleEndian.AppendUint16(b, w.Ports[0])
+	b = binary.LittleEndian.AppendUint16(b, w.Ports[1])
+	ip := w.Exit.Addr().As4()
+	b = append(b, ip[:]...)
+	b = binary.LittleEndian.AppendUint16(b, w.Exit.Port())
+	if c := w.Chromium; c != nil {
+		if len(c.SNI) > 255 || len(c.Key) > 255 || len(c.Cronet) > 65535 {
+			return nil, fmt.Errorf("pipectl: pool %d: a domain, key or path too long", w.ID)
+		}
+		b = append(append(b, byte(len(c.SNI))), c.SNI...)
+		b = append(append(b, byte(len(c.Key))), c.Key...)
+		b = append(binary.LittleEndian.AppendUint16(b, uint16(len(c.Cronet))), c.Cronet...)
+		b = append(b, c.Roots...)
+	}
+	return b, nil
+}
+
 func putRoute(r trunk.Route) []byte { return []byte{bRoute, byte(r.Voice), byte(r.Bulk)} }
 
 func putOpen(tag uint32, o trunk.FlowOptions, port uint16) []byte {
@@ -117,6 +186,9 @@ type Tick struct {
 	// up (spec/trunk.md, Drain).
 	Retired int
 	Coming  bool
+	// Streams is the clients' streams open, every session's (trunk
+	// Stats.Streams).
+	Streams int
 	Wires   []WireTick
 }
 
@@ -138,7 +210,7 @@ type WireTick struct {
 }
 
 const (
-	tickHead = 1 + 16 + 32 + 2 + 1
+	tickHead = 1 + 16 + 32 + 2 + 4 + 1
 	tickWire = 3 + 12 + 48
 )
 
@@ -165,7 +237,8 @@ func parseTick(m []byte) (Tick, error) {
 	for k, p := range []*uint64{&t.DgramsOut, &t.DgramsIn, &t.DgramsCopy, &t.FlowsIdle} {
 		*p = le.Uint64(m[17+8*k:])
 	}
-	t.Retired, t.Coming = int(m[tickHead-3]), m[tickHead-2] == 1
+	t.Retired, t.Coming = int(m[49]), m[50] == 1
+	t.Streams = int(le.Uint32(m[51:]))
 	n := int(m[tickHead-1])
 	if len(m) != tickHead+n*tickWire {
 		return Tick{}, errTorn

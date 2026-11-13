@@ -71,11 +71,13 @@ type Pipe struct {
 	pid     int
 	wires   map[trunk.WireID]*wireConf
 	listens map[byte]*listenConf
-	route   trunk.Route
-	tick    Tick
-	tickAt  time.Time
-	resumed time.Time
-	flows   map[uint32]func([]byte)
+	// tcpListens are the client ports of streams (pool_linux.go).
+	tcpListens map[byte]*tcpListenConf
+	route      trunk.Route
+	tick       Tick
+	tickAt     time.Time
+	resumed    time.Time
+	flows      map[uint32]func([]byte)
 
 	nextTag atomic.Uint32
 	hello   chan struct{}
@@ -114,7 +116,7 @@ func Start(cfg Config) (*Pipe, error) {
 		return nil, err
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
-		listens: map[byte]*listenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
+		listens: map[byte]*listenConf{}, tcpListens: map[byte]*tcpListenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
 		drained: make(chan struct{})}
 	go func() {
 		p.err = cmd.Wait()
@@ -145,6 +147,9 @@ func (p *Pipe) Close() error {
 	defer p.mu.Unlock()
 	for _, l := range p.listens {
 		l.c.Close()
+	}
+	for _, l := range p.tcpListens {
+		l.l.Close()
 	}
 	for _, w := range p.wires {
 		for _, c := range w.members {
@@ -211,6 +216,7 @@ func (p *Pipe) Drain(link *os.File) error {
 	}
 	p.mu.Lock()
 	p.listens = map[byte]*listenConf{}
+	p.tcpListens = map[byte]*tcpListenConf{}
 	p.mu.Unlock()
 	return nil
 }
@@ -246,6 +252,11 @@ func (p *Pipe) Handoff(next *Pipe) error {
 	p.mu.Unlock()
 	for id, l := range listens {
 		if err := next.Listen(id, l.c, l.class, l.to, l.copies); err != nil {
+			return err
+		}
+	}
+	for id, l := range p.tcpListensCopy() {
+		if err := next.TCPListen(id, l.l, l.to); err != nil {
 			return err
 		}
 	}

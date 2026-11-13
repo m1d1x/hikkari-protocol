@@ -23,12 +23,14 @@
 //! The loop is here; its parts: brain.rs (the brain's messages and the
 //! ticks to it), timers.rs (members' hello, pings and deaths), data.rs
 //! (clients → wires → clients), tcp.rs and death.rs (streams), session.rs
-//! (the exit's drain: sessions), generation.rs (the pipe's own reload).
+//! (the exit's drain: sessions), generation.rs (the pipe's own reload),
+//! pool.rs (the brain's client ports of streams and pools).
 
 mod brain;
 mod data;
 mod death;
 mod generation;
+mod pool;
 mod session;
 mod tcp;
 mod timers;
@@ -143,8 +145,10 @@ pub struct Pipe {
     flows: Flows,
     tcp_listens: Vec<TcpListen>,
     swires: Vec<StreamWire>,
-    /// The stream members' source ports (spec/trunk.md, "Members' health").
+    /// The stream members' source ports (spec/trunk.md, "Members' health")
+    /// and their range, [lo, hi].
     ports: Book,
+    ports_range: (u16, u16),
     streams: Streams,
     /// What acks of one read confirmed: (carrier, bytes), applied after it.
     released: Vec<(u32, u32)>,
@@ -204,6 +208,7 @@ impl Pipe {
             tcp_listens: Vec::new(),
             swires: Vec::new(),
             ports: Book::new(ports::LO, ports::HI, ports::DEAD_FOR_NS).expect("the default range is a valid one"),
+            ports_range: (ports::LO, ports::HI),
             streams: Streams::new(),
             released: Vec::with_capacity(256),
             stranded: BTreeSet::new(),
@@ -267,12 +272,13 @@ impl Pipe {
             p.route = [POOL_WIRE, POOL_WIRE];
         }
         if let Some(addr) = a.tcp_listen {
-            p.tcp_listens.push(TcpListen { fd: sys::tcp_listen(addr)?, to: a.tcp_to });
+            p.tcp_listens.push(TcpListen { id: 0, fd: sys::tcp_listen(addr)?, to: a.tcp_to });
             let reach = match &a.tcp_chromium {
                 Some(engine) => Reach::Chromium(engine.clone()),
                 None => Reach::Plain(a.tcp_exit),
             };
             p.ports = Book::new(a.ports.0, a.ports.1, ports::DEAD_FOR_NS).map_err(io::Error::other)?;
+            p.ports_range = a.ports;
             p.swires.push(StreamWire::new(POOL_WIRE, reach, a.tcp_members, health::STALL));
             let now = now_ns();
             for li in 0..a.tcp_members {

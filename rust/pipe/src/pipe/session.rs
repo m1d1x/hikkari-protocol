@@ -246,6 +246,10 @@ impl Pipe {
             false
         });
         for w in self.swires.iter_mut().filter(|w| w.sess == s) {
+            match gone.iter_mut().find(|g| g.id == w.id) {
+                Some(g) => add_counts(g, &w.t),
+                None => gone.push(w.t),
+            }
             for l in w.links.iter_mut() {
                 l.drop_sock(&mut self.ports);
                 l.renew_at = 0;

@@ -22,6 +22,8 @@ use crate::streams::{Stream, StreamCounts, Streams};
 
 /// A client port of streams: its listening socket and the exit's port.
 pub(super) struct TcpListen {
+    /// The brain's id of the port (0 without a brain).
+    pub id: u8,
     pub fd: OwnedFd,
     pub to: u16,
 }

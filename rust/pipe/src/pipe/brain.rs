@@ -8,6 +8,7 @@ use hikkari_trunk::health;
 use hikkari_trunk::udpwire::OVERHEAD;
 
 use super::session::{add_counts, counted};
+use crate::link::NO_SESSION;
 use super::{ms, Listen, Pipe};
 use crate::carry::carry;
 use crate::ctl::{self, Msg, PipeTick, WireTick, ANY_WIRE, NONE_MS};
@@ -56,6 +57,26 @@ impl Pipe {
         match ctl::parse(&self.msg[..n]) {
             Some(Msg::Drain) => return self.drain(),
             Some(Msg::Adopt) => return self.adopt(),
+            // The streams' part (pool.rs).
+            Some(Msg::TcpListen { id, to }) => {
+                if self.fds.len() != 1 {
+                    return Err(format!("tcp listen {id}: {} sockets, want 1", self.fds.len()));
+                }
+                let fd = sys::tcp_from_fd(self.fds.remove(0)).map_err(|e| format!("tcp listen {id}: {e}"))?;
+                self.tcp_listen(id, to, fd);
+                return Ok(());
+            }
+            Some(Msg::Pool(_)) => {
+                // The pool's strings point into the message buffer.
+                let msg = std::mem::take(&mut self.msg);
+                let res = match ctl::parse(&msg[..n]) {
+                    Some(Msg::Pool(p)) => self.set_pool(&p),
+                    _ => unreachable!("parsed as a pool above"),
+                };
+                self.msg = msg;
+                return res;
+            }
+            Some(Msg::Unwire { id }) => self.unpool(id),
             _ => {}
         }
         let (cur, taker) = (self.cur, self.taker());
@@ -162,7 +183,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt => unreachable!("taken above"),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) => unreachable!("taken above"),
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
@@ -222,6 +243,7 @@ impl Pipe {
             flows_idle: self.flows.n.idle,
             retired: self.sessions.iter().filter(|s| s.live && s.retired_at != 0).count() as u8,
             coming: self.next.is_some(),
+            streams: self.streams.open as u32,
         };
         self.late_max = 0;
         let Some(c) = &mut self.ctl else { return };
@@ -251,6 +273,36 @@ impl Pipe {
                     t.rtt_us = if t.rtt_us == 0 { us } else { t.rtt_us.min(us) };
                 }
             }
+            t.proof_ago_ms = if w.proof == 0 { NONE_MS } else { ms(now - w.proof) };
+            ticks[n] = t;
+            n += 1;
+        }
+        // The current session's pools, as wires: the selector reads the
+        // pool's members as any wire's.
+        for w in self.swires.iter().filter(|w| w.sess == self.cur) {
+            if n == ticks.len() {
+                break;
+            }
+            let mut t = w.t;
+            for o in self.swires.iter().filter(|o| o.id == w.id && o.sess != w.sess && o.sess != NO_SESSION) {
+                add_counts(&mut t, &o.t);
+            }
+            for g in self.gone.iter().filter(|g| g.id == w.id) {
+                add_counts(&mut t, g);
+            }
+            t.members = w.links.len() as u8;
+            t.up = w.up() as u8;
+            let (mut owed, mut rtt) = (None::<u32>, 0u32);
+            for l in w.links.iter().filter(|l| l.h.up) {
+                let o = ms(l.h.owed(&self.judge, now));
+                owed = Some(owed.map_or(o, |x| x.min(o)));
+                if l.h.rtt > 0 {
+                    let us = (l.h.rtt / 1000) as u32;
+                    rtt = if rtt == 0 { us } else { rtt.min(us) };
+                }
+            }
+            t.owed_ms = owed.unwrap_or(0);
+            t.rtt_us = rtt;
             t.proof_ago_ms = if w.proof == 0 { NONE_MS } else { ms(now - w.proof) };
             ticks[n] = t;
             n += 1;

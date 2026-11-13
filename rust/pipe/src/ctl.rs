@@ -5,7 +5,7 @@
 //! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
 //! here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -19,6 +19,8 @@ pub const B_CLOSE: u8 = 0x08; // tag u32
 pub const B_MEMBER: u8 = 0x09; // wire u8, index u8; one fd: the member's new socket
 pub const B_DRAIN: u8 = 0x0a; // one fd: the old end of a handoff socket (handoff.rs); the pipe takes no new client
 pub const B_ADOPT: u8 = 0x0b; // one fd: the new end of a handoff socket; a pipe draining sends on its other end
+pub const B_TCP_LISTEN: u8 = 0x0c; // id u8, to u16; one fd: a listening TCP socket, a client port of streams
+pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots (rest)
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -30,6 +32,11 @@ pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no clie
 
 /// The only wire form so far: the bare UDP wire (trunk/udpwire).
 pub const FORM_UDP: u8 = 1;
+/// A pool's forms: stream members over plain TCP to the exit's member port
+/// (tests, the bench), or Chromium's CONNECT to the exit's relay (the
+/// pool's form, trunk/chromium).
+pub const POOL_PLAIN: u8 = 1;
+pub const POOL_CHROMIUM: u8 = 2;
 /// No wire: any member that can carry it (trunk.AnyWire).
 pub const ANY_WIRE: u8 = 255;
 /// A duration the pipe has no value for (no proof yet, no pause yet).
@@ -57,6 +64,25 @@ pub enum Msg<'a> {
     Member { wire: u8, index: u8 },
     Drain,
     Adopt,
+    TcpListen { id: u8, to: u16 },
+    Pool(Pool<'a>),
+}
+
+/// A wire of stream members (B_POOL): its members, their stall and source
+/// ports, where they go and, for Chromium's form, what the CONNECT carries.
+pub struct Pool<'a> {
+    pub id: u8,
+    pub form: u8,
+    pub members: u8,
+    pub dead_ms: u16,
+    pub ports: (u16, u16),
+    pub exit: std::net::SocketAddrV4,
+    pub sni: &'a str,
+    pub key: &'a str,
+    /// libcronet's path; empty: found as the Go entry finds it.
+    pub cronet: &'a str,
+    /// PEM roots that replace the system's trust; empty: the system's.
+    pub roots: &'a str,
 }
 
 struct Rd<'a> {
@@ -108,8 +134,33 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_MEMBER => Msg::Member { wire: r.u8()?, index: r.u8()? },
         B_DRAIN if m.len() == 1 => Msg::Drain,
         B_ADOPT if m.len() == 1 => Msg::Adopt,
+        B_TCP_LISTEN => Msg::TcpListen { id: r.u8()?, to: r.u16()? },
+        B_POOL => Msg::Pool(pool(&mut r)?),
         _ => return None,
     })
+}
+
+fn pool<'a>(r: &mut Rd<'a>) -> Option<Pool<'a>> {
+    let (id, form, members, dead_ms) = (r.u8()?, r.u8()?, r.u8()?, r.u16()?);
+    let ports = (r.u16()?, r.u16()?);
+    let ip: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let exit = std::net::SocketAddrV4::new(ip.into(), r.u16()?);
+    let text = |b: &'a [u8]| std::str::from_utf8(b).ok();
+    let mut p = Pool { id, form, members, dead_ms, ports, exit, sni: "", key: "", cronet: "", roots: "" };
+    match form {
+        POOL_PLAIN if r.at == r.p.len() => {}
+        POOL_CHROMIUM => {
+            let n = r.u8()? as usize;
+            p.sni = text(r.take(n)?)?;
+            let n = r.u8()? as usize;
+            p.key = text(r.take(n)?)?;
+            let n = r.u16()? as usize;
+            p.cronet = text(r.take(n)?)?;
+            p.roots = text(r.rest())?;
+        }
+        _ => return None,
+    }
+    Some(p)
 }
 
 /// One wire in a tick: what the brain's selector reads (trunk.WireState)
@@ -160,9 +211,11 @@ pub struct PipeTick {
     /// Entry.Retired).
     pub retired: u8,
     pub coming: bool,
+    /// Clients' streams open, every session's (trunk Stats.Streams).
+    pub streams: u32,
 }
 
-pub const TICK_HEAD: usize = 1 + 16 + 32 + 2 + 1;
+pub const TICK_HEAD: usize = 1 + 16 + 32 + 2 + 4 + 1;
 pub const TICK_WIRE: usize = 1 + 1 + 1 + 4 + 4 + 4 + 6 * 8;
 
 /// A tick: the pipe's part, then each wire. out must hold
@@ -178,7 +231,8 @@ pub fn put_tick(out: &mut [u8], p: &PipeTick, wires: &[WireTick]) -> usize {
     }
     out[49] = p.retired;
     out[50] = p.coming as u8;
-    out[51] = wires.len() as u8;
+    out[51..55].copy_from_slice(&p.streams.to_le_bytes());
+    out[55] = wires.len() as u8;
     let mut at = TICK_HEAD;
     for w in wires {
         let b = &mut out[at..at + TICK_WIRE];
@@ -225,7 +279,35 @@ mod tests {
 
     // The same bytes as trunk/pipectl msg_test.go TestGolden.
     const WIRE_GOLDEN: &str = "030301e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
-    const TICK_GOLDEN: &str = "82ffffffff020000003905000007000000080000000000000009000000000000000a000000000000000b00000000000000030101020302fa00000064000000b80b0000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000";
+    const TICK_GOLDEN: &str = "82ffffffff020000003905000007000000080000000000000009000000000000000a000000000000000b0000000000000003010500000001020302fa00000064000000b80b0000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000";
+
+    const POOL_PLAIN_GOLDEN: &str = "0d0001202c01204eff7f7f000001de4f";
+    const POOL_CHROMIUM_GOLDEN: &str = "0d0002042c01204eff7f7f000001bb010a686b2e6578616d706c651a676f6c64656e2d746573742d6b65792d3031323334353637383911002f6f70742f6c696263726f6e65742e736f50454d";
+    const TCP_LISTEN_GOLDEN: &str = "0c01fb20";
+
+    #[test]
+    fn parses_the_brains_pool_and_tcp_port() {
+        match parse(&unhex(POOL_PLAIN_GOLDEN)) {
+            Some(Msg::Pool(p)) => {
+                assert_eq!((p.id, p.form, p.members, p.dead_ms, p.ports), (0, POOL_PLAIN, 32, 300, (20000, 32767)));
+                assert_eq!((p.exit, p.sni, p.key), ("127.0.0.1:20446".parse().unwrap(), "", ""));
+            }
+            _ => panic!("not a pool"),
+        }
+        let m = unhex(POOL_CHROMIUM_GOLDEN);
+        match parse(&m) {
+            Some(Msg::Pool(p)) => {
+                assert_eq!((p.form, p.members, p.exit.port()), (POOL_CHROMIUM, 4, 443));
+                assert_eq!((p.sni, p.key, p.cronet, p.roots), ("hk.example", "golden-test-key-0123456789", "/opt/libcronet.so", "PEM"));
+            }
+            _ => panic!("not a pool"),
+        }
+        assert!(parse(&m[..20]).is_none(), "a torn pool");
+        let mut plain = unhex(POOL_PLAIN_GOLDEN);
+        plain.push(0);
+        assert!(parse(&plain).is_none(), "a plain pool carries nothing after its exit");
+        assert!(matches!(parse(&unhex(TCP_LISTEN_GOLDEN)), Some(Msg::TcpListen { id: 1, to: 8443 })));
+    }
 
     #[test]
     fn parses_the_brains_wire() {
@@ -266,6 +348,7 @@ mod tests {
             flows_idle: 11,
             retired: 3,
             coming: true,
+            streams: 5,
         };
         let w = WireTick {
             id: 2,

@@ -260,19 +260,21 @@ Brain → pipe:
 | `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer |
 | `drain` | the old end of a reload's handoff socket (one): the pipe takes no new client (below, «Generations») |
 | `adopt` | the new end of a handoff socket (one): an older pipe drains to this one; it comes before the client ports |
+| `tcp_listen` | a client port of streams (one listening TCP socket): id, the exit's loopback port; every connection accepted is a stream on the pools (R4.2) |
+| `pool` | a wire of stream members the pipe dials itself from its book of source ports: id, form (plain TCP to the exit's member port, or Chromium's CONNECT to its relay), members, their stall, the book's range, the exit; for Chromium the relay's domain, the trunk key, libcronet's path and PEM roots (empty: the system's). The same pool again changes only the stall; a new form, exit or number of members brings the members up anew, no stream reset (R4.2) |
 
 Pipe → brain:
 
 | Message | What |
 | --- | --- |
 | `hello` | version, pid |
-| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms after the one before), pauses, the latest turn in the second, clients' flows open; since the start, as trunk Stats (the trunk's call left out), datagrams out, delivered, copies dropped, and flows ended unused; retired sessions still carrying, a session coming up (R4.1); per wire of the current session members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
+| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms after the one before), pauses, the latest turn in the second, clients' flows open; since the start, as trunk Stats (the trunk's call left out), datagrams out, delivered, copies dropped, and flows ended unused; retired sessions still carrying, a session coming up (R4.1), clients' streams open (R4.2); per wire of the current session, pools too, members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
 | `member` | a member up (hello answered) or down: `silent` (past its stall while another member proved the exit alive), `quiet` (every member silent past Quiet), `gone` (its socket failed) |
 | `dgram` | an answer on a brain's flow |
 | `error` | a message the pipe could not take |
 | `drained` | a pipe draining carries nothing more: no client's flow, no stream |
 
-Left for later: `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, the forms other than `udp` (R4) and streams with the pool (R5). The pipe passes over a wire with no member
+Left for later: `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, packet forms other than `udp`. The pipe passes over a wire with no member
 up for any wire that has one, as `trunk.Route` does, before the selector moves the route.
 
 The test of the whole loop (a Go exit, two `udp` wires to it through cutters, the selector over the pipe's ticks, four
@@ -403,8 +405,14 @@ whose next call is the new pipe's), `TestAnOldPipeGoneGivesItsAddressesToTheNewO
 
 A pipe that drains itself replaces none of its members (its session is retired, as a Go entry's on Retire).
 
-Left for later: the brain's messages for TCP client ports (under the brain the pipe has UDP client ports only: TCP is the
-bench's flags, so a reload of streams is not tested), and the Rust exit's own generations.
+A reload hands the client ports of streams too (`Pipe.Handoff`): the old pipe stops accepting, the new one accepts on the
+same listening socket, and a stream stays with the pipe that accepted it. Tests (`tcp_reload_linux_test.go`):
+`TestAReloadUnderLiveStreamsCutsNone` (a stream of 1 GiB through a reload, plain TCP pool, against the Go exit: byte for
+byte, not reset, new connections the new pipe's, the old one drains at the stream's end) and
+`TestAChromiumPoolUnderTheBrainCarriesStreamsThroughAReload` (the same with the pool in Chromium's form against `goexit
+-naive`, on the glibc build: `HK_PIPE` the gnu `hk-pipe`, `HK_GOEXIT`, `HK_CRONET`; skipped without them).
+
+Left for later: the Rust exit's own generations.
 
 ## Sessions: the exit's drain (R4.1)
 
