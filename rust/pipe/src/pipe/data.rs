@@ -15,7 +15,7 @@ use crate::flow::{Dest, Flow, Flows};
 impl Pipe {
     /// Clients → wires.
     pub(super) fn read_clients(&mut self) {
-        let Pipe { poll, slots, listens, crecv, flows, wires, route, moved, .. } = self;
+        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Listen(li) = *s else { continue };
             if !poll.readable(si) {
@@ -41,7 +41,7 @@ impl Pipe {
                     let mut at = 0;
                     while at < len {
                         let p = &crecv.buf[base + at..base + (at + step).min(len)];
-                        carry(wires, *route, f, id, p, now);
+                        carry(wires, swires, *route, f, id, p, now);
                         if !f.echo() {
                             counts.out += 1;
                         }
@@ -141,7 +141,7 @@ impl Pipe {
 /// whose flow ended here.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64) {
+pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64) {
     let Some((f, counts)) = flows.with_counts(stream) else { return };
     let echo = f.echo();
     if f.replay.seen(seq) {

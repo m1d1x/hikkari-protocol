@@ -13,6 +13,10 @@
 //! exit's relay at `--tcp-wire` instead (the pool's form), under the trunk
 //! key `--key`, trusting the PEM roots in `--tcp-roots` (tests) or the
 //! system's, libcronet from `--cronet` or found as the Go entry finds it.
+//! The stream members' source ports come from the book of `--ports lo-hi`
+//! (trunk's 20000-32767 without it). With `--members 0` there is no wire of
+//! packet members, and clients' datagrams ride the stream members (the
+//! pool's wire 0, as the Go entry's voice on its pool).
 //!
 //! `--flow-idle-ms` (either way): a client's flow unused this long ends;
 //! the trunk's 2 minutes without it.
@@ -48,6 +52,7 @@ mod linux {
             tcp_exit: "127.0.0.1:20446".parse().unwrap(),
             tcp_members: 4,
             tcp_chromium: None,
+            ports: (hikkari_trunk::ports::LO, hikkari_trunk::ports::HI),
         };
         let (mut chromium, mut roots, mut cronet): (Option<String>, Option<String>, Option<String>) = (None, None, None);
         let mut flow_idle_ms: Option<u64> = None;
@@ -79,6 +84,10 @@ mod linux {
                 "--tcp-chromium" => chromium = Some(v),
                 "--tcp-roots" => roots = Some(std::fs::read_to_string(&v).expect("--tcp-roots file")),
                 "--cronet" => cronet = Some(v),
+                "--ports" => {
+                    let (lo, hi) = v.split_once('-').expect("--ports lo-hi");
+                    a.ports = (lo.parse().expect("--ports lo"), hi.parse().expect("--ports hi"));
+                }
                 x => panic!("unknown flag {x}"),
             }
             i += 2;

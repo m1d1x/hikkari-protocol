@@ -10,8 +10,11 @@ use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::Out;
 use hikkari_trunk::frame::{self, Frame, ACK_FIN, ACK_LEN, NO_GOT};
 use hikkari_trunk::health::Verdict;
+use hikkari_trunk::ports::Book;
 use hikkari_trunk::stream::{CHUNK, NO_CARRIER};
 
+use super::data::deliver;
+use super::death::Down;
 use super::{Event, Pipe, Slot};
 use crate::ctl;
 use crate::link::{self, carrier, carrier_of, Link, StreamWire};
@@ -65,6 +68,16 @@ pub(super) fn pick(wires: &[StreamWire], bulk: u8, chunk: bool) -> Option<(usize
         }
     }
     best.map(|b| (b.0, b.1))
+}
+
+/// A member's connection that failed or closed: before the exit's hello or
+/// after it.
+fn gone(l: &Link) -> Down {
+    if l.up_at == 0 {
+        Down::Failed
+    } else {
+        Down::Lost
+    }
 }
 
 /// What a stream owed and no longer does, without a confirmation: the
@@ -207,13 +220,14 @@ impl Pipe {
                     Io::Done(k) => {
                         l.in_n += k;
                         if !self.link_frames(wi, li, now) {
-                            self.link_down(wi, li, ctl::WHY_GONE, now);
+                            self.link_down(wi, li, gone(&self.swires[wi].links[li]), now);
                             break;
                         }
                     }
                     Io::Again => break,
                     Io::Eof | Io::Gone => {
-                        self.link_down(wi, li, ctl::WHY_GONE, now);
+                        let down = gone(l);
+                        self.link_down(wi, li, down, now);
                         break;
                     }
                 }
@@ -225,9 +239,9 @@ impl Pipe {
     /// The whole frames read on member li of wire wi; false for bytes that
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
-        let Pipe { swires, streams, judge, events, released, doomed, moved, .. } = self;
+        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, .. } = self;
         let StreamWire { links, t, proof, id: wid, .. } = &mut swires[wi];
-        let Link { inb, in_n, out, h, .. } = &mut links[li];
+        let Link { inb, in_n, out, h, up_at, .. } = &mut links[li];
         let mut joined = false;
         let mut at = 0;
         while at < *in_n {
@@ -241,6 +255,7 @@ impl Pipe {
                 Frame::Hello => {
                     if !h.up {
                         h.join(now);
+                        *up_at = now;
                         joined = true;
                         events.push(Event { wire: *wid, index: li as u8, up: true, why: ctl::WHY_HELLO });
                     }
@@ -260,11 +275,22 @@ impl Pipe {
                     stream_frame(fr, inb, out, streams, doomed, released);
                 }
                 Frame::Fin { .. } | Frame::Ack { .. } | Frame::Rst { .. } => stream_frame(fr, inb, out, streams, doomed, released),
-                // Datagrams ride the packet wires (carry.rs): the exit answers
-                // a flow on the wire it came on.
-                Frame::Open { .. } | Frame::Dgram { .. } | Frame::Drain | Frame::Other => {}
+                // A datagram of a flow the route put on this wire: the exit
+                // answers a flow on the wire it came on (trunk flows.go).
+                Frame::Dgram { stream, seq, off, len, .. } => {
+                    t.down_pkts += 1;
+                    t.down_bytes += len as u64;
+                    *moved += 1;
+                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now);
+                }
+                Frame::Open { .. } | Frame::Drain | Frame::Other => {}
             }
             at = next;
+        }
+        // The answers to clients point into the in buffer: sent before what
+        // is left of it moves to its front.
+        for l in listens.iter_mut() {
+            l.down.flush(l.sock.as_raw_fd());
         }
         inb.copy_within(at..*in_n, 0);
         *in_n -= at;
@@ -365,7 +391,7 @@ impl Pipe {
                 match l.promote() {
                     Io::Done(_) => self.dirty = true,
                     Io::Gone => {
-                        self.link_down(wi, li, ctl::WHY_GONE, now);
+                        self.link_down(wi, li, Down::Failed, now);
                         continue;
                     }
                     _ => {}
@@ -373,7 +399,8 @@ impl Pipe {
                 let l = &mut self.swires[wi].links[li];
                 let Some(sock) = &mut l.sock else { continue };
                 if let Io::Gone = link::flush(&mut l.out, sock) {
-                    self.link_down(wi, li, ctl::WHY_GONE, now);
+                    let down = gone(l);
+                    self.link_down(wi, li, down, now);
                 }
             }
         }
@@ -407,23 +434,25 @@ impl Pipe {
     pub(super) fn link_timers(&mut self, now: u64, clock: bool, mut next: u64) -> u64 {
         for wi in 0..self.swires.len() {
             for li in 0..self.swires[wi].links.len() {
-                let Pipe { swires, judge, tok, session, dirty, .. } = self;
-                let w = &mut swires[wi];
-                let l = &mut w.links[li];
-                if l.renew_at != 0 {
-                    if now >= l.renew_at {
-                        l.dial(&w.reach, session, now);
-                        *dirty = true;
-                    } else {
-                        next = next.min(l.renew_at);
+                let renew_at = self.swires[wi].links[li].renew_at;
+                if renew_at != 0 {
+                    if now >= renew_at {
+                        self.redial(wi, li, now);
+                    }
+                    let renew_at = self.swires[wi].links[li].renew_at;
+                    if renew_at != 0 {
+                        next = next.min(renew_at);
                     }
                 }
+                let Pipe { swires, judge, tok, .. } = self;
+                let w = &mut swires[wi];
+                let l = &mut w.links[li];
                 if l.sock.is_none() {
                     continue;
                 }
                 if !l.h.up {
                     if now.saturating_sub(l.dialed_at) > HELLO_WAIT {
-                        self.link_down(wi, li, ctl::WHY_GONE, now);
+                        self.link_down(wi, li, Down::Silent, now);
                     }
                     continue;
                 }
@@ -435,10 +464,7 @@ impl Pipe {
                     Verdict::Ping(t) => {
                         l.out.frame(9, |b| frame::put_ping(b, frame::F_PING, t));
                     }
-                    Verdict::Dead { quiet } => {
-                        let why = if quiet { ctl::WHY_QUIET } else { ctl::WHY_SILENT };
-                        self.link_down(wi, li, why, now);
-                    }
+                    Verdict::Dead { quiet } => self.link_down(wi, li, Down::Stalled { quiet }, now),
                 }
             }
         }
@@ -522,7 +548,7 @@ fn count(n: &mut StreamCounts, why: Why) {
 }
 
 /// The streams' part of the stats line.
-pub(super) fn stats(streams: &Streams, wires: &[StreamWire]) -> String {
+pub(super) fn stats(streams: &Streams, wires: &[StreamWire], ports: &Book) -> String {
     let n = &streams.n;
     let mut s = format!(
         " | streams open={} opened={} fin={} rst_peer={} rst_local={} hit={} resent={} up={}MiB down={}MiB",
@@ -537,7 +563,8 @@ pub(super) fn stats(streams: &Streams, wires: &[StreamWire]) -> String {
         n.down >> 20
     );
     for w in wires {
-        s += &format!(" | swire {} up={}/{} chunks={}/{}", w.id, w.up(), w.links.len(), w.t.up_pkts, w.t.down_pkts);
+        s += &format!(" | swire {} up={}/{} frames={}/{} dropped={}", w.id, w.up(), w.links.len(), w.t.up_pkts, w.t.down_pkts, w.t.dropped);
     }
-    s
+    let (dead, kills) = ports.dead_now();
+    s + &format!(" | ports free={} dead={dead} kills={kills}", ports.free())
 }

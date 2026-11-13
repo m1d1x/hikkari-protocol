@@ -14,6 +14,7 @@
 //! chunk of a client's bytes is read straight into the out buffer behind its
 //! frame's head.
 
+use std::io;
 use std::net::SocketAddrV4;
 use std::os::fd::{AsRawFd, OwnedFd};
 
@@ -23,6 +24,7 @@ use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::{Out, IN};
 use hikkari_trunk::frame;
 use hikkari_trunk::health::Health;
+use hikkari_trunk::ports::Book;
 use hikkari_trunk::stream::{CHUNK, INFLIGHT};
 
 use crate::ctl::WireTick;
@@ -111,10 +113,33 @@ pub struct Link {
     /// When its connection was begun: the exit's hello is due within
     /// HELLO_WAIT of it.
     pub dialed_at: u64,
-    /// Without a brain: when a member taken down is dialed anew (0: not
-    /// waiting for it).
+    /// When a member taken down is dialed anew (0: not waiting for it).
     pub renew_at: u64,
+    /// Its connection's source port, taken from the pipe's book (0: none).
+    pub port: u16,
+    /// When the exit's hello came on its connection (0: not yet).
+    pub up_at: u64,
+    /// The wait before its next dial beyond the spread, and its stalls in a
+    /// row (trunk Entry.slot: backoff, stalls).
+    pub backoff_ns: u64,
+    pub stalls: u32,
 }
+
+/// How a dial went.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialed {
+    /// A connection is coming up, its hello waiting.
+    Begun,
+    /// Every source port of the book is dead or in use.
+    NoPort,
+    /// The connection could not be begun.
+    Failed,
+}
+
+/// Ports tried in one dial whose bind finds the port someone else's (the
+/// book's ports are not the kernel's alone: a connection of ours still in
+/// TIME_WAIT holds its port too).
+const BUSY_TRIES: usize = 8;
 
 impl Link {
     pub fn new() -> Link {
@@ -129,23 +154,59 @@ impl Link {
             gen: 0,
             dialed_at: 0,
             renew_at: 0,
+            port: 0,
+            up_at: 0,
+            backoff_ns: 0,
+            stalls: 0,
         }
     }
 
-    /// A new connection to the exit, its t1 hello waiting in the out buffer:
-    /// a new member to the exit, up once the exit answers. A tunnel takes
-    /// the hello once the relay has answered its CONNECT.
-    pub fn dial(&mut self, reach: &Reach, session: &[u8; 16], now: u64) {
-        self.drop_sock();
+    /// A new connection to the exit from a port of the book, its t1 hello
+    /// waiting in the out buffer: a new member to the exit, up once the exit
+    /// answers. A tunnel takes the hello once the relay has answered its
+    /// CONNECT. A port whose bind finds it busy goes back to the book and
+    /// another is tried at once (trunk Entry.slot on EADDRINUSE).
+    pub fn dial(&mut self, reach: &Reach, session: &[u8; 16], book: &mut Book, now: u64) -> Dialed {
+        self.drop_sock(book);
         self.gen = self.gen.wrapping_add(1);
         self.dialed_at = now;
         self.renew_at = 0;
-        self.sock = match reach {
-            Reach::Plain(exit) => sys::tcp_connect(*exit).ok().map(Sock::Tcp),
-            Reach::Chromium(engine) => sys::member_connect(engine.form().exit, 0).ok().map(|fd| Sock::Dialing(fd, engine.clone())),
+        let exit = match reach {
+            Reach::Plain(exit) => *exit,
+            Reach::Chromium(engine) => engine.form().exit,
         };
-        if self.sock.is_some() {
-            self.out.frame(29, |b| frame::hello_t1(b, session));
+        for _ in 0..BUSY_TRIES {
+            let mut r = [0u8; 8];
+            sys::urandom(&mut r);
+            let Some(port) = book.take(now, u64::from_le_bytes(r)) else { return Dialed::NoPort };
+            match sys::member_connect(exit, port) {
+                Ok(fd) => {
+                    self.port = port;
+                    self.sock = Some(match reach {
+                        Reach::Plain(_) => Sock::Tcp(fd),
+                        Reach::Chromium(engine) => Sock::Dialing(fd, engine.clone()),
+                    });
+                    self.out.frame(29, |b| frame::hello_t1(b, session));
+                    return Dialed::Begun;
+                }
+                Err(e) => {
+                    book.release(port);
+                    if e.kind() != io::ErrorKind::AddrInUse {
+                        return Dialed::Failed;
+                    }
+                }
+            }
+        }
+        Dialed::Failed
+    }
+
+    /// Its wait before the next dial grows: 200 ms, then twice as long up
+    /// to about 5 s (trunk Entry.slot: grow).
+    pub fn grow(&mut self) {
+        if self.backoff_ns == 0 {
+            self.backoff_ns = 200_000_000;
+        } else if self.backoff_ns < 5_000_000_000 {
+            self.backoff_ns *= 2;
         }
     }
 
@@ -173,9 +234,15 @@ impl Link {
         }
     }
 
-    /// Its socket closed and what it held forgotten.
-    pub fn drop_sock(&mut self) {
+    /// Its socket closed, its port back to the book (still dead if the path
+    /// killed it) and what it held forgotten.
+    pub fn drop_sock(&mut self, book: &mut Book) {
         self.sock = None;
+        if self.port != 0 {
+            book.release(self.port);
+            self.port = 0;
+        }
+        self.up_at = 0;
         self.h.down();
         self.out.clear();
         self.in_n = 0;

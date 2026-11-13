@@ -40,6 +40,7 @@ use tcp::{TcpListen, Why};
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
 use hikkari_trunk::flow::FLOW_IDLE_NS;
 use hikkari_trunk::health::{self, Judge};
+use hikkari_trunk::ports::{self, Book};
 use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, ANY_WIRE};
@@ -49,6 +50,8 @@ use crate::member::{member_to, Member, Wire, SLOT};
 use crate::streams::Streams;
 
 const MAX_CLIENT: usize = 1500;
+/// The pool's wire (trunk PoolWire): without a brain, the streams' only one.
+const POOL_WIRE: u8 = 0;
 
 struct Listen {
     id: u8,
@@ -100,6 +103,8 @@ pub struct Alone {
     pub tcp_to: u16,
     pub tcp_exit: SocketAddrV4,
     pub tcp_members: usize,
+    /// The stream members' source ports: [lo, hi].
+    pub ports: (u16, u16),
     /// The stream members by Chromium's CONNECT to the exit's relay at
     /// tcp_exit instead of plain TCP, on this engine (None: plain).
     pub tcp_chromium: Option<hikkari_cronet::Engine>,
@@ -119,6 +124,8 @@ pub struct Pipe {
     flows: Flows,
     tcp_listens: Vec<TcpListen>,
     swires: Vec<StreamWire>,
+    /// The stream members' source ports (spec/trunk.md, "Members' health").
+    ports: Book,
     streams: Streams,
     /// What acks of one read confirmed: (carrier, bytes), applied after it.
     released: Vec<(u32, u32)>,
@@ -164,6 +171,7 @@ impl Pipe {
             flows: Flows::new(),
             tcp_listens: Vec::new(),
             swires: Vec::new(),
+            ports: Book::new(ports::LO, ports::HI, ports::DEAD_FOR_NS).expect("the default range is a valid one"),
             streams: Streams::new(),
             released: Vec::with_capacity(256),
             stranded: BTreeSet::new(),
@@ -206,29 +214,33 @@ impl Pipe {
         let sock = UdpSocket::bind(a.listen)?;
         sys::tune(&sock, gro)?;
         p.listens.push(Listen { id: 0, sock, class: CLASS_VOICE, to: a.to, copies: a.copies, down: SendBatch::new() });
-        let key = udpwire::key(&a.key);
-        let mut w = Wire::new(a.wire, key, health::STALL);
-        w.glue_ns = a.glue_ns;
-        w.glue_max = a.glue_max;
-        w.exit = Some(a.exit);
-        for _ in 0..a.members {
-            w.members.push(Member::new(Some(member_to(a.exit)?), &key));
+        if a.members > 0 {
+            let key = udpwire::key(&a.key);
+            let mut w = Wire::new(a.wire, key, health::STALL);
+            w.glue_ns = a.glue_ns;
+            w.glue_max = a.glue_max;
+            w.exit = Some(a.exit);
+            for _ in 0..a.members {
+                w.members.push(Member::new(Some(member_to(a.exit)?), &key));
+            }
+            p.wires.push(w);
+            p.route = [a.wire, a.wire];
+        } else {
+            // No packet members: the datagrams ride the pool's wire.
+            p.route = [POOL_WIRE, POOL_WIRE];
         }
-        p.wires.push(w);
-        p.route = [a.wire, a.wire];
         if let Some(addr) = a.tcp_listen {
             p.tcp_listens.push(TcpListen { fd: sys::tcp_listen(addr)?, to: a.tcp_to });
-            // The pool's wire (trunk.PoolWire): the streams' only one here.
             let reach = match &a.tcp_chromium {
                 Some(engine) => Reach::Chromium(engine.clone()),
                 None => Reach::Plain(a.tcp_exit),
             };
-            let mut sw = StreamWire::new(0, reach, a.tcp_members, health::STALL);
+            p.ports = Book::new(a.ports.0, a.ports.1, ports::DEAD_FOR_NS).map_err(io::Error::other)?;
+            p.swires.push(StreamWire::new(POOL_WIRE, reach, a.tcp_members, health::STALL));
             let now = now_ns();
-            for l in sw.links.iter_mut() {
-                l.dial(&sw.reach, &p.session, now);
+            for li in 0..a.tcp_members {
+                p.redial(0, li, now);
             }
-            p.swires.push(sw);
         }
         Ok(p)
     }
@@ -392,7 +404,7 @@ impl Pipe {
             );
         }
         if self.has_tcp() {
-            s += &tcp::stats(&self.streams, &self.swires);
+            s += &tcp::stats(&self.streams, &self.swires, &self.ports);
         }
         eprintln!("{s}");
     }

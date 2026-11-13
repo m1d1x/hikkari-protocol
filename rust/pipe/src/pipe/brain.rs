@@ -51,7 +51,7 @@ impl Pipe {
     /// One message of n bytes in self.msg, its sockets in self.fds (what it
     /// takes it removes from there).
     fn handle(&mut self, n: usize) -> Result<(), String> {
-        let Pipe { msg, fds, wires, flows, route, listens, dirty, gro, moved, .. } = self;
+        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
         };
@@ -132,7 +132,7 @@ impl Pipe {
                 let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
                     return Ok(()); // closed under it
                 };
-                carry(wires, *route, f, id, payload, now);
+                carry(wires, swires, *route, f, id, payload, now);
                 if !f.echo() {
                     n.out += 1;
                 }

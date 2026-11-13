@@ -9,9 +9,10 @@ use hikkari_sys as sys;
 use hikkari_trunk::frame::{self, NO_GOT};
 
 use super::tcp::{ack, pick};
+use super::timers::SPREAD;
 use super::{Event, Pipe};
 use crate::ctl;
-use crate::link::carrier;
+use crate::link::{carrier, Dialed};
 
 impl Pipe {
     /// What dead members carried, sent again oldest first (stream by stream
@@ -60,16 +61,42 @@ impl Pipe {
     /// Member li of wire wi is down (trunk dropMemberLocked): what it carried
     /// unconfirmed goes again on the other members, every stream acks again
     /// elsewhere (the acks it carried may be lost), and it is dialed anew
-    /// within a second, spread as the UDP members are.
-    pub(super) fn link_down(&mut self, wi: usize, li: usize, why: u8, now: u64) {
-        let l = &mut self.swires[wi].links[li];
+    /// after its backoff, spread over a second as the UDP members are. A
+    /// port the path killed (the member stalled, or its dial or hello got no
+    /// answer) stays out of use for an hour (spec/trunk.md, "Members'
+    /// health"; trunk Entry.slot).
+    pub(super) fn link_down(&mut self, wi: usize, li: usize, down: Down, now: u64) {
+        let Pipe { swires, ports, .. } = self;
+        let l = &mut swires[wi].links[li];
         let (was_up, c) = (l.h.up, carrier(wi, li, l.gen));
-        l.drop_sock();
-        let mut r = [0u8; 8];
-        sys::urandom(&mut r);
-        l.renew_at = now + 1 + u64::from_le_bytes(r) % super::timers::SPREAD;
-        self.dirty = true;
-        if was_up || why == ctl::WHY_GONE {
+        if matches!(down, Down::Stalled { .. } | Down::Silent) && l.port != 0 {
+            ports.dead(l.port, now);
+        }
+        match down {
+            // The path killed the flow, not the exit: another port now. Many
+            // in a row is the path itself, and the member waits.
+            Down::Stalled { .. } => {
+                l.stalls += 1;
+                if l.stalls > 3 {
+                    l.grow();
+                } else {
+                    l.backoff_ns = 0;
+                }
+            }
+            Down::Silent | Down::Failed => l.grow(),
+            Down::Lost if l.up_at != 0 && now - l.up_at >= LIVED => (l.stalls, l.backoff_ns) = (0, 0),
+            Down::Lost => {
+                l.stalls = 0;
+                l.grow();
+            }
+        }
+        l.drop_sock(ports);
+        self.renew(wi, li, now);
+        // A stall is judged on a member up (its health took it down a moment
+        // ago): the brain hears every stall, every failed socket, and the
+        // end of any member it was told was up.
+        let why = down.why();
+        if was_up || matches!(down, Down::Stalled { .. }) || why == ctl::WHY_GONE {
             let wid = self.swires[wi].id;
             self.events.push(Event { wire: wid, index: li as u8, up: false, why });
         }
@@ -94,6 +121,70 @@ impl Pipe {
             }
             let Some((wi, li)) = pick(swires, route[0], false) else { break };
             ack(&mut swires[wi].links[li].out, st, NO_GOT);
+        }
+    }
+}
+
+/// Why a stream member went down.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Down {
+    /// It owed progress and proved none (hikkari_trunk::health): trunk
+    /// ErrStalled.
+    Stalled { quiet: bool },
+    /// Its connection or its hello got no answer in time: trunk ErrSilent.
+    Silent,
+    /// Its connection failed or closed before the exit's hello.
+    Failed,
+    /// Its connection failed or closed after it.
+    Lost,
+}
+
+impl Down {
+    /// What the brain is told.
+    pub(super) fn why(self) -> u8 {
+        match self {
+            Down::Stalled { quiet: true } => ctl::WHY_QUIET,
+            Down::Stalled { quiet: false } => ctl::WHY_SILENT,
+            Down::Silent | Down::Failed | Down::Lost => ctl::WHY_GONE,
+        }
+    }
+}
+
+/// A member that lived this long after its hello and then went down is
+/// dialed anew without a wait (trunk Entry.slot: 5 s).
+const LIVED: u64 = 5_000_000_000;
+
+impl Pipe {
+    /// Member li of wire wi is dialed anew after its backoff and a random
+    /// part of SPREAD: members that die together do not come back as one
+    /// burst of new connections from one box (trunk replaceSpread).
+    pub(super) fn renew(&mut self, wi: usize, li: usize, now: u64) {
+        let l = &mut self.swires[wi].links[li];
+        let mut r = [0u8; 8];
+        sys::urandom(&mut r);
+        l.renew_at = now + 1 + l.backoff_ns + u64::from_le_bytes(r) % SPREAD;
+        self.dirty = true;
+    }
+
+    /// Member li of wire wi dials now; a dial that could not begin waits
+    /// as a failed one.
+    pub(super) fn redial(&mut self, wi: usize, li: usize, now: u64) {
+        let Pipe { swires, ports, session, dirty, .. } = self;
+        let w = &mut swires[wi];
+        let l = &mut w.links[li];
+        *dirty = true;
+        match l.dial(&w.reach, session, ports, now) {
+            Dialed::Begun => {}
+            Dialed::NoPort => {
+                let (dead, _) = ports.counts(now);
+                eprintln!("hk-pipe: wire {} member {li}: no source port free, {dead} dead", w.id);
+                l.grow();
+                self.renew(wi, li, now);
+            }
+            Dialed::Failed => {
+                l.grow();
+                self.renew(wi, li, now);
+            }
         }
     }
 }

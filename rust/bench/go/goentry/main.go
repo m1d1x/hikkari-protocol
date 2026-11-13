@@ -4,9 +4,14 @@
 // to the client socket) over trunk.Entry with the bare UDP wire, voice routed
 // to it as the selector routes it; with -tcp-listen also its TCP path
 // (trunkentry/handoff.go: each accepted connection carried by
-// Session().Carry) over plain TCP pool members. What it leaves out: the
-// Chromium pool (plain TCP members instead), the trunk's own calls, the wire
-// stand, the handoff between generations. Bench only (rust/README.md).
+// Session().Carry) over plain TCP pool members, or with -pool-chromium over
+// the production pool's members (trunk/chromium: Chromium's CONNECT to the
+// exit's relay channel, an engine each, from a source port of the book).
+// With -members 0 there is no UDP wire and voice rides the pool, as the
+// selector routes it when the pool is the only wire. What it leaves out: the
+// trunk's own calls, the wire stand, the handoff between generations. Bench
+// only (rust/README.md). Linux builds with -pool-chromium take -tags
+// with_purego and load libcronet.so from the executable's directory.
 package main
 
 import (
@@ -16,10 +21,12 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
+	"github.com/m1d1x/hikkari-protocol/trunk/chromium"
 	"github.com/m1d1x/hikkari-protocol/trunk/udpwire"
 )
 
@@ -34,7 +41,9 @@ func main() {
 	to := flag.Uint("to", 0, "exit loopback port (0: the exit's echo)")
 	tcpListen := flag.String("tcp-listen", "", "client TCP listen address (empty: none)")
 	tcpTo := flag.Uint("tcp-to", 9000, "exit loopback port of the clients' streams")
-	poolMembers := flag.Int("pool-members", 1, "plain TCP pool members")
+	poolMembers := flag.Int("pool-members", 1, "pool members")
+	poolChromium := flag.String("pool-chromium", "", "the relay's domain: pool members by Chromium's CONNECT to -pool (empty: plain TCP)")
+	roots := flag.String("roots", "/bench/out/naive-roots.pem", "the relay certificate's PEM, with -pool-chromium")
 	flag.Parse()
 
 	exitWire, err := netip.ParseAddrPort(*wire)
@@ -45,19 +54,34 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	dialPool := func(ctx context.Context, _ int) (io.ReadWriteCloser, error) {
-		var d net.Dialer
+	dialPool := func(ctx context.Context, port int) (io.ReadWriteCloser, error) {
+		d := net.Dialer{LocalAddr: &net.TCPAddr{Port: port}}
 		return d.DialContext(ctx, "tcp", *pool)
+	}
+	if *poolChromium != "" {
+		if err := chromium.Load(); err != nil {
+			log.Fatal(err)
+		}
+		pem, err := os.ReadFile(*roots)
+		if err != nil {
+			log.Fatal(err)
+		}
+		dialPool = chromium.Dialer{Exit: *pool, SNI: *poolChromium, Key: *key, Roots: string(pem)}.Dial
+		log.Printf("goentry: pool members by Chromium %s", chromium.Version())
 	}
 	e, err := trunk.NewEntry(trunk.Config{}, *poolMembers, dialPool, ports, log.Printf)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if err := e.AddWire(trunk.Wire{ID: udpWire, Name: "udp", Shape: "random", Members: *members, Packet: true,
-		Dial: udpwire.Dialer{Exit: exitWire, Key: *key}.Dial}); err != nil {
-		log.Fatal(err)
+	if *members > 0 {
+		if err := e.AddWire(trunk.Wire{ID: udpWire, Name: "udp", Shape: "random", Members: *members, Packet: true,
+			Dial: udpwire.Dialer{Exit: exitWire, Key: *key}.Dial}); err != nil {
+			log.Fatal(err)
+		}
+		e.SetRoute(trunk.Route{Voice: udpWire, Bulk: trunk.PoolWire})
+	} else {
+		e.SetRoute(trunk.Route{Voice: trunk.PoolWire, Bulk: trunk.PoolWire})
 	}
-	e.SetRoute(trunk.Route{Voice: udpWire, Bulk: trunk.PoolWire})
 	ctx := context.Background()
 	go e.Run(ctx)
 

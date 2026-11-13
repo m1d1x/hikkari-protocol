@@ -3,7 +3,7 @@
 The trunk's protocol, the cascade entry's pipe and the exit's. The Go side (`trunk`, `trunk/pipectl`) is the reference
 and the brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r2.1-cronet` on `rust-r1.7-exit-tcp` (R2.1 stream members by Chromium's CONNECT; R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
+Status: branch `rust-r2.3-ports` on `rust-r2.2-members` (R2.3 the members' port book, deaths and their wait, datagrams on stream members; R2.2 a wire's members on one engine; R2.1 stream members by Chromium's CONNECT; R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
 members' health, R1.2 datagrams whole, R1.3 clients' TCP streams, R1.4 what a dead member carried sent again, R3 the
 brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
@@ -14,7 +14,7 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 | Crate | What | Who may depend on it |
 | --- | --- | --- |
 | `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
-| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal, a pool member's Naive padding and CONNECT headers (`naive`). No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal, a pool member's Naive padding and CONNECT headers (`naive`), the book of members' source ports (`ports`). No sockets, no clock, no threads | the entry, an exit, the messenger |
 | `cronet` (`hikkari-cronet`) | a pool member over Chromium's network stack: libcronet loaded at run time, the member's own TCP socket by cronet's dialer, the CONNECT tunnel read and written like a non-blocking socket; its `unsafe` is the C API's | the entry |
 | `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
 | `exit` (`hikkari-exit`) | the exit's pipe: the entry's packet members and stream members, their sessions, flows and streams to the loopback services, answers glued down; binary `hk-exit` | nothing |
@@ -101,7 +101,7 @@ cargo clippy --all-targets && cargo test          # on the mac: trunk and ctl; t
 rustup target add aarch64-unknown-linux-musl
 cargo build --release --target aarch64-unknown-linux-musl
 cp target/aarch64-unknown-linux-musl/release/hk-pipe target/aarch64-unknown-linux-musl/release/hk-loadgen bench/out/
-(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goentry ./goentry && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goexit ./goexit)
+(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags with_purego -o ../out/goentry ./goentry && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/goexit ./goexit)
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/run.sh 3 30 "1 4 16 64" "go rust rustev"
 ```
 
@@ -342,4 +342,32 @@ ja4 (`bench/go/hello`, a copy of the client's parser, hk h1) and fails unless ev
   && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ../out/hellocheck ./hellocheck)
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/members.sh 32 1073741824 1
 docker run --rm -e CUT=rst -e CUT_EVERY=1s -v "$PWD/bench:/bench" debian:bookworm-slim /bench/tcp.sh 1 chromium 1073741824 16 32
+```
+
+## The members' ports, their deaths, datagrams on the pool (R2.3)
+
+A stream member's connection goes from a source port of the pipe's book (`hikkari_trunk::ports::Book`, trunk
+`PortBook`; `--ports lo-hi`, 20000-32767 without it): the free ports are a list, a take one random index into it, a dead
+port comes back an hour after its last kill from the head of a queue, and a book with nothing free answers at once
+(the member waits as on a failed dial). A port whose bind finds it busy (a connection of ours still in `TIME_WAIT`) goes
+back and another is tried at once. A member's port is killed when the member stalls (hikkari_trunk::health) or its
+connection or hello gets no answer within 5 s; it goes back to the book when its connection closes, still dead if
+killed. The wait before a member is dialed anew is trunk `Entry.slot`'s: a stall dials again at once (after 3 in a row
+the wait grows), a dial or hello that failed and a member that lived under 5 s grow it from 200 ms to about 6 s, a
+member that lived longer dials again at once; every redial is spread over a second on top (`replaceSpread`).
+
+A datagram may ride stream members (spec/trunk.md, "Datagrams": the members carrying least): the route or pin names the
+pool's wire, or the wire it named has no member up. Of the members it may go on, it takes the Copies carrying the
+fewest unconfirmed bytes (a packet member carries none), ties by the flow's rank, so a flow keeps to its members while
+the load is even (`carry::on_least`); a member whose out buffer is full drops it. The exit's answers on a stream member
+go to the client as any wire's. With `--members 0` the pipe has no packet wire and its datagrams ride the pool.
+
+`bench/pool.sh` puts the bench's users on the pool alone, the Go entry (`goentry -members 0 -pool-chromium`, an engine
+per member, its ports from trunk's book) against `hk-pipe-gnu --members 0 --tcp-chromium`, to the Go exit's relay
+channel; with `CUT=rst` or `CUT=freeze` the members die under the users and come back on new ports.
+
+```bash
+(cd bench/go && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -tags with_purego -o ../out/goentry ./goentry)
+docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/pool.sh 3 30 "4 16 64" "go rust" 32
+docker run --rm -e CUT=freeze -e CUT_EVERY=2s -v "$PWD/bench:/bench" debian:bookworm-slim /bench/pool.sh 3 40 16 "go rust" 32
 ```
