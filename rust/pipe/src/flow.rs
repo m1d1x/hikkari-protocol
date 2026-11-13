@@ -149,16 +149,29 @@ impl Flows {
         Some((f, &mut self.n))
     }
 
+    /// The id of a client's open flow by its key, opening none.
+    #[inline]
+    pub fn find(&self, key: u64) -> Option<u32> {
+        self.by_addr.get(&key).copied()
+    }
+
+    /// The keys of every client's open flow.
+    pub fn client_keys(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_addr.keys().copied()
+    }
+
     /// Ends every client's flow unused for idle_ns (trunk's sweep of
-    /// FlowIdle): the next datagram from that address opens a new flow.
-    pub fn sweep(&mut self, now: u64, idle_ns: u64) {
+    /// FlowIdle): the next datagram from that address opens a new flow. The
+    /// keys of the flows it ended go to `ended`.
+    pub fn sweep(&mut self, now: u64, idle_ns: u64, ended: &mut Vec<u64>) {
         for i in 0..self.list.len() {
             let f = &self.list[i];
             if matches!(f.dest, Dest::Client { .. }) && now.saturating_sub(f.used) > idle_ns {
-                let id = f.id;
-                self.by_addr.remove(&f.key);
+                let (id, key) = (f.id, f.key);
+                self.by_addr.remove(&key);
                 self.end(id);
                 self.n.idle += 1;
+                ended.push(key);
             }
         }
     }
@@ -241,8 +254,11 @@ mod tests {
         let b = fl.client(2, || client(0)).unwrap();
         assert_eq!(fl.client(1, || unreachable!()), Some(a), "one flow per address");
         fl.with_counts(b).unwrap().0.used = 100 * S;
-        fl.sweep(121 * S, 120 * S);
+        let mut ended = Vec::new();
+        fl.sweep(121 * S, 120 * S, &mut ended);
         assert_eq!((fl.clients, fl.n.idle), (1, 1), "a, unused for 121 s, ended; b, used at 100 s, not");
+        assert_eq!(ended, vec![1], "a's key told");
+        assert_eq!((fl.find(1), fl.find(2)), (None, Some(b)));
         assert!(fl.with_counts(a).is_none(), "the exit's late answers on a find no flow");
         let a2 = fl.client(1, || client(121 * S)).unwrap();
         assert_ne!(a2, a, "the address's next datagram opens a new flow");
@@ -258,7 +274,9 @@ mod tests {
         fl.open(9, call).unwrap();
         assert!(fl.open(9, Flow::new(Dest::Brain { tag: 9 }, CLASS_VOICE, 2, ECHO_PORT, 1, 0)).is_err());
         assert_eq!(fl.clients, 0, "the trunk's own call is no client's flow");
-        fl.sweep(1000 * S, 120 * S);
+        let mut ended = Vec::new();
+        fl.sweep(1000 * S, 120 * S, &mut ended);
+        assert!(ended.is_empty());
         let id = fl.tagged(9).unwrap();
         assert!(fl.with_counts(id).is_some(), "a call the brain keeps is not swept");
         fl.close(9);
@@ -272,7 +290,7 @@ mod tests {
         for i in 0..4096u64 {
             let id = fl.client(i, || client(0)).unwrap();
             assert!(seen.insert(id), "id {id:#x} given twice");
-            fl.sweep(200 * S, 120 * S);
+            fl.sweep(200 * S, 120 * S, &mut Vec::new());
         }
         assert_eq!(fl.list.len(), 1, "one slot, used again each time");
     }

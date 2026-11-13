@@ -39,7 +39,7 @@ impl Pipe {
         }
     }
 
-    fn error(&mut self, e: &str) {
+    pub(super) fn error(&mut self, e: &str) {
         let mut b = Vec::with_capacity(1 + e.len());
         b.push(ctl::P_ERROR);
         b.extend_from_slice(e.as_bytes());
@@ -51,6 +51,12 @@ impl Pipe {
     /// One message of n bytes in self.msg, its sockets in self.fds (what it
     /// takes it removes from there).
     fn handle(&mut self, n: usize) -> Result<(), String> {
+        // A handoff's socket, whichever end: the generations' part.
+        match ctl::parse(&self.msg[..n]) {
+            Some(Msg::Drain) => return self.drain(),
+            Some(Msg::Adopt) => return self.adopt(),
+            _ => {}
+        }
         let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
@@ -139,6 +145,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
+            Msg::Drain | Msg::Adopt => unreachable!("taken above"),
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));

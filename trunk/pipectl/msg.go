@@ -25,7 +25,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 2
+const Version = 3
 
 // Brain → pipe.
 const (
@@ -38,6 +38,8 @@ const (
 	bDgram  = 0x07 // tag u32, payload
 	bClose  = 0x08 // tag u32
 	bMember = 0x09 // wire u8, index u8; one socket
+	bDrain  = 0x0a // one socket: the old end of a handoff
+	bAdopt  = 0x0b // one socket: the new end of a handoff
 )
 
 // Pipe → brain.
@@ -46,7 +48,8 @@ const (
 	pTick   = 0x82
 	pMember = 0x83 // wire u8, index u8, up u8, why u8
 	pDgram  = 0x84 // tag u32, payload
-	pError  = 0x85 // text
+	pError   = 0x85 // text
+	pDrained = 0x86 // a pipe draining carries nothing more
 )
 
 // FormUDP is the bare UDP wire (trunk/udpwire), the only form the pipe

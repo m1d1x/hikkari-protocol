@@ -56,6 +56,16 @@ replaced retires its current session the same way and opens no session after it,
 process changes nothing: a process that takes no new clients has no use for a new pool. What an entry cuts when it stops
 counts every session it has, the retired ones too.
 
+An entry's own process replaced (a generation of its unit, trunkentry `handoff.go`; the Rust pipe's `drain` and `adopt`)
+cuts nothing either. The new process gets the same client sockets and opens a session of its own. The old one stops
+accepting and stops reading the shared UDP sockets, and first tells the new one every client address its flows are for; the
+new one reads no client datagram before that list is whole. A datagram from such an address the new process hands to the
+old one, which carries it on its own session; the answers go out of the shared socket from the process that holds the flow.
+A flow stays with its process until it ends (2 minutes unused): then the old process lets the address go, and a datagram it
+was handed for a flow it no longer has goes back to the new one with it, which opens the flow itself. A stream stays with the
+process that accepted it. An old process that carries nothing more says so and leaves, at the latest after 30 minutes; one
+that is gone gives every address it held to the new one.
+
 ## Streams
 
 A stream is one client TCP connection to an exit loopback port, opened by the entry. Its bytes are numbered by offset; data

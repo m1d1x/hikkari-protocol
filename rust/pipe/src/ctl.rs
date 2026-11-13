@@ -5,7 +5,7 @@
 //! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
 //! here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -17,6 +17,8 @@ pub const B_OPEN: u8 = 0x06; // tag u32, class u8, pin u8, port u16, copies u8
 pub const B_DGRAM: u8 = 0x07; // tag u32, payload
 pub const B_CLOSE: u8 = 0x08; // tag u32
 pub const B_MEMBER: u8 = 0x09; // wire u8, index u8; one fd: the member's new socket
+pub const B_DRAIN: u8 = 0x0a; // one fd: the old end of a handoff socket (handoff.rs); the pipe takes no new client
+pub const B_ADOPT: u8 = 0x0b; // one fd: the new end of a handoff socket; a pipe draining sends on its other end
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -24,6 +26,7 @@ pub const P_TICK: u8 = 0x82; // see put_tick
 pub const P_MEMBER: u8 = 0x83; // wire u8, index u8, up u8, why u8
 pub const P_DGRAM: u8 = 0x84; // tag u32, payload
 pub const P_ERROR: u8 = 0x85; // text
+pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no client's flow, no stream
 
 /// The only wire form so far: the bare UDP wire (trunk/udpwire).
 pub const FORM_UDP: u8 = 1;
@@ -52,6 +55,8 @@ pub enum Msg<'a> {
     Dgram { tag: u32, payload: &'a [u8] },
     Close { tag: u32 },
     Member { wire: u8, index: u8 },
+    Drain,
+    Adopt,
 }
 
 struct Rd<'a> {
@@ -101,6 +106,8 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_DGRAM => Msg::Dgram { tag: r.u32()?, payload: r.rest() },
         B_CLOSE => Msg::Close { tag: r.u32()? },
         B_MEMBER => Msg::Member { wire: r.u8()?, index: r.u8()? },
+        B_DRAIN if m.len() == 1 => Msg::Drain,
+        B_ADOPT if m.len() == 1 => Msg::Adopt,
         _ => return None,
     })
 }
@@ -229,6 +236,14 @@ mod tests {
             Some(Msg::Dgram { tag: 7, payload }) => assert_eq!(payload, b"hi"),
             _ => panic!("not a dgram"),
         }
+    }
+
+    #[test]
+    fn parses_the_brains_drain_and_adopt_alone() {
+        // The same bytes as trunk/pipectl msg.go bDrain and bAdopt.
+        assert!(matches!(parse(&[0x0a]), Some(Msg::Drain)));
+        assert!(matches!(parse(&[0x0b]), Some(Msg::Adopt)));
+        assert!(parse(&[B_DRAIN, 0]).is_none(), "a drain carries nothing but its socket");
     }
 
     #[test]

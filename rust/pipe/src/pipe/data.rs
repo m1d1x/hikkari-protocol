@@ -7,15 +7,17 @@ use hikkari_trunk::frame::{self, Frame};
 
 use hikkari_sys::SeqPacket;
 
+use super::generation::{forward, owner_key};
 use super::{Event, Listen, Pipe, Slot};
 use crate::carry::carry;
 use crate::ctl::{self, ANY_WIRE};
 use crate::flow::{Dest, Flow, Flows};
 
 impl Pipe {
-    /// Clients → wires.
+    /// Clients → wires; a datagram from an address whose flow an older
+    /// generation keeps goes to it (generation.rs).
     pub(super) fn read_clients(&mut self) {
-        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, .. } = self;
+        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, older, owners, msg, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Listen(li) = *s else { continue };
             if !poll.readable(si) {
@@ -27,27 +29,19 @@ impl Pipe {
                 let n = crecv.recv(fd);
                 let now = now_ns();
                 for i in 0..n {
-                    let key = ((li as u64) << 48) | sys::addr_key(&crecv.addr[i]);
                     let addr = crecv.addr[i];
-                    let Some(id) = flows.client(key, || Flow::new(Dest::Client { listen: li as u16, addr }, l.class, ANY_WIRE, l.to, l.copies, now))
-                    else {
-                        continue; // MAX_FLOWS open: no flow for a new client
-                    };
+                    let key = client_key(li, &addr);
                     let seg = crecv.seg[i];
                     let len = crecv.len[i];
                     let step = if seg == 0 { len } else { seg };
-                    let base = i * crecv.slot;
-                    let Some((f, counts)) = flows.with_counts(id) else { continue };
-                    let mut at = 0;
-                    while at < len {
-                        let p = &crecv.buf[base + at..base + (at + step).min(len)];
-                        carry(wires, swires, *route, f, id, p, now);
-                        if !f.echo() {
-                            counts.out += 1;
+                    let p = &crecv.buf[i * crecv.slot..i * crecv.slot + len];
+                    if !owners.is_empty() {
+                        if let Some(&o) = owners.get(&owner_key(l.id, &addr)) {
+                            forward(&mut older[o as usize], msg, l.id, &addr, p, step);
+                            continue;
                         }
-                        *moved += 1;
-                        at += step;
                     }
+                    take_client(flows, wires, swires, *route, l, li, addr, key, p, step, now, moved);
                 }
                 if n < BATCH {
                     break;
@@ -170,4 +164,45 @@ pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Optio
         }
         Dest::Gone => {}
     }
+}
+
+/// A client's key in the flows: its listen (by index) and address.
+#[inline]
+pub(super) fn client_key(li: usize, addr: &sys::sockaddr_in) -> u64 {
+    ((li as u64) << 48) | sys::addr_key(addr)
+}
+
+/// A client datagram (segments of `step` bytes in p, as GRO read them) on
+/// its flow, opened by its first; false when no flow could be opened
+/// (MAX_FLOWS open).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn take_client(
+    flows: &mut Flows,
+    wires: &mut [crate::member::Wire],
+    swires: &mut [crate::link::StreamWire],
+    route: [u8; 2],
+    l: &Listen,
+    li: usize,
+    addr: sys::sockaddr_in,
+    key: u64,
+    p: &[u8],
+    step: usize,
+    now: u64,
+    moved: &mut u64,
+) -> bool {
+    let Some(id) = flows.client(key, || Flow::new(Dest::Client { listen: li as u16, addr }, l.class, ANY_WIRE, l.to, l.copies, now)) else {
+        return false;
+    };
+    let Some((f, counts)) = flows.with_counts(id) else { return false };
+    let mut at = 0;
+    while at < p.len() {
+        carry(wires, swires, route, f, id, &p[at..(at + step).min(p.len())], now);
+        if !f.echo() {
+            counts.out += 1;
+        }
+        *moved += 1;
+        at += step;
+    }
+    true
 }

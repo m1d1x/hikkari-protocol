@@ -27,6 +27,7 @@
 mod brain;
 mod data;
 mod death;
+mod generation;
 mod tcp;
 mod timers;
 
@@ -35,6 +36,7 @@ use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
+use generation::Older;
 use tcp::{TcpListen, Why};
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
@@ -44,7 +46,7 @@ use hikkari_trunk::ports::{self, Book};
 use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, ANY_WIRE};
-use crate::flow::{Flows, CLASS_VOICE};
+use crate::flow::{Flows, FxMap, CLASS_VOICE};
 use crate::link::{Reach, StreamWire};
 use crate::member::{member_to, Member, Wire, SLOT};
 use crate::streams::Streams;
@@ -73,6 +75,10 @@ enum Slot {
     TcpListen(usize),
     Client(usize),
     Link(usize, usize),
+    /// The handoff socket to the newer generation (this pipe drains), to
+    /// an older one (this pipe adopted it).
+    Newer,
+    Older(usize),
 }
 
 /// A member event for the brain, sent after the walk that found it.
@@ -134,6 +140,15 @@ pub struct Pipe {
     stranded: BTreeSet<u32>,
     /// Streams to end after the pass that found them done or failed.
     doomed: Vec<(usize, Why)>,
+    /// The generations (generation.rs): the newer one this pipe drains to,
+    /// the older ones draining to it, the client addresses (owner keys)
+    /// whose flows an older one keeps, by its index in older; the keys of
+    /// flows the last sweep ended; whether the brain heard it drained.
+    newer: Option<SeqPacket>,
+    older: Vec<Older>,
+    owners: FxMap<u64>,
+    freed: Vec<u64>,
+    drained: bool,
     poll: Poll,
     slots: Vec<Slot>,
     dirty: bool,
@@ -176,6 +191,11 @@ impl Pipe {
             released: Vec::with_capacity(256),
             stranded: BTreeSet::new(),
             doomed: Vec::with_capacity(64),
+            newer: None,
+            older: Vec::new(),
+            owners: FxMap::default(),
+            freed: Vec::with_capacity(256),
+            drained: false,
             poll: Poll::new(),
             slots: Vec::new(),
             dirty: true,
@@ -300,6 +320,7 @@ impl Pipe {
             if !self.read_brain() {
                 return;
             }
+            self.read_generations();
             if self.dirty {
                 // The sockets changed under the poll: read every one once.
                 self.rebuild_poll();
@@ -324,8 +345,18 @@ impl Pipe {
         if self.ctl.is_some() {
             self.slots.push(Slot::Ctl);
         }
-        for i in 0..self.listens.len() {
-            self.slots.push(Slot::Listen(i));
+        if self.newer.is_some() {
+            self.slots.push(Slot::Newer);
+        }
+        for (i, o) in self.older.iter().enumerate() {
+            if o.sock.is_some() {
+                self.slots.push(Slot::Older(i));
+            }
+        }
+        if self.reads_clients() {
+            for i in 0..self.listens.len() {
+                self.slots.push(Slot::Listen(i));
+            }
         }
         for (wi, w) in self.wires.iter().enumerate() {
             for (mi, m) in w.members.iter().enumerate() {
@@ -334,8 +365,10 @@ impl Pipe {
                 }
             }
         }
-        for i in 0..self.tcp_listens.len() {
-            self.slots.push(Slot::TcpListen(i));
+        if self.newer.is_none() {
+            for i in 0..self.tcp_listens.len() {
+                self.slots.push(Slot::TcpListen(i));
+            }
         }
         for slot in 0..self.streams.slots() {
             if self.streams.get(slot).is_some() {
@@ -351,6 +384,7 @@ impl Pipe {
         }
         let (listens, wires, ctl) = (&self.listens, &self.wires, &self.ctl);
         let (tcp_listens, streams, swires) = (&self.tcp_listens, &self.streams, &self.swires);
+        let (newer, older) = (&self.newer, &self.older);
         self.poll.set(self.slots.iter().map(|s| match *s {
             Slot::Ctl => ctl.as_ref().unwrap().fd,
             Slot::Listen(i) => listens[i].sock.as_raw_fd(),
@@ -358,6 +392,8 @@ impl Pipe {
             Slot::TcpListen(i) => tcp_listens[i].fd.as_raw_fd(),
             Slot::Client(slot) => streams.get(slot).map_or(-1, |st| st.client.fd.as_raw_fd()),
             Slot::Link(w, l) => swires[w].links[l].sock.as_ref().map_or(-1, |s| s.fd()),
+            Slot::Newer => newer.as_ref().map_or(-1, |s| s.fd),
+            Slot::Older(i) => older[i].sock.as_ref().map_or(-1, |s| s.fd),
         }));
         self.dirty = false;
     }
@@ -405,6 +441,13 @@ impl Pipe {
         }
         if self.has_tcp() {
             s += &tcp::stats(&self.streams, &self.swires, &self.ports);
+        }
+        if self.newer.is_some() {
+            s += " | draining";
+        }
+        let older = self.older.iter().filter(|o| o.sock.is_some()).count();
+        if older > 0 {
+            s += &format!(" | older={} held={}", older, self.owners.len());
         }
         eprintln!("{s}");
     }

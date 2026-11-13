@@ -100,7 +100,7 @@ impl Pipe {
         if now >= self.tick_at {
             // Flows unused past idle end once a second, as trunk's sweep on
             // its tick: an end a second late changes nothing.
-            self.flows.sweep(now, self.flow_idle_ns);
+            self.sweep_flows(now);
             self.send_tick(now);
             self.tick_at = if self.tick_at + TICK_EVERY > now { self.tick_at + TICK_EVERY } else { now + TICK_EVERY };
         }

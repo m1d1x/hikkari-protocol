@@ -3,7 +3,7 @@
 The trunk's protocol, the cascade entry's pipe and the exit's. The Go side (`trunk`, `trunk/pipectl`) is the reference
 and the brain; how to write code here: [../STYLE.md](../STYLE.md).
 
-Status: branch `rust-r2.3-ports` on `rust-r2.2-members` (R2.3 the members' port book, deaths and their wait, datagrams on stream members; R2.2 a wire's members on one engine; R2.1 stream members by Chromium's CONNECT; R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
+Status: branch `rust-r4-generations` on `rust-r2.3-ports` (R4 generations: a reload hands the client ports to a new pipe, the old one carries its flows to their end; R2.3 the members' port book, deaths and their wait, datagrams on stream members; R2.2 a wire's members on one engine; R2.1 stream members by Chromium's CONNECT; R1.7 the exit's streams; R1.6 the exit's pipe, UDP; R1.5 both paths benched at once; R1.1
 members' health, R1.2 datagrams whole, R1.3 clients' TCP streams, R1.4 what a dead member carried sent again, R3 the
 brain's socket); bench and tests only, not deployed. The
 plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`, «Труба на Rust»; numbers:
@@ -258,6 +258,8 @@ Brain → pipe:
 | `route` | the wire of each class; the pipe moves the next datagram, nothing to migrate: the exit answers a flow on the wire the entry last sent it on |
 | `open`, `dgram`, `close` | a flow of the brain's own (its call on a wire, pinned: dropped while the wire has no member up) and its datagrams |
 | `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer |
+| `drain` | the old end of a reload's handoff socket (one): the pipe takes no new client (below, «Generations») |
+| `adopt` | the new end of a handoff socket (one): an older pipe drains to this one; it comes before the client ports |
 
 Pipe → brain:
 
@@ -268,8 +270,9 @@ Pipe → brain:
 | `member` | a member up (hello answered) or down: `silent` (past its stall while another member proved the exit alive), `quiet` (every member silent past Quiet), `gone` (its socket failed) |
 | `dgram` | an answer on a brain's flow |
 | `error` | a message the pipe could not take |
+| `drained` | a pipe draining carries nothing more: no client's flow, no stream |
 
-Left for later: `drain` and generations (R3), `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, the forms other than `udp` (R4) and streams with the pool (R5). The pipe passes over a wire with no member
+Left for later: `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, the forms other than `udp` (R4) and streams with the pool (R5). The pipe passes over a wire with no member
 up for any wire that has one, as `trunk.Route` does, before the selector moves the route.
 
 The test of the whole loop (a Go exit, two `udp` wires to it through cutters, the selector over the pipe's ticks, four
@@ -371,3 +374,33 @@ channel; with `CUT=rst` or `CUT=freeze` the members die under the users and come
 docker run --rm -v "$PWD/bench:/bench" debian:bookworm-slim /bench/pool.sh 3 30 "4 16 64" "go rust" 32
 docker run --rm -e CUT=freeze -e CUT_EVERY=2s -v "$PWD/bench:/bench" debian:bookworm-slim /bench/pool.sh 3 40 16 "go rust" 32
 ```
+
+## Generations (R4)
+
+A reload of the entry replaces its pipe without a cut (spec/trunk.md, "An entry's own process replaced"; the Go entry's
+generations, hikkari-control trunkentry `handoff.go`, are the reference). The brain starts the new pipe, gives it its
+wires and waits for its members, then makes one `SOCK_SEQPACKET` socket for the reload (`pipectl.HandoffLink`): its new
+end goes to the new pipe with `adopt`, the client ports (the same sockets) after it, its old end to the old pipe with
+`drain` (`Pipe.Handoff` does all three in one brain; across two brain processes the ends travel as inherited files). The
+messages between the pipes are `pipe/src/handoff.rs`, the loop's part `pipe/src/pipe/generation.rs`:
+
+- The old pipe stops reading the client ports and stops accepting, and sends `own` (every address its flows are for, many
+  to a message), then `all`. The new pipe reads no client port before every older pipe it adopted said `all`; the datagrams
+  wait in the shared socket meanwhile.
+- The new pipe sends a datagram of an address an older pipe owns to that pipe (`dgram`), a message per segment; the old
+  pipe carries it on its own session and members, and answers out of the shared socket. A flow stays with its pipe until
+  it ends unused; then the old pipe sends `free`, and a datagram it was handed for a flow it no longer has goes back in
+  the `free`, which the new pipe carries itself. A stream stays with the pipe that accepted it.
+- An old pipe with no client's flow and no stream says `drained` to its brain once (on its second's tick); the brain ends
+  it then, or at its limit. An older pipe gone (its socket closed) gives every address it held to the new one: the next
+  datagram opens a flow there. A newer pipe gone makes the old one read its clients again.
+- The ownership check costs the new pipe one lookup per client datagram while an older pipe owns any address, nothing
+  otherwise; the handed datagrams are one message each way, only for the old pipe's flows and only while it drains.
+
+Tests against both exits (`generation_linux_test.go`): `TestAReloadUnderACallPausesItNoMoreThan150ms` (a call through the
+reload: no pause over 150 ms, nothing lost; a call after it is the new pipe's; the old one drains once the first hangs up,
+whose next call is the new pipe's), `TestAnOldPipeGoneGivesItsAddressesToTheNewOne`.
+
+Left for later: the brain's messages for TCP client ports (under the brain the pipe has UDP client ports only: TCP is the
+bench's flags, so a reload of streams is not tested), the exit's drain (`drain` frame 10: the pipe ignores it, so a reload of
+the exit's relay keeps the old session until the exit's old process leaves), and the Rust exit's own generations.

@@ -395,6 +395,14 @@ impl SeqPacket {
     }
 }
 
+impl Drop for SeqPacket {
+    /// The socket is the SeqPacket's: a handoff socket closed tells the
+    /// other generation it is gone.
+    fn drop(&mut self) {
+        close_fd(self.fd);
+    }
+}
+
 /// Readiness of many sockets by epoll, read without waiting: what a loop on
 /// a tick asks once per turn, when the sockets are too many to read each
 /// one (the exit's sockets to its relay, one per flow). Level-triggered: a

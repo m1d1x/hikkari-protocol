@@ -9,9 +9,11 @@
 //! - link: stream members, each over a TCP connection of its own
 //! - streams: clients' TCP connections as streams to the exit
 //! - carry: which wire and member carry a flow's datagram
+//! - handoff: the messages between an old generation of the pipe and a new one
 //! - pipe: the loop (brain, timers, data)
 
 pub mod ctl;
+pub mod handoff;
 #[cfg(target_os = "linux")]
 mod carry;
 #[cfg(target_os = "linux")]

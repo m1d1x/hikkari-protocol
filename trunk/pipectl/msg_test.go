@@ -47,6 +47,10 @@ func TestGolden(t *testing.T) {
 	if _, err := putWire(3, FormUDP, 0, 0, 0, key[:31]); err == nil {
 		t.Fatal("a short key taken")
 	}
+	// rust/pipe/src/ctl.rs parses_the_brains_drain_and_adopt_alone.
+	if bDrain != 0x0a || bAdopt != 0x0b || pDrained != 0x86 {
+		t.Fatalf("drain %#x, adopt %#x, drained %#x", bDrain, bAdopt, pDrained)
+	}
 	if got := putRoute(trunk.Route{Voice: 2, Bulk: trunk.AnyWire}); !reflect.DeepEqual(got, []byte{bRoute, 2, 255}) {
 		t.Fatalf("route % x", got)
 	}

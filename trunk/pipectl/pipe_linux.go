@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -69,7 +70,7 @@ type Pipe struct {
 	mu      sync.Mutex
 	pid     int
 	wires   map[trunk.WireID]*wireConf
-	listens map[byte]*net.UDPConn
+	listens map[byte]*listenConf
 	route   trunk.Route
 	tick    Tick
 	tickAt  time.Time
@@ -78,6 +79,19 @@ type Pipe struct {
 
 	nextTag atomic.Uint32
 	hello   chan struct{}
+	// drained is closed once the pipe, draining, says it carries nothing
+	// more.
+	drained     chan struct{}
+	drainedOnce sync.Once
+}
+
+// listenConf is a client port as the brain gave it, to give it again to
+// the next pipe of a reload.
+type listenConf struct {
+	c      *net.UDPConn
+	class  trunk.Class
+	to     uint16
+	copies int
 }
 
 type wireConf struct {
@@ -100,7 +114,8 @@ func Start(cfg Config) (*Pipe, error) {
 		return nil, err
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
-		listens: map[byte]*net.UDPConn{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{})}
+		listens: map[byte]*listenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
+		drained: make(chan struct{})}
 	go func() {
 		p.err = cmd.Wait()
 		close(p.done)
@@ -128,8 +143,8 @@ func (p *Pipe) Close() error {
 	<-p.done
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, c := range p.listens {
-		c.Close()
+	for _, l := range p.listens {
+		l.c.Close()
 	}
 	for _, w := range p.wires {
 		for _, c := range w.members {
@@ -163,12 +178,78 @@ func (p *Pipe) Listen(id byte, c *net.UDPConn, class trunk.Class, to uint16, cop
 		return err
 	}
 	p.mu.Lock()
-	if old := p.listens[id]; old != nil && old != c {
-		old.Close()
+	if old := p.listens[id]; old != nil && old.c != c {
+		old.c.Close()
 	}
-	p.listens[id] = c
+	p.listens[id] = &listenConf{c: c, class: class, to: to, copies: copies}
 	p.mu.Unlock()
 	return nil
+}
+
+// HandoffLink is the socket of one reload (spec/trunk.md, "An entry's own
+// process replaced"; rust/pipe/src/handoff.rs): the old end goes to the
+// old pipe's Drain, the new end to the new pipe's Adopt, in this brain or
+// in the next brain's process. The caller closes both once given.
+func HandoffLink() (old, next *os.File, err error) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, fmt.Errorf("pipectl: handoff socketpair: %w", err)
+	}
+	return os.NewFile(uintptr(fds[0]), "handoff-old"), os.NewFile(uintptr(fds[1]), "handoff-new"), nil
+}
+
+// Drain makes p the old pipe of a reload: it takes no new client, stops
+// reading its client ports, tells the new pipe at the other end of link
+// which client addresses its flows are for, and carries those flows (their
+// datagrams reach it through the new pipe) until they end. Drained is
+// closed once it carries nothing more; the brain closes it then, or at its
+// limit (the Go entry's 30 minutes). Its client ports are the new pipe's:
+// Close leaves those sockets open.
+func (p *Pipe) Drain(link *os.File) error {
+	if err := sendWith(p.conn, &p.wmu, []byte{bDrain}, link); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.listens = map[byte]*listenConf{}
+	p.mu.Unlock()
+	return nil
+}
+
+// Adopt makes p the new pipe of a reload, link the other end of the old
+// pipe's Drain. Adopt comes before p gets the old pipe's client ports: p
+// reads none of them before the old pipe said whose flows it keeps.
+func (p *Pipe) Adopt(link *os.File) error {
+	return sendWith(p.conn, &p.wmu, []byte{bAdopt}, link)
+}
+
+// Drained is closed once p, draining, carries nothing more: no client's
+// flow, no stream.
+func (p *Pipe) Drained() <-chan struct{} { return p.drained }
+
+// Handoff is a reload within one brain: next, its wires up, adopts p, gets
+// p's client ports (the same sockets) and every new client; p drains to it.
+func (p *Pipe) Handoff(next *Pipe) error {
+	old, nw, err := HandoffLink()
+	if err != nil {
+		return err
+	}
+	defer old.Close()
+	defer nw.Close()
+	if err := next.Adopt(nw); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	listens := make(map[byte]*listenConf, len(p.listens))
+	for id, l := range p.listens {
+		listens[id] = l
+	}
+	p.mu.Unlock()
+	for id, l := range listens {
+		if err := next.Listen(id, l.c, l.class, l.to, l.copies); err != nil {
+			return err
+		}
+	}
+	return p.Drain(old)
 }
 
 // SetWire gives the pipe a wire, or new members and settings of one it has:
@@ -413,6 +494,9 @@ func (p *Pipe) read() {
 			}
 		case pError:
 			p.cfg.Logf("pipectl: the pipe: %s", m[1:])
+		case pDrained:
+			p.cfg.Logf("pipectl: the pipe drained")
+			p.drainedOnce.Do(func() { close(p.drained) })
 		default:
 			p.cfg.Logf("pipectl: a message the brain does not know: type %#x", m[0])
 		}
