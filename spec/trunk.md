@@ -189,3 +189,24 @@ The bare UDP wire (`trunk/udpwire`): packet members, a UDP socket of its own per
 on the exit, a member per entry address. A datagram is a 12-byte random nonce and the frames of one write sealed with
 AES-256-GCM under HKDF-SHA256(trunk key, "hikkari trunk udp wire"). A datagram that opens under no trunk key is dropped
 without an answer.
+
+The Chromium QUIC wire (`h3dgram`, draft 2026-11-13, R6.2; hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
+"Труба на Rust"): packet members whose datagrams are HTTP Datagrams (RFC 9297) of a CONNECT-UDP request (RFC 9298) over
+HTTP/3, sent by Chromium's own QUIC stack on the entry, so the border sees what Chrome sends to a MASQUE proxy. A member is
+one QUIC connection (TLS 1.3, ALPN `h3`, the exit's UDP port) carrying one CONNECT-UDP request: `:method CONNECT`,
+`:protocol connect-udp`, `:scheme https`, `:path /.well-known/masque/udp/{host}/{port}/` (any target: the exit is the
+trunk's end and opens nothing to it), and `proxy-authorization: Bearer <token>`, where the token is HKDF-SHA256(trunk key,
+"hikkari trunk h3dgram wire"), 32 bytes in lower-case hex. Datagrams must be on in both QUIC (RFC 9221) and HTTP/3
+(`SETTINGS_H3_DATAGRAM` 1). The exit answers a request with a known token `200` with `capsule-protocol: ?1`; any other
+request on the connection is answered `404` as a site would, and a connection that never asks a CONNECT-UDP with a known
+token carries nothing of the trunk. Capsules on the request stream are read and dropped.
+
+An HTTP Datagram is the request stream's quarter stream id (varint), context id 0 (varint) and the frames of one write as
+they are, not sealed: QUIC's TLS already keeps them, and the token proved the trunk key. A datagram with another context id,
+or one for a stream that is no member, is dropped. The frames of one datagram are what one QUIC DATAGRAM frame holds on the
+connection's path (about 1200 B with Chromium's packets): a write over it is dropped, as udpwire drops one over its
+datagram. Live datagrams of clients (voice, games) fit; a client's own QUIC packets (1250–1350 B) do not and go on a wire
+that carries them.
+
+The member's end is its connection's: the request stream ending, the connection closing or the member dying by its health
+closes both, and the entry opens a new member with a new connection. The exit's QUIC connection ids are random, 16 bytes.

@@ -55,7 +55,7 @@ impl Exit {
                 let sock = sys::udp_from_fd(fds.remove(0)).map_err(|e| format!("exit: wire {id}: {e}"))?;
                 sys::tune(&sock, false).map_err(|e| format!("exit: wire {id}: {e}"))?;
                 let keys = keys.chunks(32).map(|k| k.try_into().expect("32")).collect();
-                let w = Wire::new(id, sock, keys, dead_ms as u64 * 1_000_000, quiet_ms as u64 * 1_000_000, glue_us as u64 * 1000, glue_max as usize);
+                let w = Wire::udp(id, sock, keys, dead_ms as u64 * 1_000_000, quiet_ms as u64 * 1_000_000, glue_us as u64 * 1000, glue_max as usize);
                 self.wires.push(w);
                 self.dirty = true;
                 Ok(())
@@ -106,7 +106,7 @@ impl Exit {
         (t.hit, t.resent, t.up, t.down, t.early, t.early_dropped) = (n.deaths, n.resent, n.up, n.down, n.early, n.early_dropped);
         t.w_out = self.wires.iter().map(|w| w.dgrams).sum();
         t.frames_out = self.wires.iter().map(|w| w.frames).sum();
-        t.dropped = self.wires.iter().map(|w| w.send.dropped).sum();
+        t.dropped = self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum();
         let Some(c) = self.ctl.as_mut() else { return };
         let mut b = [0u8; ctl::TICK_LEN];
         let n = self.t.put(&mut b);

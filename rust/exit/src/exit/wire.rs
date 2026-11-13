@@ -11,6 +11,7 @@ use hikkari_trunk::frame::{self, Frame, DGRAM_HEAD, F_PONG, KIND_PACKET, KIND_ST
 use hikkari_trunk::health::Health;
 
 use super::Exit;
+use crate::peer::Form;
 
 impl Exit {
     /// Everything each readable wire has, batch by batch.
@@ -19,6 +20,10 @@ impl Exit {
         let mut rb = self.wrecv.take().expect("the wire's batch");
         for wi in 0..self.wires.len() {
             if !self.poll.readable(first + wi) {
+                continue;
+            }
+            if self.wires[wi].h3().is_some() {
+                self.read_h3(wi, &mut rb, now);
                 continue;
             }
             loop {
@@ -48,7 +53,8 @@ impl Exit {
                 }
             },
             None => {
-                let opened = self.wires[wi].openers.iter().enumerate().find_map(|(k, o)| o.open(d).map(|n| (k, n)));
+                let Form::Udp(u) = &self.wires[wi].form else { return };
+                let opened = u.openers.iter().enumerate().find_map(|(k, o)| o.open(d).map(|n| (k, n)));
                 let Some((k, n)) = opened else {
                     // Under no key: a stranger, answered nothing.
                     self.t.bad += 1;
@@ -60,10 +66,15 @@ impl Exit {
                 }
             }
         };
+        self.frames(pi, &d[12..12 + n], now);
+    }
+
+    /// The frames of one datagram that opened on peer pi, in order (on the
+    /// QUIC wire, an HTTP Datagram of its request).
+    pub(super) fn frames(&mut self, pi: usize, p: &[u8], now: u64) {
         self.t.w_in += 1;
         self.moved += 1;
         self.peers[pi].heard = now;
-        let p = &d[12..12 + n];
         let mut at = 0;
         while at < p.len() {
             let Some((f, next)) = frame::next_frame(p, at) else {

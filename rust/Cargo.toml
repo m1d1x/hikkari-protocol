@@ -19,6 +19,7 @@ sha2 = "=0.10.9"
 hikkari-sys = { path = "sys" }
 hikkari-trunk = { path = "trunk" }
 hikkari-cronet = { path = "cronet" }
+quiche = "=0.30.1"
 
 [profile.release]
 opt-level = 3

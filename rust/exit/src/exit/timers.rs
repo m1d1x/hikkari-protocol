@@ -33,6 +33,11 @@ impl Exit {
             self.end_doomed(now);
         }
         let mut next = self.clock_at;
+        for w in self.wires.iter_mut() {
+            if let Some(h) = w.h3() {
+                next = next.min(h.timers(now));
+            }
+        }
         if self.tick_ns == 0 {
             for p in self.peers.iter().filter(|p| p.live && p.glue_since != 0) {
                 next = next.min(p.glue_since + self.wires[p.wire].glue_ns);

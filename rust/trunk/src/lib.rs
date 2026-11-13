@@ -8,6 +8,7 @@
 pub mod buf;
 pub mod flow;
 pub mod frame;
+pub mod h3dgram;
 pub mod health;
 pub mod naive;
 pub mod ports;

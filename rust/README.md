@@ -14,13 +14,13 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 | Crate | What | Who may depend on it |
 | --- | --- | --- |
 | `sys` (`hikkari-sys`) | Linux syscalls: batched UDP, poll, time, SOCK_SEQPACKET with SCM_RIGHTS. Every `unsafe` of the workspace | any |
-| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal, a pool member's Naive padding and CONNECT headers (`naive`), the book of members' source ports (`ports`). No sockets, no clock, no threads | the entry, an exit, the messenger |
+| `trunk` (`hikkari-trunk`) | the trunk's protocol (spec/trunk.md): frames, members' health, a flow's rules (copies dropped by seq, idle end), a stream's rules (what an ack confirms, chunks in order, the window), the `udp` wire's seal, a pool member's Naive padding and CONNECT headers (`naive`), the book of members' source ports (`ports`), the `h3dgram` wire's token and HTTP Datagram head (`h3dgram`). No sockets, no clock, no threads | the entry, an exit, the messenger |
 | `cronet` (`hikkari-cronet`) | a pool member over Chromium's network stack: libcronet loaded at run time, the member's own TCP socket by cronet's dialer, the CONNECT tunnel read and written like a non-blocking socket; its `unsafe` is the C API's | the entry |
 | `pipe` (`hikkari-pipe`) | the entry's pipe: client ports, flows, wires, the route, the loop; binary `hk-pipe` | nothing |
-| `exit` (`hikkari-exit`) | the exit's pipe: the entry's packet members and stream members, their sessions, flows and streams to the loopback services, answers glued down; binary `hk-exit` | nothing |
+| `exit` (`hikkari-exit`) | the exit's pipe: the entry's packet members (the `udp` wire, and the `h3dgram` wire's QUIC connections by `quiche`) and stream members, their sessions, flows and streams to the loopback services, answers glued down; binary `hk-exit` | nothing |
 | `bench` (`hikkari-bench`) | the bench's users (`hk-loadgen`), `run.sh`, the Go entry and exit it measures against | nothing |
 
-`trunk` depends on no other crate here, `sys` on none, `cronet` on both, `pipe` on all three, `exit` on `sys` and `trunk`. Inside `pipe`: `ctl` (the brain's messages),
+`trunk` depends on no other crate here, `sys` on none, `cronet` on both, `pipe` on all three, `exit` on `sys`, `trunk` and `quiche` (=0.30.1, BoringSSL by `boring`: cmake and libclang to build). Inside `pipe`: `ctl` (the brain's messages),
 `flow`, `member` (wires, members, glue), `carry` (which wire carries a datagram), `link` (stream members over TCP),
 `streams` (clients' connections as streams), `pipe/` (the loop: `brain`, `timers`, `data`, `tcp`).
 
@@ -478,4 +478,36 @@ get no tunnel.
 cargo build --release -p hikkari-cronet --bin hk-udp-tunnel     # linux/amd64, glibc
 (cd bench/go && CGO_ENABLED=0 go build -o ../out/connectudp ./connectudp)
 bench/tunnel.sh 3 1500      # needs /bench/out: connectudp, hk-udp-tunnel, the patched libcronet.so
+```
+
+## The exit's Chromium QUIC wire (R6.2)
+
+The other end of the tunnel above: the `h3dgram` wire (spec/trunk.md, "Wires") in `hk-exit`. QUIC and HTTP/3 are
+`quiche` 0.30.1 sans-IO in the exit's own loop (research: hikkari-client
+`plans/research/2026-11-13-connect-udp-rust-server.md`); no runtime, no thread. `h3wire.rs` keeps the connections: one
+UDP socket, packets in by `recvmmsg` with the rest of the exit's wires, a connection by the destination id read from the
+header (16 random bytes of the exit's own; quiche parses only a new connection's Initial), HTTP/3 with extended CONNECT
+and `SETTINGS_H3_DATAGRAM`, packets out in one `sendmmsg` a turn, QUIC's timers on the loop's. A CONNECT-UDP with the
+token of a trunk key (`proxy-authorization: Bearer <hex>`) is a member (`200`, `capsule-protocol: ?1`); anything else is
+answered `404`. `exit/h3.rs` makes a member a peer like a `udp` one: its datagrams' frames go the same way
+(`wire.rs`, `frames`), its glue becomes one HTTP Datagram a tick (as much as the connection's DATAGRAM frame holds), and a
+member that dies closes its connection. Datagrams sit in quiche's queues in buffers of a fixed size (`Dg`), not one
+allocation each.
+
+Not yet: the brain's message for this wire (the brain hands the `udp` wire only; the certificate and the tokens come with
+R6.3), the queue by time and the guard of С10 down (quiche's own congestion control for now), Retry.
+
+Checks:
+
+- `exit/tests/h3dgram.rs`: a QUIC client of its own (quiche) against `hk-exit`: a member says its hello and hears the
+  call back; another token gets `404` (`tests/data` holds a test-only certificate).
+- `bench/h3dgram.sh [runs] [count]`: the call through Chromium's QUIC (`hk-h3dgram-call`, the patched libcronet) to
+  `hk-exit`, every datagram checked; a wrong key gets no member.
+- `bench/h3dgram-cost.sh [members] [pps] [secs] [size]`: the exit's CPU per datagram under calls at once.
+
+```bash
+cargo build --release -p hikkari-exit --bin hk-exit            # linux/amd64
+cargo build --release -p hikkari-cronet --bin hk-h3dgram-call
+OUT=<dir> bench/h3dgram.sh 3 1500      # needs in OUT: hk-exit, hk-h3dgram-call, the patched libcronet.so; openssl
+OUT=<dir> bench/h3dgram-cost.sh 8 4000 10
 ```

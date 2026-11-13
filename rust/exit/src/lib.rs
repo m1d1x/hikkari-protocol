@@ -7,6 +7,8 @@
 //!
 //! - ctl: the brain ↔ exit messages
 //! - peer: a wire's socket and the entry's members on it, each member's glue
+//! - h3wire: the Chromium QUIC wire's connections (quiche), a member per
+//!   CONNECT-UDP
 //! - session: sessions by the entry's session id, each with its members
 //! - flow: flows by stream id, which members carry an answer
 //! - link: the entry's stream members, each on a TCP connection
@@ -18,6 +20,8 @@ pub mod ctl;
 pub mod exit;
 #[cfg(target_os = "linux")]
 mod flow;
+#[cfg(target_os = "linux")]
+pub mod h3wire;
 #[cfg(target_os = "linux")]
 mod link;
 #[cfg(target_os = "linux")]

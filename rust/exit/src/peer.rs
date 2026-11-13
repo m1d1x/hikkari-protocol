@@ -1,6 +1,8 @@
 //! A packet wire on the exit and the entry's members on it (spec/trunk.md,
-//! "Wires"; trunk/udpwire Listener): one socket for every member, a member
-//! per entry address, joined to its session by its hello. Each member has
+//! "Wires"): one socket for every member; on the bare UDP wire
+//! (trunk/udpwire Listener) a member per entry address, on the Chromium
+//! QUIC wire (h3wire.rs) a member per QUIC connection's CONNECT-UDP; each
+//! joined to its session by its hello. Each member has
 //! its health (hikkari_trunk::health, judged by the exit as by the entry)
 //! and its glue: the frames bound for it in one tick sealed into one
 //! datagram, which the Go exit does not do (trunk session.go writePackets:
@@ -15,6 +17,8 @@ use hikkari_sys::{self as sys, sockaddr_in, SendBatch, BATCH};
 use hikkari_trunk::health::Health;
 use hikkari_trunk::udpwire::{Seal, OVERHEAD};
 
+use crate::h3wire::H3Wire;
+
 /// The largest datagram on the wire (udpwire MaxDatagram, the IPv4 UDP
 /// payload limit): a wire's receive and send slots hold one each.
 pub const SLOT: usize = 65507;
@@ -22,77 +26,141 @@ pub const SLOT: usize = 65507;
 /// No index: a member not in a session, a flow's member not known.
 pub const NONE: usize = usize::MAX;
 
-/// One packet wire: its socket, the keys a member's first datagram may open
-/// under, its members' stall and the session's Quiet, its glue, and the
-/// sealed datagrams waiting for one sendmmsg to their addresses.
-pub struct Wire {
-    pub id: u8,
+/// A packet wire's own form: the bare UDP wire's socket and seal, or the
+/// Chromium QUIC wire's connections (h3wire.rs).
+pub enum Form {
+    Udp(Udp),
+    H3(Box<H3Wire>),
+}
+
+/// The bare UDP wire: its socket, the keys a member's first datagram may
+/// open under, and the sealed datagrams waiting for one sendmmsg to their
+/// addresses.
+pub struct Udp {
     sock: UdpSocket,
     pub keys: Vec<[u8; 32]>,
     /// One opener per key: opening takes no nonce of its own.
     pub openers: Vec<Seal>,
+    out: Vec<u8>,
+    out_n: usize,
+    pub send: SendBatch,
+}
+
+/// One packet wire: its form, its members' stall and the session's Quiet,
+/// its glue.
+pub struct Wire {
+    pub id: u8,
+    pub form: Form,
     pub stall_ns: u64,
     pub quiet_ns: u64,
     pub glue_ns: u64,
     pub glue_max: usize,
-    out: Vec<u8>,
-    out_n: usize,
-    pub send: SendBatch,
-    /// Frames glued and sealed datagrams sent since the wire came: frames
-    /// per datagram is the glue down.
+    /// Frames glued and datagrams sent since the wire came: frames per
+    /// datagram is the glue down. Dropped: frames no datagram of the
+    /// member held, and datagrams its connection did not take.
     pub frames: u64,
     pub dgrams: u64,
+    pub dropped: u64,
 }
 
 impl Wire {
-    pub fn new(id: u8, sock: UdpSocket, keys: Vec<[u8; 32]>, stall_ns: u64, quiet_ns: u64, glue_ns: u64, glue_max: usize) -> Wire {
+    /// A bare UDP wire on `sock` under the wire keys `keys`.
+    pub fn udp(id: u8, sock: UdpSocket, keys: Vec<[u8; 32]>, stall_ns: u64, quiet_ns: u64, glue_ns: u64, glue_max: usize) -> Wire {
         let openers = keys.iter().map(|k| Seal::from_key(k, [0; 4])).collect();
-        Wire {
-            id,
-            sock,
-            keys,
-            openers,
-            stall_ns,
-            quiet_ns,
-            glue_ns,
-            glue_max: glue_max.clamp(OVERHEAD + 64, SLOT),
-            out: vec![0; SLOT * BATCH],
-            out_n: 0,
-            send: SendBatch::new(),
-            frames: 0,
-            dgrams: 0,
-        }
+        let u = Udp { sock, keys, openers, out: vec![0; SLOT * BATCH], out_n: 0, send: SendBatch::new() };
+        Wire::of(id, Form::Udp(u), stall_ns, quiet_ns, glue_ns, glue_max.clamp(OVERHEAD + 64, SLOT))
+    }
+
+    /// A Chromium QUIC wire.
+    pub fn h3dgram(id: u8, h: H3Wire, stall_ns: u64, quiet_ns: u64, glue_ns: u64, glue_max: usize) -> Wire {
+        Wire::of(id, Form::H3(Box::new(h)), stall_ns, quiet_ns, glue_ns, glue_max.max(64))
+    }
+
+    fn of(id: u8, form: Form, stall_ns: u64, quiet_ns: u64, glue_ns: u64, glue_max: usize) -> Wire {
+        Wire { id, form, stall_ns, quiet_ns, glue_ns, glue_max, frames: 0, dgrams: 0, dropped: 0 }
     }
 
     #[inline]
     pub fn fd(&self) -> i32 {
-        self.sock.as_raw_fd()
-    }
-
-    /// Sends every sealed datagram waiting.
-    pub fn flush(&mut self) {
-        if self.out_n > 0 {
-            self.send.flush(self.sock.as_raw_fd());
-            self.out_n = 0;
+        match &self.form {
+            Form::Udp(u) => u.sock.as_raw_fd(),
+            Form::H3(h) => h.fd(),
         }
     }
 
-    /// Seals `p`'s glued frames into the next out slot, to its address.
+    /// The Chromium QUIC wire's connections, if this is one.
+    #[inline]
+    pub fn h3(&mut self) -> Option<&mut H3Wire> {
+        match &mut self.form {
+            Form::H3(h) => Some(h),
+            Form::Udp(_) => None,
+        }
+    }
+
+    /// Datagrams the socket refused (a full buffer) and sendmmsg calls.
+    pub fn socket_counts(&self) -> (u64, u64) {
+        let s = match &self.form {
+            Form::Udp(u) => &u.send,
+            Form::H3(h) => &h.send,
+        };
+        (s.dropped, s.calls)
+    }
+
+    /// Sends every datagram waiting (on the QUIC wire, what its
+    /// connections have to send, and their timers from `now`).
+    pub fn flush(&mut self, now: u64) {
+        match &mut self.form {
+            Form::Udp(u) => {
+                if u.out_n > 0 {
+                    u.send.flush(u.sock.as_raw_fd());
+                    u.out_n = 0;
+                }
+            }
+            Form::H3(h) => h.flush(now),
+        }
+    }
+
+    /// p's glued frames into one datagram: sealed into the next out slot to
+    /// its address, or an HTTP Datagram of its request on its connection.
     pub fn seal(&mut self, p: &mut Peer) {
         if p.glue_n == 0 {
             return;
         }
-        if self.out_n == BATCH {
-            self.flush();
+        let sent = match &mut self.form {
+            Form::Udp(u) => {
+                if u.out_n == BATCH {
+                    u.send.flush(u.sock.as_raw_fd());
+                    u.out_n = 0;
+                }
+                let slot = &mut u.out[u.out_n * SLOT..(u.out_n + 1) * SLOT];
+                slot[12..12 + p.glue_n].copy_from_slice(&p.glue[12..12 + p.glue_n]);
+                let n = p.seal.seal(slot, p.glue_n);
+                u.send.push(slot.as_ptr(), n, Some(&p.addr));
+                u.out_n += 1;
+                true
+            }
+            Form::H3(h) => h.send_dgram(p.conn, p.stream, &mut p.glue, 12, 12 + p.glue_n),
+        };
+        if sent {
+            self.dgrams += 1;
+        } else {
+            self.dropped += 1;
         }
-        let slot = &mut self.out[self.out_n * SLOT..(self.out_n + 1) * SLOT];
-        slot[12..12 + p.glue_n].copy_from_slice(&p.glue[12..12 + p.glue_n]);
-        let n = p.seal.seal(slot, p.glue_n);
-        self.send.push(slot.as_ptr(), n, Some(&p.addr));
-        self.out_n += 1;
         p.glue_n = 0;
         p.glue_since = 0;
-        self.dgrams += 1;
+    }
+
+    /// The frames one datagram of p holds at most, and the glue's window
+    /// (both in frame bytes).
+    #[inline]
+    fn room(&self, p: &Peer) -> (usize, usize) {
+        match &self.form {
+            Form::Udp(_) => (SLOT - OVERHEAD, self.glue_max - OVERHEAD),
+            Form::H3(h) => {
+                let r = h.room(p.conn, p.stream);
+                (r, r.min(self.glue_max))
+            }
+        }
     }
 
     /// Puts one frame of `need` bytes (written by `put`) into p's glue,
@@ -101,10 +169,12 @@ impl Wire {
     /// holds: dropped, as udpwire drops a write over MaxDatagram.
     #[inline]
     pub fn glue(&mut self, p: &mut Peer, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
-        if OVERHEAD + need > SLOT {
+        let (most, window) = self.room(p);
+        if need > most {
+            self.dropped += 1;
             return false;
         }
-        if p.glue_n > 0 && OVERHEAD + p.glue_n + need > self.glue_max {
+        if p.glue_n > 0 && p.glue_n + need > window {
             self.seal(p);
         }
         let n = put(&mut p.glue[12 + p.glue_n..]);
@@ -125,7 +195,8 @@ impl Wire {
     }
 }
 
-/// One entry address on a wire: a member once its hello is answered.
+/// One entry address on the UDP wire, or one CONNECT-UDP request on the
+/// QUIC wire: a member once its hello is answered.
 pub struct Peer {
     /// A slot of the exit's peers in use; gen counts its uses, so a flow
     /// that remembers an index knows a member that came after the one it
@@ -143,7 +214,11 @@ pub struct Peer {
     pub h: Health,
     /// When it last sent a datagram that opened (udpwire's peer.last).
     pub heard: u64,
+    /// The UDP wire's: its seal, and its address above. The QUIC wire's:
+    /// its connection and request stream (NONE on the UDP wire).
     pub seal: Seal,
+    pub conn: usize,
+    pub stream: u64,
     glue: Box<[u8]>,
     pub glue_n: usize,
     pub glue_since: u64,
@@ -163,6 +238,8 @@ impl Peer {
             h: Health::new(true),
             heard: 0,
             seal: Seal::from_key(&[0; 32], [0; 4]),
+            conn: NONE,
+            stream: 0,
             glue: vec![0; SLOT].into_boxed_slice(),
             glue_n: 0,
             glue_since: 0,
@@ -174,17 +251,32 @@ impl Peer {
     pub fn take(&mut self, addr: sockaddr_in, wire: usize, key: &[u8; 32], now: u64) {
         let mut prefix = [0u8; 4];
         sys::urandom(&mut prefix);
-        self.live = true;
-        self.gen = self.gen.wrapping_add(1);
         self.addr = addr;
         self.key = sys::addr_key(&addr);
+        self.seal = Seal::from_key(key, prefix);
+        self.conn = NONE;
+        self.reset(wire, now);
+    }
+
+    /// The slot taken by the CONNECT-UDP of request `stream` on QUIC
+    /// connection `conn` of `wire`: the connection is its address.
+    pub fn take_request(&mut self, wire: usize, conn: usize, stream: u64, now: u64) {
+        self.addr = sys::sockaddr("0.0.0.0:0".parse().expect("a literal address"));
+        self.key = 0;
+        self.conn = conn;
+        self.stream = stream;
+        self.reset(wire, now);
+    }
+
+    fn reset(&mut self, wire: usize, now: u64) {
+        self.live = true;
+        self.gen = self.gen.wrapping_add(1);
         self.wire = wire;
         self.session = NONE;
         self.wire_id = 0;
         self.flags = 0;
         self.h = Health::new(true);
         self.heard = now;
-        self.seal = Seal::from_key(key, prefix);
         self.glue_n = 0;
         self.glue_since = 0;
     }
@@ -205,7 +297,7 @@ mod tests {
     #[test]
     fn glued_frames_seal_into_one_datagram() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let mut w = Wire::new(2, sock, vec![[7; 32]], 0, 0, 0, 100);
+        let mut w = Wire::udp(2, sock, vec![[7; 32]], 0, 0, 0, 100);
         let mut p = Peer::vacant();
         p.take(sys::sockaddr("127.0.0.1:9".parse().unwrap()), 0, &[7; 32], 1);
         assert!(w.glue(&mut p, 30, 5, |b| {
@@ -222,8 +314,9 @@ mod tests {
             30
         }));
         assert_eq!((p.glue_n, p.glue_since, w.dgrams, w.frames), (30, 7, 1, 3), "a third frame over 100 bytes sealed the first two");
-        let first = &mut w.out[..OVERHEAD + 60];
-        let n = w.openers[0].open(first).unwrap();
+        let Form::Udp(u) = &mut w.form else { unreachable!("a UDP wire") };
+        let first = &mut u.out[..OVERHEAD + 60];
+        let n = u.openers[0].open(first).unwrap();
         assert_eq!(n, 60);
         assert!(first[12..42].iter().all(|&b| b == 1) && first[42..72].iter().all(|&b| b == 2));
         assert!(!w.glue(&mut p, SLOT, 8, |_| 0), "a frame no datagram holds");

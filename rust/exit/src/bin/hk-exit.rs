@@ -8,7 +8,9 @@
 //! Without it (the bench) the flags fix what the brain would decide: one
 //! wire on `--listen` under `--key`, the pool's port of plain TCP stream
 //! members on `--pool`, the ports in `--ports` (the call's port 0 always),
-//! the glue window, the stall and Quiet.
+//! the glue window, the stall and Quiet. `--h3 ip:port` adds the Chromium
+//! QUIC wire (`h3dgram`, id `--h3-wire-id`) under the same key, with the
+//! certificate and key in `--cert` and `--cert-key` (PEM).
 //!
 //! `--flow-idle-ms` (either way): a flow unused this long ends; the trunk's
 //! 2 minutes without it.
@@ -26,7 +28,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use hikkari_exit::exit::{Alone, Exit, EXIT_QUIET};
+    use hikkari_exit::exit::{Alone, AloneH3, Exit, EXIT_QUIET};
     use hikkari_trunk::health::STALL;
 
     pub fn main() {
@@ -40,7 +42,10 @@ mod linux {
             quiet_ns: EXIT_QUIET,
             ports: Vec::new(),
             pool: None,
+            h3: None,
         };
+        let mut h3 = AloneH3 { listen: "127.0.0.1:4433".parse().unwrap(), wire: 6, cert: String::new(), key: String::new() };
+        let mut with_h3 = false;
         let mut flow_idle_ms: Option<u64> = None;
         let mut tick_ns = 1_000_000u64;
         let mut ctl: Option<i32> = None;
@@ -60,10 +65,20 @@ mod linux {
                 "--pool" => a.pool = Some(v.parse().expect("--pool ip:port")),
                 "--ports" => a.ports = v.split(',').filter(|s| !s.is_empty()).map(|s| s.parse().expect("--ports p,q")).collect(),
                 "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
+                "--h3" => {
+                    h3.listen = v.parse().expect("--h3 ip:port");
+                    with_h3 = true;
+                }
+                "--h3-wire-id" => h3.wire = v.parse().expect("--h3-wire-id"),
+                "--cert" => h3.cert = v,
+                "--cert-key" => h3.key = v,
                 "--tick-us" => tick_ns = v.parse::<u64>().expect("--tick-us") * 1000,
                 x => panic!("unknown flag {x}"),
             }
             i += 2;
+        }
+        if with_h3 {
+            a.h3 = Some(h3);
         }
         let mut x = match ctl {
             Some(fd) => {

@@ -17,13 +17,14 @@
 //! their epoll says they can be.
 //!
 //! Its parts: wire.rs (the entry's datagrams: hellos, pings, a flow's
-//! datagrams), relay.rs (flows to and from the loopback services), tcp.rs
+//! datagrams), h3.rs (the Chromium QUIC wire's connections and requests), relay.rs (flows to and from the loopback services), tcp.rs
 //! (stream members and their streams), death.rs (what a dead stream member
 //! carried, again), timers.rs (members' health on their clock, idle flows,
 //! members and sessions), brain.rs (the brain's messages, the tick).
 
 mod brain;
 mod death;
+mod h3;
 mod relay;
 mod stream;
 mod tcp;
@@ -42,9 +43,10 @@ use hikkari_trunk::health::Judge;
 use hikkari_trunk::udpwire;
 
 use crate::ctl::{self, Tick};
+use crate::h3wire::H3Wire;
 use crate::flow::{Flows, Seen};
 use crate::link::Links;
-use crate::peer::{Peer, Wire, NONE, SLOT};
+use crate::peer::{Form, Peer, Wire, NONE, SLOT};
 use crate::session::Sessions;
 use crate::streams::Streams;
 
@@ -71,6 +73,17 @@ pub struct Alone {
     pub ports: Vec<u16>,
     /// The pool's port: plain TCP stream members (None: none).
     pub pool: Option<SocketAddrV4>,
+    /// A Chromium QUIC wire beside it, under the same trunk key.
+    pub h3: Option<AloneH3>,
+}
+
+/// The Chromium QUIC wire of an exit without a brain: its UDP address, its
+/// id, the certificate and key (PEM files).
+pub struct AloneH3 {
+    pub listen: SocketAddrV4,
+    pub wire: u8,
+    pub cert: String,
+    pub key: String,
 }
 
 pub struct Exit {
@@ -103,6 +116,9 @@ pub struct Exit {
     /// allocation for it), as are the relay's buffer and the brain's message.
     wrecv: Option<RecvBatch>,
     relay_buf: Vec<u8>,
+    /// A QUIC datagram read (h3.rs), and the members of closed connections.
+    dgram_buf: Vec<u8>,
+    gone: Vec<(usize, u32)>,
     carriers: [Seen; 2],
     msg: Vec<u8>,
     fds: Vec<i32>,
@@ -143,6 +159,8 @@ impl Exit {
             dirty: true,
             wrecv: Some(RecvBatch::new(SLOT)),
             relay_buf: vec![0; 65535],
+            dgram_buf: vec![0; crate::h3wire::DGRAM],
+            gone: Vec::with_capacity(16),
             carriers: [(NONE, 0); 2],
             msg: vec![0; 65536],
             fds: Vec::with_capacity(ctl::MAX_FDS),
@@ -173,7 +191,14 @@ impl Exit {
         let sock = UdpSocket::bind(a.listen)?;
         sys::tune(&sock, false)?;
         let keys = vec![udpwire::key(&a.key)];
-        x.wires.push(Wire::new(a.wire, sock, keys, a.stall_ns, a.quiet_ns, a.glue_ns, a.glue_max));
+        x.wires.push(Wire::udp(a.wire, sock, keys, a.stall_ns, a.quiet_ns, a.glue_ns, a.glue_max));
+        if let Some(h) = &a.h3 {
+            let sock = UdpSocket::bind(h.listen)?;
+            sys::tune(&sock, false)?;
+            let tokens = vec![hikkari_trunk::h3dgram::token(&a.key)];
+            let w = H3Wire::new(sock, &h.cert, &h.key, tokens).map_err(io::Error::other)?;
+            x.wires.push(Wire::h3dgram(h.wire, w, a.stall_ns, a.quiet_ns, a.glue_ns, a.glue_max));
+        }
         for &p in &a.ports {
             x.ports[p as usize] = true;
         }
@@ -276,8 +301,9 @@ impl Exit {
             }
         }
         for w in wires.iter_mut() {
-            w.flush();
+            w.flush(now);
         }
+        self.reap_h3(now);
     }
 
     /// The peer slot of an entry address, if it has one.
@@ -297,7 +323,8 @@ impl Exit {
             self.peers.push(Peer::vacant());
             self.peers.len() - 1
         });
-        let key = self.wires[wire].keys[k];
+        let Form::Udp(u) = &self.wires[wire].form else { return None };
+        let key = u.keys[k];
         self.peers[i].take(addr, wire, &key, now);
         self.peers[i].key = at;
         self.by_addr.insert(at, i);
@@ -311,6 +338,14 @@ impl Exit {
         let p = &mut self.peers[i];
         if !p.live {
             return;
+        }
+        // A member of the QUIC wire ends with its connection (spec/trunk.md,
+        // `h3dgram`): the entry opens a new one.
+        if p.conn != NONE {
+            if let Some(h) = self.wires[p.wire].h3() {
+                h.close(p.conn);
+            }
+            p.conn = NONE;
         }
         if p.session != NONE {
             let s = p.session;
@@ -328,7 +363,7 @@ impl Exit {
     }
 
     fn log_stats(&self) {
-        let calls: u64 = self.wires.iter().map(|w| w.send.calls).sum();
+        let calls: u64 = self.wires.iter().map(|w| w.socket_counts().1).sum();
         let t = &self.t;
         eprintln!(
             "hk-exit: sessions={} members={} joined={} silent={} quiet={} gone={} flows={} idle={} dgrams={}/{} copies={} refused={} w_in={} w_out={} frames/dgram={:.2} sendmmsg={} pauses={} bad={} dropped={}",
@@ -350,8 +385,23 @@ impl Exit {
             calls,
             self.pause.pauses,
             t.bad,
-            self.wires.iter().map(|w| w.send.dropped).sum::<u64>()
+            self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum::<u64>()
         );
+        for w in &self.wires {
+            if let Form::H3(h) = &w.form {
+                let n = &h.n;
+                eprintln!(
+                    "hk-exit: h3dgram wire {} conns={} accepted={} refused={} stray={} too_big={} full={}",
+                    w.id,
+                    h.open(),
+                    n.conns,
+                    n.refused,
+                    n.stray,
+                    n.too_big,
+                    n.full
+                );
+            }
+        }
         if self.pool.is_some() {
             let n = &self.streams.n;
             eprintln!(
