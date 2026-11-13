@@ -50,7 +50,9 @@ exit lost its streams: the entry resets its own.
 Drain is the exit's process being replaced without a cut. The entry answers it once per session: a new session with a new
 id and a full pool, which reaches the exit's new process, takes every new stream and flow once a quarter of its pool is up
 (or after 10 seconds); until then the old session takes them, as the exit's old process still serves, and replaces none of
-its members. Nothing new waits for a pool that is not there: the trunk's call goes on through the old session. Then the old
+its members. Nothing new waits for a pool that is not there: the trunk's call goes on through the old session, and moves to
+the new one when it takes over; the exit's new process numbers its answers anew, so an entry counts a flow's answers only
+from members of its own session. Then the old
 one is retired: it keeps its members, replaces none, and closes when it carries nothing more or after 30 minutes. An entry whose own process is being
 replaced retires its current session the same way and opens no session after it, so a drain that reaches the old entry
 process changes nothing: a process that takes no new clients has no use for a new pool. What an entry cuts when it stops

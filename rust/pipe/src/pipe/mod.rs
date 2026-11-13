@@ -22,12 +22,14 @@
 //!
 //! The loop is here; its parts: brain.rs (the brain's messages and the
 //! ticks to it), timers.rs (members' hello, pings and deaths), data.rs
-//! (clients → wires → clients).
+//! (clients → wires → clients), tcp.rs and death.rs (streams), session.rs
+//! (the exit's drain: sessions), generation.rs (the pipe's own reload).
 
 mod brain;
 mod data;
 mod death;
 mod generation;
+mod session;
 mod tcp;
 mod timers;
 
@@ -37,6 +39,7 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use generation::Older;
+use session::Sess;
 use tcp::{TcpListen, Why};
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
@@ -45,7 +48,7 @@ use hikkari_trunk::health::{self, Judge};
 use hikkari_trunk::ports::{self, Book};
 use hikkari_trunk::udpwire;
 
-use crate::ctl::{self, ANY_WIRE};
+use crate::ctl::{self, WireTick, ANY_WIRE};
 use crate::flow::{Flows, FxMap, CLASS_VOICE};
 use crate::link::{Reach, StreamWire};
 use crate::member::{member_to, Member, Wire, SLOT};
@@ -118,7 +121,17 @@ pub struct Alone {
 
 pub struct Pipe {
     ctl: Option<SeqPacket>,
-    session: [u8; 16],
+    /// The sessions (session.rs) by index, a slot used again once closed:
+    /// the current one, the one coming up for the exit's drain, retired
+    /// ones; the sessions whose members heard the exit drain this turn, a
+    /// bit each; what packet wires of closed sessions counted.
+    sessions: Vec<Sess>,
+    cur: u8,
+    next: Option<u8>,
+    drains: u32,
+    gone: Vec<WireTick>,
+    take_over_ns: u64,
+    retire_ns: u64,
     gro: bool,
     tick_ns: u64,
     /// A client's flow unused this long ends (trunk FlowIdle).
@@ -171,12 +184,16 @@ pub struct Pipe {
 
 impl Pipe {
     fn new(ctl: Option<SeqPacket>, gro: bool, tick_ns: u64) -> Pipe {
-        let mut session = [0u8; 16];
-        sys::urandom(&mut session);
         let now = now_ns();
         Pipe {
             ctl,
-            session,
+            sessions: vec![Sess::new(now)],
+            cur: 0,
+            next: None,
+            drains: 0,
+            gone: Vec::new(),
+            take_over_ns: session::TAKE_OVER_NS,
+            retire_ns: session::RETIRE_NS,
             gro,
             tick_ns,
             flow_idle_ns: FLOW_IDLE_NS,
@@ -269,6 +286,14 @@ impl Pipe {
     /// tests take less.
     pub fn set_flow_idle(&mut self, idle_ns: u64) {
         self.flow_idle_ns = idle_ns.max(1);
+    }
+
+    /// A new session takes over after take_over_ns without a quarter of its
+    /// pool, a retired one is cut after retire_ns (the trunk's 10 s and 30
+    /// minutes; tests take less).
+    pub fn set_session_limits(&mut self, take_over_ns: u64, retire_ns: u64) {
+        self.take_over_ns = take_over_ns.max(1);
+        self.retire_ns = retire_ns.max(1);
     }
 
     /// Runs until the brain is gone (forever without one).
@@ -441,6 +466,10 @@ impl Pipe {
         }
         if self.has_tcp() {
             s += &tcp::stats(&self.streams, &self.swires, &self.ports);
+        }
+        let retired = self.sessions.iter().filter(|x| x.live && x.retired_at != 0).count();
+        if self.next.is_some() || retired > 0 {
+            s += &format!(" | sessions cur={} next={} retired={retired}", self.cur, self.next.map_or(-1, |n| n as i32));
         }
         if self.newer.is_some() {
             s += " | draining";

@@ -10,8 +10,10 @@ use crate::link::StreamWire;
 use crate::member::Wire;
 
 /// Carries one datagram of flow `id` on `copies` members at once, never
-/// sent again (spec/trunk.md, "Datagrams"). The members are those of its
-/// wire, of packet members or of stream members: its pin, else its class's
+/// sent again (spec/trunk.md, "Datagrams"). The members are those of the
+/// flow's session (the pipe's session.rs: the session of a draining exit's
+/// old process reaches only that process), and of its wire, of packet
+/// members or of stream members: its pin, else its class's
 /// route. A route's wire with no member up is passed over for any member
 /// up, of any wire (trunk Route); a pinned flow's datagram is dropped
 /// instead, counted on its wire. ANY_WIRE is any member up.
@@ -28,22 +30,23 @@ pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: [u8; 2], f: &
     f.seq = f.seq.wrapping_add(1);
     let strict = f.pin != ANY_WIRE;
     let want = if strict { f.pin } else { route[(f.class & 1) as usize] };
-    let has = |id: u8| wires.iter().any(|w| w.id == id && w.any_up()) || swires.iter().any(|w| w.id == id && w.up() > 0);
+    let sess = f.sess;
+    let has = |id: u8| wires.iter().any(|w| w.id == id && w.sess == sess && w.any_up()) || swires.iter().any(|w| w.id == id && w.sess == sess && w.up() > 0);
     let only = if want != ANY_WIRE && (strict || has(want)) { Some(want) } else { None };
-    let takes = |wid: u8| only.is_none_or(|o| wid == o);
-    let up: usize = wires.iter().filter(|w| takes(w.id)).map(|w| w.up()).sum();
-    let sup: usize = swires.iter().filter(|w| takes(w.id)).map(|w| w.up()).sum();
+    let takes = |wid: u8, ws: u8| ws == sess && only.is_none_or(|o| wid == o);
+    let up: usize = wires.iter().filter(|w| takes(w.id, w.sess)).map(|w| w.up()).sum();
+    let sup: usize = swires.iter().filter(|w| takes(w.id, w.sess)).map(|w| w.up()).sum();
     if up + sup == 0 {
         // Nothing can carry it: dropped, counted on the wire it wanted (a
         // flow with no pin and no route: on the first).
-        if let Some(w) = wires.iter_mut().find(|w| w.id == want) {
+        if let Some(w) = wires.iter_mut().find(|w| w.id == want && w.sess == sess) {
             w.t.dropped += 1;
-        } else if let Some(w) = swires.iter_mut().find(|w| w.id == want) {
+        } else if let Some(w) = swires.iter_mut().find(|w| w.id == want && w.sess == sess) {
             w.t.dropped += 1;
         } else if !strict {
-            if let Some(w) = wires.first_mut() {
+            if let Some(w) = wires.iter_mut().find(|w| w.sess == sess) {
                 w.t.dropped += 1;
-            } else if let Some(w) = swires.first_mut() {
+            } else if let Some(w) = swires.iter_mut().find(|w| w.sess == sess) {
                 w.t.dropped += 1;
             }
         }
@@ -67,7 +70,7 @@ fn on_packets(wires: &mut [Wire], only: Option<u8>, up: usize, copies: usize, f:
     let (seq, port) = (f.seq, f.port);
     let mut k = 0;
     for w in wires.iter_mut() {
-        if only.is_some_and(|o| w.id != o) {
+        if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
             continue;
         }
         let glue_max = w.glue_max;
@@ -117,7 +120,7 @@ fn on_least(wires: &mut [Wire], swires: &mut [StreamWire], only: Option<u8>, up:
         };
         let mut k = 0;
         for (wi, w) in wires.iter().enumerate() {
-            if only.is_some_and(|o| w.id != o) {
+            if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
                 continue;
             }
             for (mi, _) in w.members.iter().enumerate().filter(|(_, m)| m.h.up) {
@@ -126,7 +129,7 @@ fn on_least(wires: &mut [Wire], swires: &mut [StreamWire], only: Option<u8>, up:
             }
         }
         for (wi, w) in swires.iter().enumerate() {
-            if only.is_some_and(|o| w.id != o) {
+            if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
                 continue;
             }
             for (li, l) in w.links.iter().enumerate().filter(|(_, l)| l.h.up) {
@@ -251,6 +254,28 @@ mod tests {
         let mut ws = wires(&[(1, 2), (2, 2)], &[(2, 0)]);
         carry(&mut ws, &mut [], [1, 1], &mut flow(CLASS_VOICE, 2, 2), 0, b"x", 10);
         assert_eq!(carried(&ws), ["2/1"], "two copies, one member up: one copy");
+    }
+
+    #[test]
+    fn a_flow_goes_only_on_its_sessions_members() {
+        // Session 1 is the exit's new process, 0 its old one: a flow of each
+        // reaches only its own (spec/trunk.md, Drain).
+        let mut ws = wires(&[(1, 2), (1, 2)], &[]);
+        ws[1].sess = 1;
+        let mut f = flow(CLASS_VOICE, ANY_WIRE, 2);
+        f.sess = 1;
+        carry(&mut ws, &mut [], [1, 1], &mut f, 0, b"x", 10);
+        assert!(ws[0].members.iter().all(|m| m.glue_n == 0), "nothing on session 0's members");
+        assert!(ws[1].members.iter().all(|m| m.glue_n > 0), "two copies on session 1's two");
+        let mut ws = wires(&[(1, 2), (2, 1)], &[]);
+        ws[1].sess = 1;
+        let mut ps = [pool(0, &[0])];
+        ps[0].sess = 1;
+        let mut f = flow(CLASS_VOICE, 1, 2);
+        f.sess = 1;
+        carry(&mut ws, &mut ps, [1, 1], &mut f, 0, b"x", 10);
+        assert!(carried(&ws).is_empty() && on_pool(&ps).is_empty(), "pinned to wire 1, which session 1 lacks: dropped");
+        assert_eq!((ws[0].t.dropped, ws[1].t.dropped), (0, 0), "counted on no other session's wire");
     }
 
     #[test]

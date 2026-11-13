@@ -46,6 +46,9 @@ pub struct Flow {
     pub replay: Replay,
     /// When it last sent a datagram or got one that was not a copy.
     pub used: u64,
+    /// The session it goes on (the pipe's session.rs): the one that took
+    /// everything new when it opened. A client's flow stays there to its end.
+    pub sess: u8,
     id: u32,
     /// A client's key in by_addr, to forget it at the end.
     key: u64,
@@ -53,7 +56,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn new(dest: Dest, class: u8, pin: u8, port: u16, copies: u8, now: u64) -> Flow {
-        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), used: now, id: 0, key: 0 }
+        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), used: now, sess: 0, id: 0, key: 0 }
     }
 
     /// The trunk's own call, not a client's: neither end counts it among its
@@ -174,6 +177,41 @@ impl Flows {
                 ended.push(key);
             }
         }
+    }
+
+    /// The clients' flows session `sess` carries.
+    pub fn on(&self, sess: u8) -> usize {
+        self.list.iter().filter(|f| f.sess == sess && matches!(f.dest, Dest::Client { .. })).count()
+    }
+
+    /// The brain's flows on session `from` go on `to`: its calls follow the
+    /// session that takes everything new, and never keep a retired one open
+    /// (spec/trunk.md, "Datagrams"). The exit's new process numbers its
+    /// answers anew, so the copies seen start over.
+    pub fn move_brains(&mut self, from: u8, to: u8) {
+        for f in self.list.iter_mut() {
+            if f.sess == from && matches!(f.dest, Dest::Brain { .. }) {
+                f.sess = to;
+                f.replay = Replay::default();
+            }
+        }
+    }
+
+    /// Ends every client's flow on session `sess` (it closed with them);
+    /// their keys go to `ended`. How many there were.
+    pub fn end_session(&mut self, sess: u8, ended: &mut Vec<u64>) -> usize {
+        let mut n = 0;
+        for i in 0..self.list.len() {
+            let f = &self.list[i];
+            if f.sess == sess && matches!(f.dest, Dest::Client { .. }) {
+                let (id, key) = (f.id, f.key);
+                self.by_addr.remove(&key);
+                self.end(id);
+                ended.push(key);
+                n += 1;
+            }
+        }
+        n
     }
 
     fn push(&mut self, mut f: Flow) -> Option<u32> {

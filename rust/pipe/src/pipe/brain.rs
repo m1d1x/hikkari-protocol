@@ -7,6 +7,7 @@ use hikkari_sys::{self as sys, now_ns, SendBatch};
 use hikkari_trunk::health;
 use hikkari_trunk::udpwire::OVERHEAD;
 
+use super::session::{add_counts, counted};
 use super::{ms, Listen, Pipe};
 use crate::carry::carry;
 use crate::ctl::{self, Msg, PipeTick, WireTick, ANY_WIRE, NONE_MS};
@@ -57,7 +58,8 @@ impl Pipe {
             Some(Msg::Adopt) => return self.adopt(),
             _ => {}
         }
-        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, .. } = self;
+        let (cur, taker) = (self.cur, self.taker());
+        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, gone, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
         };
@@ -88,20 +90,32 @@ impl Pipe {
                 if id == ANY_WIRE {
                     return Err("wire 255 is no wire".into());
                 }
+                // New members join the session that takes everything new
+                // (session.rs); a pipe draining itself takes none.
+                let Some(sess) = taker else {
+                    return Err(format!("wire {id}: the pipe drains, it takes no new member"));
+                };
                 let mut socks = Vec::with_capacity(fds.len());
                 for fd in fds.drain(..) {
                     let s = sys::udp_from_fd(fd).map_err(|e| e.to_string())?;
                     sys::tune(&s, false).map_err(|e| format!("wire {id}: {e}"))?;
                     socks.push(s);
                 }
-                let at = match wires.iter().position(|w| w.id == id) {
+                let at = match wires.iter().position(|w| w.id == id && w.sess == sess) {
                     Some(i) => i,
                     None => {
-                        wires.push(Wire::new(id, key, health::STALL));
+                        let mut w = Wire::new(id, key, health::STALL);
+                        w.sess = sess;
+                        wires.push(w);
                         wires.len() - 1
                     }
                 };
                 let w = &mut wires[at];
+                // A session coming up dials its own members where the
+                // brain's go.
+                if let Some(Ok(std::net::SocketAddr::V4(a))) = socks.first().map(|s| s.peer_addr()) {
+                    w.exit = Some(a);
+                }
                 w.glue_ns = glue_us as u64 * 1000;
                 w.glue_max = (glue_max as usize).clamp(64, SLOT - OVERHEAD);
                 w.stall_ns = dead_ms.max(1) as u64 * 1_000_000;
@@ -125,6 +139,7 @@ impl Pipe {
             }
             Msg::Unwire { id } => {
                 wires.retain(|w| w.id != id);
+                gone.retain(|g| g.id != id);
                 *dirty = true;
             }
             Msg::Route { voice, bulk } => {
@@ -132,7 +147,9 @@ impl Pipe {
                 route[CLASS_VOICE as usize] = voice;
             }
             Msg::Open { tag, class, pin, port, copies } => {
-                flows.open(tag, Flow::new(Dest::Brain { tag }, class, pin, port, copies, now))?;
+                let mut f = Flow::new(Dest::Brain { tag }, class, pin, port, copies, now);
+                f.sess = cur;
+                flows.open(tag, f)?;
             }
             Msg::Dgram { tag, payload } => {
                 let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
@@ -150,11 +167,19 @@ impl Pipe {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
                 }
-                let s = sys::udp_from_fd(fds.remove(0)).map_err(|e| e.to_string())?;
-                sys::tune(&s, false).map_err(|e| e.to_string())?;
-                let Some(m) = wires.iter_mut().find(|w| w.id == wire).and_then(|w| w.members.get_mut(index as usize)) else {
+                let Some(m) = wires.iter_mut().find(|w| w.id == wire && w.sess == cur).and_then(|w| w.members.get_mut(index as usize)) else {
                     return Err(format!("member {wire}/{index}: no such member"));
                 };
+                // Only a member down of the session that replaces its
+                // members takes it (session.rs): one of a session handing
+                // over to the next, or retired, comes back to no one, and a
+                // socket that comes after a takeover finds a member of the
+                // new session up. The socket left in fds is closed.
+                if taker != Some(cur) || m.fd >= 0 || m.renew_at != 0 {
+                    return Ok(());
+                }
+                let s = sys::udp_from_fd(fds.remove(0)).map_err(|e| e.to_string())?;
+                sys::tune(&s, false).map_err(|e| e.to_string())?;
                 m.set_sock(Some(s));
                 *dirty = true;
             }
@@ -195,13 +220,23 @@ impl Pipe {
             dgrams_in: self.flows.n.delivered,
             dgrams_copy: self.flows.n.copies,
             flows_idle: self.flows.n.idle,
+            retired: self.sessions.iter().filter(|s| s.live && s.retired_at != 0).count() as u8,
+            coming: self.next.is_some(),
         };
         self.late_max = 0;
         let Some(c) = &mut self.ctl else { return };
         let mut ticks = [WireTick::default(); 32];
         let mut n = 0;
-        for w in self.wires.iter().take(ticks.len()) {
-            let mut t = w.t;
+        // The current session's wires, with what every session counted on
+        // each (session.rs: the brain sees the current one alone).
+        for w in self.wires.iter().filter(|w| w.sess == self.cur).take(ticks.len()) {
+            let mut t = counted(w);
+            for o in self.wires.iter().filter(|o| o.id == w.id && o.sess != w.sess) {
+                add_counts(&mut t, &counted(o));
+            }
+            for g in self.gone.iter().filter(|g| g.id == w.id) {
+                add_counts(&mut t, g);
+            }
             t.members = w.members.len() as u8;
             t.up = w.up() as u8;
             t.owed_ms = 0;
@@ -217,8 +252,6 @@ impl Pipe {
                 }
             }
             t.proof_ago_ms = if w.proof == 0 { NONE_MS } else { ms(now - w.proof) };
-            t.dgrams = w.members.iter().map(|m| m.dgrams).sum();
-            t.dropped += w.members.iter().map(|m| m.send.dropped).sum::<u64>();
             ticks[n] = t;
             n += 1;
         }

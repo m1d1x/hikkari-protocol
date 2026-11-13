@@ -48,14 +48,15 @@ pub(super) enum Why {
     Done,
 }
 
-/// The member a stream's next frame goes on (trunk pickLocked): of the bulk
-/// route's wire while it has a member up, else of any wire; the one owing
-/// least; for a chunk, only one with room under INFLIGHT.
-pub(super) fn pick(wires: &[StreamWire], bulk: u8, chunk: bool) -> Option<(usize, usize)> {
-    let only = wires.iter().any(|w| w.id == bulk && w.up() > 0);
+/// The member a stream of session `sess` sends its next frame on (trunk
+/// pickLocked): of its session's, of the bulk route's wire while it has a
+/// member up, else of any wire; the one owing least; for a chunk, only one
+/// with room under INFLIGHT.
+pub(super) fn pick(wires: &[StreamWire], sess: u8, bulk: u8, chunk: bool) -> Option<(usize, usize)> {
+    let only = wires.iter().any(|w| w.id == bulk && w.sess == sess && w.up() > 0);
     let mut best: Option<(usize, usize, usize)> = None;
     for (wi, w) in wires.iter().enumerate() {
-        if only && w.id != bulk {
+        if w.sess != sess || only && w.id != bulk {
             continue;
         }
         for (li, l) in w.links.iter().enumerate() {
@@ -106,7 +107,7 @@ impl Pipe {
 
     /// New client connections: a stream each, opened when a member is up.
     pub(super) fn accept_clients(&mut self) {
-        let Pipe { poll, slots, tcp_listens, streams, dirty, .. } = self;
+        let Pipe { poll, slots, tcp_listens, streams, dirty, cur, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::TcpListen(li) = *s else { continue };
             if !poll.readable(si) {
@@ -114,7 +115,7 @@ impl Pipe {
             }
             let l = &tcp_listens[li];
             while let Some(fd) = sys::accept(l.fd.as_raw_fd()) {
-                streams.add(fd, l.to);
+                streams.add(fd, l.to, *cur);
                 *dirty = true;
             }
         }
@@ -131,10 +132,10 @@ impl Pipe {
             if st.opened {
                 continue;
             }
-            let Some((wi, li)) = pick(swires, route[0], false) else { return };
+            let Some((wi, li)) = pick(swires, st.sess, route[0], false) else { continue };
             let l = &mut swires[wi].links[li];
             if !l.out.frame(7, |b| frame::put_open(b, st.id, st.port)) {
-                return;
+                continue;
             }
             st.send.open(carrier(wi, li, l.gen));
             l.owe(0, now);
@@ -146,10 +147,9 @@ impl Pipe {
     /// credit and the members' room go, read straight into a member's out
     /// buffer as chunks; a client's end is its FIN.
     pub(super) fn read_streams(&mut self, now: u64) {
-        // What is owed again goes before what is new (trunk queueLocked).
-        if !self.resend(now) {
-            return;
-        }
+        // What is owed again goes before what is new (trunk queueLocked):
+        // a session with things waiting reads no client of its own.
+        let waits = self.resend(now);
         let Pipe { poll, slots, streams, swires, route, moved, doomed, .. } = self;
         let bulk = route[0];
         for (si, s) in slots.iter().enumerate() {
@@ -158,7 +158,7 @@ impl Pipe {
                 continue;
             }
             let Some((st, n)) = streams.with_counts(slot) else { continue };
-            if !st.opened || st.read_done {
+            if !st.opened || st.read_done || waits & (1 << st.sess) != 0 {
                 continue;
             }
             for _ in 0..READS_PER_TURN {
@@ -166,7 +166,7 @@ impl Pipe {
                 if room == 0 {
                     break;
                 }
-                let Some((wi, li)) = pick(swires, bulk, true) else { break };
+                let Some((wi, li)) = pick(swires, st.sess, bulk, true) else { break };
                 let w = &mut swires[wi];
                 let l = &mut w.links[li];
                 let k = l.out.chunk_room(room);
@@ -185,7 +185,7 @@ impl Pipe {
                     }
                     Io::Again => break,
                     Io::Eof => {
-                        let Some((wi, li)) = pick(swires, bulk, false) else { break };
+                        let Some((wi, li)) = pick(swires, st.sess, bulk, false) else { break };
                         let l = &mut swires[wi].links[li];
                         let off = st.send.sent;
                         if !l.out.frame(13, |b| frame::put_fin(b, st.id, off)) {
@@ -239,8 +239,9 @@ impl Pipe {
     /// The whole frames read on member li of wire wi; false for bytes that
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
-        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, .. } = self;
-        let StreamWire { links, t, proof, id: wid, .. } = &mut swires[wi];
+        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, .. } = self;
+        let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
+        let sess = *sess;
         let Link { inb, in_n, out, h, up_at, .. } = &mut links[li];
         let mut joined = false;
         let mut at = 0;
@@ -257,7 +258,9 @@ impl Pipe {
                         h.join(now);
                         *up_at = now;
                         joined = true;
-                        events.push(Event { wire: *wid, index: li as u8, up: true, why: ctl::WHY_HELLO });
+                        if sess == *cur {
+                            events.push(Event { wire: *wid, index: li as u8, up: true, why: ctl::WHY_HELLO });
+                        }
                     }
                 }
                 Frame::Ping(tok) => {
@@ -281,9 +284,11 @@ impl Pipe {
                     t.down_pkts += 1;
                     t.down_bytes += len as u64;
                     *moved += 1;
-                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now);
+                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now, sess);
                 }
-                Frame::Open { .. } | Frame::Drain | Frame::Other => {}
+                // The exit's process is being replaced (session.rs).
+                Frame::Drain => *drains |= 1u32 << sess,
+                Frame::Open { .. } | Frame::Other => {}
             }
             at = next;
         }
@@ -295,11 +300,11 @@ impl Pipe {
         inb.copy_within(at..*in_n, 0);
         *in_n -= at;
         if joined {
-            // Every stream says again how far it is: acks sent on a member
-            // that died are lost (trunk serve).
+            // Every stream of its session says again how far it is: acks
+            // sent on a member that died are lost (trunk serve).
             for slot in 0..streams.slots() {
                 if let Some((st, _)) = streams.with_counts(slot) {
-                    if st.opened {
+                    if st.opened && st.sess == sess {
                         ack(out, st, NO_GOT);
                     }
                 }
@@ -329,7 +334,7 @@ impl Pipe {
     }
 
     /// Ends the streams found done or failed in this pass.
-    fn end_doomed(&mut self) {
+    pub(super) fn end_doomed(&mut self) {
         while let Some((slot, why)) = self.doomed.pop() {
             let Pipe { streams, swires, route, dirty, .. } = self;
             let Some((st, n)) = streams.with_counts(slot) else { continue };
@@ -337,7 +342,7 @@ impl Pipe {
                 count(n, why);
                 if !matches!(why, Why::Peer) && st.opened {
                     for _ in 0..RST_COPIES {
-                        let Some((wi, li)) = pick(swires, route[0], false) else { break };
+                        let Some((wi, li)) = pick(swires, st.sess, route[0], false) else { break };
                         swires[wi].links[li].out.frame(5, |b| frame::put_rst(b, st.id));
                     }
                 }
@@ -371,7 +376,7 @@ impl Pipe {
             };
             n.down += k as u64;
             if st.recv.wrote(k) {
-                if let Some((wi, li)) = pick(swires, route[0], false) {
+                if let Some((wi, li)) = pick(swires, st.sess, route[0], false) {
                     ack(&mut swires[wi].links[li].out, st, NO_GOT);
                 }
             }
@@ -409,13 +414,26 @@ impl Pipe {
 
     /// What each stream socket is waited for in the next poll.
     pub(super) fn want_tcp(&mut self) {
-        let chunk = self.stranded.is_empty() && pick(&self.swires, self.route[0], true).is_some();
+        // Sessions with nothing owed again and a member that takes a chunk
+        // now, a bit each.
+        let mut waits = 0u32;
+        for &id in &self.stranded {
+            if let Some(st) = self.streams.slot_of(id).and_then(|slot| self.streams.get(slot)) {
+                waits |= 1 << st.sess;
+            }
+        }
+        let mut chunk = 0u32;
+        for (s, ss) in self.sessions.iter().enumerate() {
+            if ss.live && waits & (1 << s) == 0 && pick(&self.swires, s as u8, self.route[0], true).is_some() {
+                chunk |= 1 << s;
+            }
+        }
         let Pipe { poll, slots, streams, swires, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             match *s {
                 Slot::Client(slot) => {
                     let Some(st) = streams.get(slot) else { continue };
-                    let read = st.opened && !st.read_done && chunk && st.send.room() > 0;
+                    let read = st.opened && !st.read_done && chunk & (1 << st.sess) != 0 && st.send.room() > 0;
                     poll.want(si, read, st.client.down_pending());
                 }
                 Slot::Link(wi, li) => {
@@ -562,8 +580,8 @@ pub(super) fn stats(streams: &Streams, wires: &[StreamWire], ports: &Book) -> St
         n.up >> 20,
         n.down >> 20
     );
-    for w in wires {
-        s += &format!(" | swire {} up={}/{} frames={}/{} dropped={}", w.id, w.up(), w.links.len(), w.t.up_pkts, w.t.down_pkts, w.t.dropped);
+    for w in wires.iter().filter(|w| w.sess != link::NO_SESSION) {
+        s += &format!(" | swire {}/{} up={}/{} frames={}/{} dropped={}", w.id, w.sess, w.up(), w.links.len(), w.t.up_pkts, w.t.down_pkts, w.t.dropped);
     }
     let (dead, kills) = ports.dead_now();
     s + &format!(" | ports free={} dead={dead} kills={kills}", ports.free())

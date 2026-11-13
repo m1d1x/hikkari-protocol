@@ -125,13 +125,18 @@ fn new_seal(key: &[u8; 32]) -> Seal {
 
 pub struct Wire {
     pub id: u8,
+    /// The session its members join (the pipe's session.rs): a wire has
+    /// members in each session the pipe has, one Wire per session.
+    pub sess: u8,
     pub glue_ns: u64,
     pub glue_max: usize,
     /// Its members' stall (trunk Config.Stall): the brain's dead_ms.
     pub stall_ns: u64,
     pub key: [u8; 32],
     pub members: Vec<Member>,
-    /// Without a brain: where a member's new socket goes.
+    /// Where a member's new socket goes: without a brain the flag's, under
+    /// one the address the brain's sockets are connected to (the members of
+    /// a new session are the pipe's own, session.rs).
     pub exit: Option<SocketAddrV4>,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
@@ -142,6 +147,7 @@ impl Wire {
     pub fn new(id: u8, key: [u8; 32], stall_ns: u64) -> Wire {
         Wire {
             id,
+            sess: 0,
             glue_ns: 0,
             glue_max: 0,
             stall_ns,

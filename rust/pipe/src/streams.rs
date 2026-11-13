@@ -75,6 +75,8 @@ pub struct Stream {
     pub recv: Recv,
     /// The client ended its side: the FIN went to the exit.
     pub read_done: bool,
+    /// The session it goes on (the pipe's session.rs), to its end.
+    pub sess: u8,
     /// The exit's FIN is written: the client's side is shut.
     pub write_done: bool,
 }
@@ -139,8 +141,9 @@ impl Streams {
         }
     }
 
-    /// A new client connection to the exit's port: its slot.
-    pub fn add(&mut self, fd: OwnedFd, port: u16) -> usize {
+    /// A new client connection to the exit's port, on session `sess`: its
+    /// slot.
+    pub fn add(&mut self, fd: OwnedFd, port: u16, sess: u8) -> usize {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let st = Stream {
             client: Client { fd, down: Behind::default() },
@@ -150,6 +153,7 @@ impl Streams {
             send: Send::default(),
             recv: Recv::default(),
             read_done: false,
+            sess,
             write_done: false,
         };
         let slot = match self.free.pop() {
@@ -203,6 +207,11 @@ impl Streams {
     #[inline]
     pub fn slot_of(&self, id: u32) -> Option<usize> {
         self.by_id.get(&id).map(|&s| s as usize)
+    }
+
+    /// The streams session `sess` carries.
+    pub fn on(&self, sess: u8) -> usize {
+        self.list.iter().flatten().filter(|st| st.sess == sess).count()
     }
 
     /// Ends the stream in `slot`: its client connection closes.

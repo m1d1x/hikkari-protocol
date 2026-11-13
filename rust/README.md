@@ -266,7 +266,7 @@ Pipe → brain:
 | Message | What |
 | --- | --- |
 | `hello` | version, pid |
-| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms after the one before), pauses, the latest turn in the second, clients' flows open; since the start, as trunk Stats (the trunk's call left out), datagrams out, delivered, copies dropped, and flows ended unused; per wire members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
+| `tick` | once a second, and at once after a member event: the pipe's latest pause (a turn of its loop more than 100 ms after the one before), pauses, the latest turn in the second, clients' flows open; since the start, as trunk Stats (the trunk's call left out), datagrams out, delivered, copies dropped, and flows ended unused; retired sessions still carrying, a session coming up (R4.1); per wire of the current session members, up, owed (the least debt of its up members), when one last heard the exit, round trip, packets and bytes each way, sealed datagrams, drops |
 | `member` | a member up (hello answered) or down: `silent` (past its stall while another member proved the exit alive), `quiet` (every member silent past Quiet), `gone` (its socket failed) |
 | `dgram` | an answer on a brain's flow |
 | `error` | a message the pipe could not take |
@@ -401,6 +401,37 @@ Tests against both exits (`generation_linux_test.go`): `TestAReloadUnderACallPau
 reload: no pause over 150 ms, nothing lost; a call after it is the new pipe's; the old one drains once the first hangs up,
 whose next call is the new pipe's), `TestAnOldPipeGoneGivesItsAddressesToTheNewOne`.
 
+A pipe that drains itself replaces none of its members (its session is retired, as a Go entry's on Retire).
+
 Left for later: the brain's messages for TCP client ports (under the brain the pipe has UDP client ports only: TCP is the
-bench's flags, so a reload of streams is not tested), the exit's drain (`drain` frame 10: the pipe ignores it, so a reload of
-the exit's relay keeps the old session until the exit's old process leaves), and the Rust exit's own generations.
+bench's flags, so a reload of streams is not tested), and the Rust exit's own generations.
+
+## Sessions: the exit's drain (R4.1)
+
+The exit's process replaced without a cut (spec/trunk.md, "Frames": Drain; the Go entry's `drained`, `takeOver` and
+`closeRetired` in `trunk/entry.go` are the reference). The pipe keeps sessions (`pipe/src/pipe/session.rs`): a session is
+a session id and, for each wire, a `Wire` or `StreamWire` of its own members; every flow and stream is tagged with the
+session that took it and goes on that session's members alone (`carry`, `pick`), to its end.
+
+- A `drain` frame on a member of the current session is answered once, on the next turn: a new session with a new id and
+  as many members of every wire, dialed by the pipe itself (packet members to the address the brain's sockets are
+  connected to, stream members from the book), which reach the exit's new process.
+- Until a quarter of the new session's members are up, or 10 s (`--take-over-ms`), the current session takes every new
+  flow and stream and replaces none of its members. Then the new one takes over: the current one is retired, and the
+  brain's own flows (its calls) move to the new session, their copies seen started over, since the new process numbers
+  its answers from 1 again. A flow's answers count only from members of its own session.
+- A retired session takes nothing new and replaces no member; it closes once it carries nothing, or after 30 minutes
+  (`--retire-ms`) with what it carries cut: its clients' flows end (their next datagram opens a flow on the current
+  session), its streams are reset. Its packet wires' counters go on in the tick of the wire's id.
+- The brain sees the current session alone: its ticks and member events are the current session's wires, and a `member`
+  socket goes to a member of the current session only while that session replaces its members and the member is down
+  (otherwise the socket is closed). A `wire` gives its sockets to the session that takes everything new: the one coming
+  up, else the current one. The tick says how many retired sessions still carry something and whether one is coming up
+  (version 4).
+- A pipe draining itself (`drain` from the brain) opens no session for the exit's drain, and lets one coming up go.
+
+Tests against the Go exit, its two processes two `trunk.Exit` behind one address, a member that comes after the switch
+reaching the new one (`exit_drain_linux_test.go`): `TestAnExitDrainWaitsForAQuarterOfTheNewPoolThenMovesWhatIsNew`,
+`TestTheBrainsCallMovesToTheNewSession`, `TestAPipeDrainingItselfOpensNoSessionForTheExitsDrain`,
+`TestARetiredSessionIsCutAfterItsLimit`, `TestAStreamThroughAnExitDrainEndsByteForByte`. The Rust exit sends no `drain`
+yet (its generations are not done).

@@ -18,18 +18,31 @@ impl Pipe {
     /// What dead members carried, sent again oldest first (stream by stream
     /// in the order they were opened, each in the order it sent) as far as
     /// the members up have room; a chunk only on a member with room under
-    /// INFLIGHT (trunk drainPendingLocked). Whether nothing waits any more.
-    pub(super) fn resend(&mut self, now: u64) -> bool {
+    /// INFLIGHT (trunk drainPendingLocked). Each session's members carry its
+    /// own streams' alone, so a session that has no room waits without
+    /// holding the others. The sessions that still have something waiting,
+    /// a bit each.
+    pub(super) fn resend(&mut self, now: u64) -> u32 {
         let Pipe { streams, swires, route, stranded, moved, .. } = self;
-        while let Some(&id) = stranded.first() {
+        let mut waits = 0u32;
+        let mut from = 0u32;
+        while let Some(&id) = stranded.range(from..).next() {
+            from = id.saturating_add(1);
             let Some(slot) = streams.slot_of(id) else {
-                stranded.pop_first();
+                stranded.remove(&id);
                 continue;
             };
             let (st, n) = streams.with_counts(slot).unwrap();
+            if waits & (1 << st.sess) != 0 {
+                continue;
+            }
+            let mut done = true;
             while let Some(i) = st.send.next_stranded() {
                 let o = st.send.owed[i];
-                let Some((wi, li)) = pick(swires, route[0], o.kind == frame::F_DATA) else { return false };
+                let Some((wi, li)) = pick(swires, st.sess, route[0], o.kind == frame::F_DATA) else {
+                    done = false;
+                    break;
+                };
                 let l = &mut swires[wi].links[li];
                 let went = match o.kind {
                     frame::F_OPEN => l.out.frame(7, |b| frame::put_open(b, st.id, st.port)),
@@ -48,14 +61,22 @@ impl Pipe {
                     }
                 };
                 if !went {
-                    return false;
+                    done = false;
+                    break;
                 }
                 st.send.resent(i, carrier(wi, li, l.gen));
                 l.owe(o.len as usize, now);
             }
-            stranded.pop_first();
+            if done {
+                stranded.remove(&id);
+            } else {
+                waits |= 1 << st.sess;
+            }
+            if id == u32::MAX {
+                break;
+            }
         }
-        true
+        waits
     }
 
     /// Member li of wire wi is down (trunk dropMemberLocked): what it carried
@@ -91,12 +112,17 @@ impl Pipe {
             }
         }
         l.drop_sock(ports);
-        self.renew(wi, li, now);
+        // Only the session that takes everything new replaces its members
+        // (session.rs); the brain hears the current session's.
+        let sess = self.swires[wi].sess;
+        if self.taker() == Some(sess) {
+            self.renew(wi, li, now);
+        }
         // A stall is judged on a member up (its health took it down a moment
         // ago): the brain hears every stall, every failed socket, and the
         // end of any member it was told was up.
         let why = down.why();
-        if was_up || matches!(down, Down::Stalled { .. }) || why == ctl::WHY_GONE {
+        if sess == self.cur && (was_up || matches!(down, Down::Stalled { .. }) || why == ctl::WHY_GONE) {
             let wid = self.swires[wi].id;
             self.events.push(Event { wire: wid, index: li as u8, up: false, why });
         }
@@ -116,10 +142,10 @@ impl Pipe {
         let Pipe { streams, swires, route, .. } = self;
         for slot in 0..streams.slots() {
             let Some((st, _)) = streams.with_counts(slot) else { continue };
-            if !st.opened {
+            if !st.opened || st.sess != sess {
                 continue;
             }
-            let Some((wi, li)) = pick(swires, route[0], false) else { break };
+            let Some((wi, li)) = pick(swires, sess, route[0], false) else { break };
             ack(&mut swires[wi].links[li].out, st, NO_GOT);
         }
     }
@@ -169,11 +195,11 @@ impl Pipe {
     /// Member li of wire wi dials now; a dial that could not begin waits
     /// as a failed one.
     pub(super) fn redial(&mut self, wi: usize, li: usize, now: u64) {
-        let Pipe { swires, ports, session, dirty, .. } = self;
+        let Pipe { swires, ports, sessions, dirty, .. } = self;
         let w = &mut swires[wi];
         let l = &mut w.links[li];
         *dirty = true;
-        match l.dial(&w.reach, session, ports, now) {
+        match l.dial(&w.reach, &sessions[w.sess as usize].id, ports, now) {
             Dialed::Begun => {}
             Dialed::NoPort => {
                 let (dead, _) = ports.counts(now);

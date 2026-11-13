@@ -17,7 +17,7 @@ impl Pipe {
     /// Clients → wires; a datagram from an address whose flow an older
     /// generation keeps goes to it (generation.rs).
     pub(super) fn read_clients(&mut self) {
-        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, older, owners, msg, .. } = self;
+        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, older, owners, msg, cur, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Listen(li) = *s else { continue };
             if !poll.readable(si) {
@@ -41,7 +41,7 @@ impl Pipe {
                             continue;
                         }
                     }
-                    take_client(flows, wires, swires, *route, l, li, addr, key, p, step, now, moved);
+                    take_client(flows, wires, swires, *route, l, li, addr, key, p, step, now, moved, *cur);
                 }
                 if n < BATCH {
                     break;
@@ -52,14 +52,14 @@ impl Pipe {
 
     /// Wires → clients and the brain.
     pub(super) fn read_wires(&mut self) {
-        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, .. } = self;
+        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, drains, cur, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Member(wi, mi) = *s else { continue };
             if !poll.readable(si) {
                 continue;
             }
             let w = &mut wires[wi];
-            let (wid, glue_max) = (w.id, w.glue_max);
+            let (wid, glue_max, sess) = (w.id, w.glue_max, w.sess);
             let m = &mut w.members[mi];
             if m.fd < 0 {
                 continue;
@@ -83,14 +83,19 @@ impl Pipe {
                                 w.t.down_pkts += 1;
                                 w.t.down_bytes += len as u64;
                                 *moved += 1;
-                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now);
+                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess);
                             }
                             Frame::Hello => {
                                 if !m.h.up {
                                     m.h.join(now);
-                                    events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO });
+                                    if sess == *cur {
+                                        events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO });
+                                    }
                                 }
                             }
+                            // The exit's process is being replaced: answered
+                            // once per session, on the turn after (session.rs).
+                            Frame::Drain => *drains |= 1u32 << sess,
                             Frame::Ping(t) => {
                                 m.glue_frame(9, glue_max, now, |b| frame::put_ping(b, frame::F_PONG, t));
                             }
@@ -106,7 +111,6 @@ impl Pipe {
                             | Frame::Ack { .. }
                             | Frame::Fin { .. }
                             | Frame::Rst { .. }
-                            | Frame::Drain
                             | Frame::Other => {}
                         }
                         at = nx;
@@ -129,14 +133,19 @@ impl Pipe {
     }
 }
 
-/// A datagram of trunk stream `stream` from the exit: to its client (queued
-/// in the listen's batch, pointing into the receive buffer) or to the brain;
-/// a copy already seen is dropped (spec/trunk.md, "Datagrams"), as is one
-/// whose flow ended here.
+/// A datagram of trunk stream `stream` from the exit, on a member of session
+/// `sess`: to its client (queued in the listen's batch, pointing into the
+/// receive buffer) or to the brain; a copy already seen is dropped
+/// (spec/trunk.md, "Datagrams"), as is one whose flow ended here, and one
+/// from another session than its flow's (a brain's call moved to the new
+/// one: the exit's old process still answers what it had).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64) {
+pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64, sess: u8) {
     let Some((f, counts)) = flows.with_counts(stream) else { return };
+    if f.sess != sess {
+        return;
+    }
     let echo = f.echo();
     if f.replay.seen(seq) {
         if !echo {
@@ -173,8 +182,8 @@ pub(super) fn client_key(li: usize, addr: &sys::sockaddr_in) -> u64 {
 }
 
 /// A client datagram (segments of `step` bytes in p, as GRO read them) on
-/// its flow, opened by its first; false when no flow could be opened
-/// (MAX_FLOWS open).
+/// its flow, opened by its first on session `sess`; false when no flow could
+/// be opened (MAX_FLOWS open).
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub(super) fn take_client(
@@ -190,8 +199,14 @@ pub(super) fn take_client(
     step: usize,
     now: u64,
     moved: &mut u64,
+    sess: u8,
 ) -> bool {
-    let Some(id) = flows.client(key, || Flow::new(Dest::Client { listen: li as u16, addr }, l.class, ANY_WIRE, l.to, l.copies, now)) else {
+    let new = || {
+        let mut f = Flow::new(Dest::Client { listen: li as u16, addr }, l.class, ANY_WIRE, l.to, l.copies, now);
+        f.sess = sess;
+        f
+    };
+    let Some(id) = flows.client(key, new) else {
         return false;
     };
     let Some((f, counts)) = flows.with_counts(id) else { return false };

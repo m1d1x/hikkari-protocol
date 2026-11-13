@@ -34,10 +34,15 @@ impl Pipe {
         if clock {
             self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
         }
-        let mut next = self.clock_at;
+        let mut next = self.step_sessions(now).min(self.clock_at);
         let alone = self.ctl.is_none();
-        let Pipe { wires, judge, tok, events, session, dirty, .. } = self;
+        let (cur, taker) = (self.cur, self.taker());
+        let Pipe { wires, judge, tok, events, sessions, dirty, .. } = self;
         for w in wires.iter_mut() {
+            // The brain hears and renews the current session's members; the
+            // members of one coming up are the pipe's own (session.rs), and
+            // only the session that takes everything new replaces any.
+            let (brains, replaces) = (!alone && w.sess == cur, taker == Some(w.sess));
             for (mi, m) in w.members.iter_mut().enumerate() {
                 if m.renew_at != 0 {
                     if now >= m.renew_at {
@@ -56,7 +61,7 @@ impl Pipe {
                 if !m.h.up {
                     if now >= m.hello_at {
                         let mut h = [0u8; 64];
-                        let n = frame::hello_t2(&mut h[12..], session, w.id);
+                        let n = frame::hello_t2(&mut h[12..], &sessions[w.sess as usize].id, w.id);
                         let n = m.seal.seal(&mut h, n);
                         if let Some(s) = &m.sock {
                             let _ = s.send(&h[..n]);
@@ -74,13 +79,15 @@ impl Pipe {
                         }
                         Verdict::Dead { quiet } => {
                             let why = if quiet { ctl::WHY_QUIET } else { ctl::WHY_SILENT };
-                            events.push(Event { wire: w.id, index: mi as u8, up: false, why });
+                            if brains {
+                                events.push(Event { wire: w.id, index: mi as u8, up: false, why });
+                            }
                             // Its socket goes now: what comes on it is no
                             // member's. The brain answers the event with a
                             // new one; alone the pipe dials it within SPREAD.
                             m.set_sock(None);
                             *dirty = true;
-                            if alone {
+                            if replaces && !brains {
                                 let mut r = [0u8; 8];
                                 sys::urandom(&mut r);
                                 m.renew_at = now + 1 + u64::from_le_bytes(r) % SPREAD;

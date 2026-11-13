@@ -267,9 +267,15 @@ impl Link {
     }
 }
 
+/// A StreamWire's session when it has none: its session closed, and the
+/// next session to open takes the slot (its index is in what streams owe).
+pub const NO_SESSION: u8 = u8::MAX;
+
 /// A wire of stream members: the pool's form (spec/trunk.md, "Wires").
 pub struct StreamWire {
     pub id: u8,
+    /// The session its members join (the pipe's session.rs), or NO_SESSION.
+    pub sess: u8,
     /// Its members' stall (trunk Config.Stall).
     pub stall_ns: u64,
     pub links: Vec<Link>,
@@ -284,6 +290,7 @@ impl StreamWire {
     pub fn new(id: u8, reach: Reach, members: usize, stall_ns: u64) -> StreamWire {
         StreamWire {
             id,
+            sess: 0,
             stall_ns,
             links: (0..members).map(|_| Link::new()).collect(),
             reach,

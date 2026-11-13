@@ -25,7 +25,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 3
+const Version = 4
 
 // Brain → pipe.
 const (
@@ -44,10 +44,10 @@ const (
 
 // Pipe → brain.
 const (
-	pHello  = 0x81 // ver u16, pid u32
-	pTick   = 0x82
-	pMember = 0x83 // wire u8, index u8, up u8, why u8
-	pDgram  = 0x84 // tag u32, payload
+	pHello   = 0x81 // ver u16, pid u32
+	pTick    = 0x82
+	pMember  = 0x83 // wire u8, index u8, up u8, why u8
+	pDgram   = 0x84 // tag u32, payload
 	pError   = 0x85 // text
 	pDrained = 0x86 // a pipe draining carries nothing more
 )
@@ -112,7 +112,12 @@ type Tick struct {
 	DgramsOut, DgramsIn, DgramsCopy uint64
 	// FlowsIdle is the clients' flows ended unused (trunk's FlowIdle).
 	FlowsIdle uint64
-	Wires     []WireTick
+	// Retired is the sessions retired for the exit's drain that still carry
+	// something (trunk Entry.Retired), Coming whether a new one is coming
+	// up (spec/trunk.md, Drain).
+	Retired int
+	Coming  bool
+	Wires   []WireTick
 }
 
 // WireTick is one wire in a tick.
@@ -133,7 +138,7 @@ type WireTick struct {
 }
 
 const (
-	tickHead = 1 + 16 + 32 + 1
+	tickHead = 1 + 16 + 32 + 2 + 1
 	tickWire = 3 + 12 + 48
 )
 
@@ -160,6 +165,7 @@ func parseTick(m []byte) (Tick, error) {
 	for k, p := range []*uint64{&t.DgramsOut, &t.DgramsIn, &t.DgramsCopy, &t.FlowsIdle} {
 		*p = le.Uint64(m[17+8*k:])
 	}
+	t.Retired, t.Coming = int(m[tickHead-3]), m[tickHead-2] == 1
 	n := int(m[tickHead-1])
 	if len(m) != tickHead+n*tickWire {
 		return Tick{}, errTorn

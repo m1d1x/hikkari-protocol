@@ -19,7 +19,10 @@
 //! pool's wire 0, as the Go entry's voice on its pool).
 //!
 //! `--flow-idle-ms` (either way): a client's flow unused this long ends;
-//! the trunk's 2 minutes without it.
+//! the trunk's 2 minutes without it. `--take-over-ms` and `--retire-ms`
+//! (tests): when the exit drains, the new session takes over after this
+//! without a quarter of its pool (10 s), and a retired session still
+//! carrying something is cut after this (30 minutes).
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -56,6 +59,7 @@ mod linux {
         };
         let (mut chromium, mut roots, mut cronet): (Option<String>, Option<String>, Option<String>) = (None, None, None);
         let mut flow_idle_ms: Option<u64> = None;
+        let (mut take_over_ms, mut retire_ms): (Option<u64>, Option<u64>) = (None, None);
         let mut gro = true;
         let mut tick_ns = 1_000_000u64;
         let mut ctl: Option<i32> = None;
@@ -76,6 +80,8 @@ mod linux {
                 "--wire-id" => a.wire = v.parse().expect("--wire-id"),
                 "--copies" => a.copies = v.parse().expect("--copies"),
                 "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
+                "--take-over-ms" => take_over_ms = Some(v.parse().expect("--take-over-ms")),
+                "--retire-ms" => retire_ms = Some(v.parse().expect("--retire-ms")),
                 "--tick-us" => tick_ns = v.parse::<u64>().expect("--tick-us") * 1000,
                 "--tcp-listen" => a.tcp_listen = Some(v.parse().expect("--tcp-listen ip:port")),
                 "--tcp-to" => a.tcp_to = v.parse().expect("--tcp-to"),
@@ -119,6 +125,9 @@ mod linux {
         };
         if let Some(ms) = flow_idle_ms {
             p.set_flow_idle(ms * 1_000_000);
+        }
+        if take_over_ms.is_some() || retire_ms.is_some() {
+            p.set_session_limits(take_over_ms.unwrap_or(10_000) * 1_000_000, retire_ms.unwrap_or(30 * 60_000) * 1_000_000);
         }
         p.run();
         eprintln!("hk-pipe: the brain is gone");

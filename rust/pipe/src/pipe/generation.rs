@@ -82,6 +82,7 @@ impl Pipe {
         if self.newer.is_some() {
             return Err("drain: the pipe drains already".into());
         }
+        self.drop_next();
         let mut s = SeqPacket::new(self.fds.remove(0), 0);
         let mut sent = true;
         let keys: Vec<u64> = self.flows.client_keys().collect();
@@ -180,9 +181,9 @@ impl Pipe {
                 s.send(&self.out[..head + payload.len()]);
                 continue;
             }
-            let Pipe { flows, wires, swires, route, listens, moved, .. } = self;
+            let Pipe { flows, wires, swires, route, listens, moved, cur, .. } = self;
             let now = sys::now_ns();
-            take_client(flows, wires, swires, *route, &listens[li], li, sa, key, payload, payload.len(), now, moved);
+            take_client(flows, wires, swires, *route, &listens[li], li, sa, key, payload, payload.len(), now, moved, *cur);
         }
     }
 
@@ -223,10 +224,10 @@ impl Pipe {
                     if payload.is_empty() {
                         continue;
                     }
-                    let Pipe { flows, wires, swires, route, listens, moved, .. } = self;
+                    let Pipe { flows, wires, swires, route, listens, moved, cur, .. } = self;
                     let now = sys::now_ns();
                     let key = client_key(li, &sa);
-                    take_client(flows, wires, swires, *route, &listens[li], li, sa, key, payload, payload.len(), now, moved);
+                    take_client(flows, wires, swires, *route, &listens[li], li, sa, key, payload, payload.len(), now, moved, *cur);
                 }
                 Some(Msg::Dgram { .. }) | None => {}
             }
@@ -238,6 +239,7 @@ impl Pipe {
     /// it carries nothing more.
     pub(super) fn sweep_flows(&mut self, now: u64) {
         self.flows.sweep(now, self.flow_idle_ns, &mut self.freed);
+        self.close_retired(now);
         if let Some(s) = &mut self.newer {
             for &key in &self.freed {
                 let (li, a) = split(key);
