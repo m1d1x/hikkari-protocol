@@ -278,12 +278,31 @@ impl Poll {
     }
 }
 
-/// A UDP socket from a descriptor the brain passed, non-blocking.
+/// A UDP socket from a descriptor the brain passed, non-blocking. One not
+/// bound for IPv4 is refused: the pipe reads and writes the clients'
+/// addresses as sockaddr_in, and a dual-stack socket's (Go's ":port") come
+/// as IPv4-mapped IPv6 that would send every answer nowhere.
 pub fn udp_from_fd(fd: i32) -> io::Result<UdpSocket> {
     use std::os::fd::FromRawFd;
     let s = unsafe { UdpSocket::from_raw_fd(fd) };
+    if !inet4(fd) {
+        return Err(not_inet4());
+    }
     s.set_nonblocking(true)?;
     Ok(s)
+}
+
+/// Whether fd is a socket bound for IPv4 (getsockname gives AF_INET).
+pub(crate) fn inet4(fd: i32) -> bool {
+    let mut sa: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // Safe: sa is a sockaddr_storage the kernel fills up to len.
+    let rc = unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) };
+    rc == 0 && sa.ss_family as i32 == libc::AF_INET
+}
+
+pub(crate) fn not_inet4() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "not an IPv4 socket: the pipe carries IPv4 clients only (bind udp4/tcp4)")
 }
 
 /// The CPU time a process has had, all its threads, in ns: user and

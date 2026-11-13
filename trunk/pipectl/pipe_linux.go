@@ -164,6 +164,20 @@ func (p *Pipe) Close() error {
 // Done is closed once the pipe has ended.
 func (p *Pipe) Done() <-chan struct{} { return p.done }
 
+// Pid is the pipe's process, as its hello said: the brain reads its CPU
+// for the minute line.
+func (p *Pipe) Pid() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pid
+}
+
+// Err is why the pipe's process ended, once Done is closed.
+func (p *Pipe) Err() error {
+	<-p.done
+	return p.err
+}
+
 // send writes one message with the sockets of conns.
 func (p *Pipe) send(msg []byte, conns ...*net.UDPConn) error {
 	sc := make([]syscall.Conn, len(conns))

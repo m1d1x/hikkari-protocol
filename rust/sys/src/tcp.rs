@@ -126,6 +126,9 @@ pub fn tcp_from_fd(fd: i32) -> io::Result<OwnedFd> {
         return Err(io::Error::from_raw_os_error(libc::EBADF));
     }
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    if !crate::inet4(fd) {
+        return Err(crate::not_inet4());
+    }
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
