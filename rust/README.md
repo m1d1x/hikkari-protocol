@@ -274,6 +274,10 @@ Pipe → brain:
 | `error` | a message the pipe could not take |
 | `drained` | a pipe draining carries nothing more: no client's flow, no stream |
 
+A client port must be bound for IPv4 (`udp4`, `tcp4`): the pipe reads clients' addresses as `sockaddr_in` and refuses
+any other socket with an `error`, since a dual-stack one (Go's `:port`) gives IPv4-mapped IPv6 addresses and every answer
+would go nowhere.
+
 Left for later: `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, packet forms other than `udp`. The pipe passes over a wire with no member
 up for any wire that has one, as `trunk.Route` does, before the selector moves the route.
 
@@ -383,7 +387,8 @@ A reload of the entry replaces its pipe without a cut (spec/trunk.md, "An entry'
 generations, hikkari-control trunkentry `handoff.go`, are the reference). The brain starts the new pipe, gives it its
 wires and waits for its members, then makes one `SOCK_SEQPACKET` socket for the reload (`pipectl.HandoffLink`): its new
 end goes to the new pipe with `adopt`, the client ports (the same sockets) after it, its old end to the old pipe with
-`drain` (`Pipe.Handoff` does all three in one brain; across two brain processes the ends travel as inherited files). The
+`drain` (`Pipe.Handoff` does all three in one brain; across two brain processes the ends travel as inherited files: hikkari-control
+trunkentry `brain_linux.go`, the old brain gives the new end to the next one it starts, R5). The
 messages between the pipes are `pipe/src/handoff.rs`, the loop's part `pipe/src/pipe/generation.rs`:
 
 - The old pipe stops reading the client ports and stops accepting, and sends `own` (every address its flows are for, many
