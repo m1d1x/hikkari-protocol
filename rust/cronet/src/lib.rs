@@ -16,6 +16,10 @@
 //! shut down, and streams begun and ended, on a thread of their own
 //! (keeper), since an engine's start and shutdown block.
 //!
+//! The same library, built with our patch (rust/cronet/chromium), also
+//! carries datagrams: CONNECT-UDP tunnels over Chromium's QUIC (tunnel.rs),
+//! the form of the trunk's `h3dgram` wire (hot path plan, R6).
+//!
 //! libcronet is loaded at run time (`load`), as the Go entry does on Linux.
 #![cfg(target_os = "linux")]
 
@@ -23,8 +27,11 @@ mod api;
 mod conn;
 mod engine;
 mod keeper;
+mod tunnel;
 
 pub use api::load;
 pub use conn::{Conn, Form};
 pub use engine::Engine;
 pub use keeper::version;
+pub use tunnel::{Proxy, State, Tunnel, TunnelEngine};
+pub use api::TunnelStats;

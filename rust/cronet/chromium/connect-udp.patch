@@ -1,0 +1,659 @@
+diff --git a/src/components/cronet/native/BUILD.gn b/src/components/cronet/native/BUILD.gn
+index 90cac672..7adaaeea 100644
+--- a/src/components/cronet/native/BUILD.gn
++++ b/src/components/cronet/native/BUILD.gn
+@@ -60,6 +60,8 @@ source_set("cronet_native_impl") {
+     "runnables.cc",
+     "runnables.h",
+     "upload_data_sink.cc",
++    "udp_tunnel.cc",
++    "udp_tunnel.h",
+     "upload_data_sink.h",
+     "url_request.cc",
+     "url_request.h",
+diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
+index 6bdec585..a1493d02 100644
+--- a/src/components/cronet/native/include/cronet_c.h
++++ b/src/components/cronet/native/include/cronet_c.h
+@@ -5,6 +5,7 @@
+ #ifndef COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
+ #define COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #include "cronet_export.h"
+@@ -111,6 +112,85 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+ // Calls from Cronet's network thread schedule the close asynchronously.
+ CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
+ 
++// CONNECT-UDP tunnels (RFC 9298) through an HTTP/3 proxy, with the
++// datagrams as HTTP Datagrams (RFC 9297): the client Chrome uses for its own
++// QUIC through IP Protection proxies (net::QuicProxyDatagramClientSocket),
++// with the datagrams to and from the embedder instead of a site's QUIC.
++// The QUIC session to the proxy comes from the engine's session pool, so
++// the engine must have QUIC enabled; its UDP socket comes from the UDP
++// dialer when one is set.
++
++typedef struct Cronet_UdpTunnel Cronet_UdpTunnel;
++typedef Cronet_UdpTunnel* Cronet_UdpTunnelPtr;
++
++typedef struct Cronet_UdpTunnelHeader {
++  const char* key;
++  const char* value;
++} Cronet_UdpTunnelHeader;
++
++typedef struct Cronet_UdpTunnelParams {
++  // The HTTP/3 proxy.
++  const char* proxy_host;
++  uint16_t proxy_port;
++  // The target in the request's URI template; the proxy decides what it is.
++  const char* target_host;
++  uint16_t target_port;
++  // Extra headers of the CONNECT-UDP request (proxy-authorization, say).
++  const Cronet_UdpTunnelHeader* headers;
++  size_t header_count;
++  // A URL naming the tunnel's network partition: tunnels with different
++  // keys never share a QUIC session to the proxy. NULL for none.
++  const char* isolation_key;
++  // One end of a datagram socket pair (AF_UNIX, SOCK_DGRAM or
++  // SOCK_SEQPACKET). The tunnel owns it from the call on and closes it when
++  // destroyed. Every message the embedder writes to the other end is one
++  // datagram to the proxy; every datagram from the proxy is one message to
++  // read there. A datagram that does not fit (the QUIC connection cannot
++  // send it, or the embedder's end is full) is dropped and counted.
++  int fd;
++} Cronet_UdpTunnelParams;
++
++typedef enum Cronet_UdpTunnelEvent {
++  // The tunnel carries datagrams. net_error is 0.
++  Cronet_UdpTunnel_UP = 1,
++  // The tunnel is over (it may never have been up): net_error says why.
++  // Nothing more is sent or received; the embedder still destroys it.
++  Cronet_UdpTunnel_CLOSED = 2,
++} Cronet_UdpTunnelEvent;
++
++// Called on the engine's network thread, at most once per event.
++typedef void (*Cronet_UdpTunnelCallback)(void* context,
++                                         Cronet_UdpTunnelEvent event,
++                                         int net_error);
++
++typedef struct Cronet_UdpTunnelStats {
++  // Datagrams from the embedder handed to the QUIC connection.
++  uint64_t up_sent;
++  // Datagrams from the embedder the QUIC connection would not take.
++  uint64_t up_dropped;
++  // Datagrams from the proxy.
++  uint64_t down_received;
++  // Datagrams from the proxy dropped: too big, or the embedder's end full.
++  uint64_t down_dropped;
++} Cronet_UdpTunnelStats;
++
++// Starts opening a tunnel on a started engine; returns at once. NULL when
++// the engine is not started or a parameter is missing (fd is then not
++// taken). The callback says when it is up or over.
++CRONET_EXPORT Cronet_UdpTunnelPtr
++Cronet_UdpTunnel_Create(Cronet_EnginePtr engine,
++                        const Cronet_UdpTunnelParams* params,
++                        Cronet_UdpTunnelCallback callback,
++                        void* callback_context);
++
++// Closes the tunnel and its end of the pair. When it returns, the callback
++// is not called again. Must be called before Cronet_Engine_Shutdown().
++CRONET_EXPORT void Cronet_UdpTunnel_Destroy(Cronet_UdpTunnelPtr tunnel);
++
++// The tunnel's counts so far.
++CRONET_EXPORT Cronet_UdpTunnelStats
++Cronet_UdpTunnel_GetStats(Cronet_UdpTunnelPtr tunnel);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/components/cronet/native/udp_tunnel.cc b/src/components/cronet/native/udp_tunnel.cc
+new file mode 100755
+index 00000000..d5ad358b
+--- /dev/null
++++ b/src/components/cronet/native/udp_tunnel.cc
+@@ -0,0 +1,434 @@
++// Copyright 2026 The Hikkari Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "components/cronet/native/udp_tunnel.h"
++
++#include <errno.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <utility>
++
++#include "base/compiler_specific.h"
++#include "base/containers/span.h"
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/strings/escape.h"
++#include "base/strings/stringprintf.h"
++#include "base/synchronization/waitable_event.h"
++#include "base/task/current_thread.h"
++#include "components/cronet/cronet_context.h"
++#include "components/cronet/native/engine.h"
++#include "net/base/host_port_pair.h"
++#include "net/base/http_user_agent_settings.h"
++#include "net/base/network_anonymization_key.h"
++#include "net/base/proxy_chain.h"
++#include "net/base/proxy_server.h"
++#include "net/base/schemeful_site.h"
++#include "net/cert/cert_verifier.h"
++#include "net/http/http_network_session.h"
++#include "net/http/http_request_headers.h"
++#include "net/http/http_transaction_factory.h"
++#include "net/socket/socket_tag.h"
++#include "net/traffic_annotation/network_traffic_annotation.h"
++#include "net/url_request/url_request_context.h"
++#include "url/gurl.h"
++#include "url/scheme_host_port.h"
++
++namespace cronet {
++
++namespace {
++
++constexpr net::NetworkTrafficAnnotationTag kTrafficAnnotation =
++    net::DefineNetworkTrafficAnnotation("cronet_udp_tunnel", R"(
++      semantics {
++        sender: "Cronet UDP tunnel"
++        description: "A CONNECT-UDP tunnel the embedder opened."
++        trigger: "Cronet_UdpTunnel_Create."
++        data: "The embedder's datagrams."
++        destination: OTHER
++      }
++      policy {
++        cookies_allowed: NO
++        setting: "None."
++        policy_exception_justification: "Embedder's own traffic."
++      })");
++
++// The largest datagram either way: an HTTP Datagram never carries more than
++// a QUIC DATAGRAM frame, which is under 64 KiB.
++constexpr int kMaxDatagram = 65536;
++
++// Datagrams from the embedder taken in one wake, so that a busy embedder
++// cannot keep the network thread from its other sockets.
++constexpr int kUpPerWake = 64;
++
++}  // namespace
++
++// Adds the embedder's headers to the CONNECT-UDP request: the socket asks a
++// ProxyDelegate for them (QuicProxyDatagramClientSocket::DoCalculateHeaders)
++// and has no other way in. It answers nothing else.
++class UdpTunnel::Headers : public net::ProxyDelegate {
++ public:
++  explicit Headers(
++      const std::vector<std::pair<std::string, std::string>>& headers) {
++    for (const auto& [key, value] : headers) {
++      headers_.SetHeader(key, value);
++    }
++  }
++
++  void OnResolveProxy(const GURL&,
++                      const net::NetworkAnonymizationKey&,
++                      const std::string&,
++                      const net::ProxyRetryInfoMap&,
++                      net::ProxyInfo*) override {}
++  void OnFallback(const net::ProxyChain&, int) override {}
++  void OnSuccessfulRequestAfterFailures(const net::ProxyRetryInfoMap&) override {
++  }
++  base::expected<net::HttpRequestHeaders, net::Error> OnBeforeTunnelRequest(
++      const net::ProxyChain&,
++      size_t,
++      OnBeforeTunnelRequestCallback) override {
++    return headers_;
++  }
++  net::Error OnTunnelHeadersReceived(const net::ProxyChain&,
++                                     size_t,
++                                     const net::HttpResponseHeaders&,
++                                     net::CompletionOnceCallback) override {
++    return net::OK;
++  }
++  void SetProxyResolutionService(net::ProxyResolutionService*) override {}
++
++ private:
++  net::HttpRequestHeaders headers_;
++};
++
++UdpTunnel::UdpTunnel(CronetContext* context, Params params)
++    : context_(context),
++      params_(std::move(params)),
++      fd_watcher_(FROM_HERE),
++      up_buf_(base::MakeRefCounted<net::IOBufferWithSize>(kMaxDatagram)),
++      down_buf_(base::MakeRefCounted<net::IOBufferWithSize>(kMaxDatagram)) {}
++
++UdpTunnel::~UdpTunnel() {
++  fd_watcher_.StopWatchingFileDescriptor();
++  socket_.reset();
++  session_.reset();
++  session_request_.reset();
++  if (params_.fd >= 0) {
++    close(params_.fd);
++  }
++}
++
++void UdpTunnel::Start() {
++  DCHECK(context_->IsOnNetworkThread());
++  net::URLRequestContext* request_context = context_->GetURLRequestContext();
++  net::HttpNetworkSession* network_session =
++      request_context->http_transaction_factory()->GetSession();
++  if (!network_session || !network_session->quic_session_pool()) {
++    Close(net::ERR_NOT_IMPLEMENTED);
++    return;
++  }
++  net_log_ = net::NetLogWithSource::Make(request_context->net_log(),
++                                         net::NetLogSourceType::NONE);
++  headers_ = std::make_unique<Headers>(params_.headers);
++
++  // As QuicSessionPool::ProxyJob asks for its session to a proxy: direct,
++  // used for proxying, at the RFC version (there is no Alt-Svc to choose
++  // by).
++  net::NetworkAnonymizationKey nak;
++  if (!params_.isolation_key.empty()) {
++    nak = net::NetworkAnonymizationKey::CreateSameSite(
++        net::SchemefulSite(GURL(params_.isolation_key)));
++  }
++  url::SchemeHostPort destination(url::kHttpsScheme, params_.proxy_host,
++                                  params_.proxy_port);
++  session_request_ = std::make_unique<net::QuicSessionRequest>(
++      network_session->quic_session_pool());
++  int rv = session_request_->Request(
++      destination, quic::ParsedQuicVersion::RFCv1(), net::ProxyChain::Direct(),
++      kTrafficAnnotation, request_context->http_user_agent_settings(),
++      net::SessionUsage::kProxy, net::PRIVACY_MODE_DISABLED, net::HIGHEST,
++      net::SocketTag(), nak, net::SecureDnsPolicy::kAllow,
++      /*require_dns_https_alpn=*/false,
++      // A session to a proxy never fetches for its certificate (the pool
++      // CHECKs it for SessionUsage::kProxy, as ProxyJob sets it).
++      net::CertVerifier::VERIFY_DISABLE_NETWORK_FETCHES,
++      GURL(destination.Serialize()), net::handles::kInvalidNetworkHandle,
++      net_log_, &net_error_details_,
++      net::MultiplexedSessionCreationInitiator::kUnknown,
++      /*management_config=*/std::nullopt,
++      /*failed_on_default_network_callback=*/net::CompletionOnceCallback(),
++      base::BindOnce(&UdpTunnel::OnSession, weak_factory_.GetWeakPtr()));
++  if (rv != net::ERR_IO_PENDING) {
++    OnSession(rv);
++  }
++}
++
++void UdpTunnel::OnSession(int rv) {
++  if (rv != net::OK) {
++    Close(rv);
++    return;
++  }
++  session_ = session_request_->ReleaseSessionHandle();
++  session_request_.reset();
++  if (!session_) {
++    Close(net::ERR_CONNECTION_CLOSED);
++    return;
++  }
++  // As ProxyJob::DoCreateProxyStream: wait for the handshake's
++  // confirmation, so that the tunnel is built on a working connection.
++  rv = session_->RequestStream(
++      /*requires_confirmation=*/true,
++      base::BindOnce(&UdpTunnel::OnStream, weak_factory_.GetWeakPtr()),
++      kTrafficAnnotation);
++  if (rv != net::ERR_IO_PENDING) {
++    OnStream(rv);
++  }
++}
++
++void UdpTunnel::OnStream(int rv) {
++  if (rv != net::OK) {
++    Close(rv);
++    return;
++  }
++  std::unique_ptr<net::QuicChromiumClientStream::Handle> stream =
++      session_->ReleaseStream();
++  if (!stream || !stream->IsOpen()) {
++    Close(net::ERR_CONNECTION_CLOSED);
++    return;
++  }
++  net::IPEndPoint local_address;
++  net::IPEndPoint proxy_address;
++  rv = session_->GetSelfAddress(&local_address);
++  if (rv == net::OK) {
++    rv = session_->GetPeerAddress(&proxy_address);
++  }
++  if (rv != net::OK) {
++    Close(rv);
++    return;
++  }
++  // RFC 9298, section 3: the default URI template.
++  GURL url(base::StringPrintf(
++      "https://%s:%d/.well-known/masque/udp/%s/%d/", params_.proxy_host.c_str(),
++      params_.proxy_port,
++      base::EscapeQueryParamValue(params_.target_host, false).c_str(),
++      params_.target_port));
++  net::ProxyChain chain(net::ProxyServer(
++      net::ProxyServer::SCHEME_QUIC,
++      net::HostPortPair(params_.proxy_host, params_.proxy_port)));
++  std::string user_agent;
++  if (const net::HttpUserAgentSettings* settings =
++          context_->GetURLRequestContext()->http_user_agent_settings()) {
++    user_agent = settings->GetUserAgent();
++  }
++  socket_ = std::make_unique<net::QuicProxyDatagramClientSocket>(
++      url, chain, user_agent, net_log_, headers_.get());
++  rv = socket_->ConnectViaStream(
++      local_address, proxy_address, std::move(stream),
++      base::BindOnce(&UdpTunnel::OnConnected, weak_factory_.GetWeakPtr()));
++  if (rv != net::ERR_IO_PENDING) {
++    OnConnected(rv);
++  }
++}
++
++void UdpTunnel::OnConnected(int rv) {
++  if (rv != net::OK) {
++    Close(rv);
++    return;
++  }
++  if (!base::CurrentIOThread::Get()->WatchFileDescriptor(
++          params_.fd, /*persistent=*/true, base::MessagePumpForIO::WATCH_READ,
++          &fd_watcher_, this)) {
++    Close(net::ERR_UNEXPECTED);
++    return;
++  }
++  params_.callback(params_.callback_context, Cronet_UdpTunnel_UP, net::OK);
++  if (!closed_) {
++    ReadFromProxy();
++  }
++}
++
++void UdpTunnel::OnFileCanReadWithoutBlocking(int fd) {
++  for (int i = 0; i < kUpPerWake && !closed_; i++) {
++    ssize_t n = recv(fd, up_buf_->data(), kMaxDatagram, MSG_DONTWAIT);
++    if (n < 0) {
++      if (errno == EINTR) {
++        continue;
++      }
++      if (errno != EAGAIN && errno != EWOULDBLOCK) {
++        Close(net::ERR_CONNECTION_RESET);
++      }
++      return;
++    }
++    // An empty message is an empty datagram: the embedder's end is a
++    // datagram socket (Cronet_UdpTunnelParams.fd), so it is carried too.
++    // The write is synchronous: the datagram is in a QUIC packet or dropped
++    // by the connection (too big, blocked), as a UDP datagram would be.
++    int rv = socket_->Write(up_buf_.get(), static_cast<int>(n),
++                            base::DoNothing(), kTrafficAnnotation);
++    if (rv >= 0) {
++      stats_.up_sent++;
++    } else if (rv == net::ERR_CONNECTION_CLOSED ||
++               rv == net::ERR_SOCKET_NOT_CONNECTED) {
++      Close(rv);
++      return;
++    } else {
++      stats_.up_dropped++;
++    }
++  }
++}
++
++void UdpTunnel::OnFileCanWriteWithoutBlocking(int fd) {}
++
++void UdpTunnel::ReadFromProxy() {
++  while (!closed_) {
++    int rv = socket_->Read(
++        down_buf_.get(), kMaxDatagram,
++        base::BindOnce(&UdpTunnel::OnReadFromProxy, weak_factory_.GetWeakPtr()));
++    if (rv == net::ERR_IO_PENDING || !Deliver(rv)) {
++      return;
++    }
++  }
++}
++
++void UdpTunnel::OnReadFromProxy(int rv) {
++  if (Deliver(rv)) {
++    ReadFromProxy();
++  }
++}
++
++bool UdpTunnel::Deliver(int rv) {
++  if (rv == 0) {
++    // The socket reads 0 once the request stream is closed.
++    Close(net::ERR_CONNECTION_CLOSED);
++    return false;
++  }
++  if (rv == net::ERR_MSG_TOO_BIG) {
++    stats_.down_dropped++;
++    return true;
++  }
++  if (rv < 0) {
++    Close(rv);
++    return false;
++  }
++  stats_.down_received++;
++  for (;;) {
++    ssize_t n = send(params_.fd, down_buf_->data(), rv, MSG_DONTWAIT);
++    if (n >= 0) {
++      return true;
++    }
++    if (errno == EINTR) {
++      continue;
++    }
++    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
++      // The embedder is behind: drop, as a full UDP receive buffer would.
++      stats_.down_dropped++;
++      return true;
++    }
++    Close(net::ERR_CONNECTION_RESET);
++    return false;
++  }
++}
++
++void UdpTunnel::Close(int net_error) {
++  if (closed_) {
++    return;
++  }
++  closed_ = true;
++  fd_watcher_.StopWatchingFileDescriptor();
++  socket_.reset();
++  params_.callback(params_.callback_context, Cronet_UdpTunnel_CLOSED,
++                   net_error);
++}
++
++}  // namespace cronet
++
++namespace {
++
++// Runs `task` on the engine's network thread and waits for it, or runs it
++// right away when called there.
++void RunOnNetworkThread(cronet::CronetContext* context,
++                        base::OnceClosure task) {
++  if (context->IsOnNetworkThread()) {
++    std::move(task).Run();
++    return;
++  }
++  base::WaitableEvent done;
++  context->PostTaskToNetworkThread(
++      FROM_HERE, std::move(task).Then(base::BindOnce(
++                     &base::WaitableEvent::Signal, base::Unretained(&done))));
++  done.Wait();
++}
++
++}  // namespace
++
++struct Cronet_UdpTunnel {
++  raw_ptr<cronet::CronetContext> context;
++  std::unique_ptr<cronet::UdpTunnel> tunnel;
++};
++
++CRONET_EXPORT Cronet_UdpTunnelPtr
++Cronet_UdpTunnel_Create(Cronet_EnginePtr engine,
++                        const Cronet_UdpTunnelParams* params,
++                        Cronet_UdpTunnelCallback callback,
++                        void* callback_context) {
++  cronet::CronetContext* context =
++      static_cast<cronet::Cronet_EngineImpl*>(engine)
++          ->cronet_url_request_context();
++  if (!context || !params || !callback || params->fd < 0 ||
++      !params->proxy_host || !params->target_host) {
++    return nullptr;
++  }
++  cronet::UdpTunnel::Params p;
++  p.proxy_host = params->proxy_host;
++  p.proxy_port = params->proxy_port;
++  p.target_host = params->target_host;
++  p.target_port = params->target_port;
++  if (params->header_count > 0 && params->headers) {
++    // SAFETY: the C API's contract, cronet_c.h Cronet_UdpTunnelParams:
++    // `headers` points to `header_count` entries.
++    auto headers = UNSAFE_BUFFERS(
++        base::span(params->headers, params->header_count));
++    for (const Cronet_UdpTunnelHeader& h : headers) {
++      if (h.key && h.value) {
++        p.headers.emplace_back(h.key, h.value);
++      }
++    }
++  }
++  if (params->isolation_key) {
++    p.isolation_key = params->isolation_key;
++  }
++  p.fd = params->fd;
++  p.callback = callback;
++  p.callback_context = callback_context;
++  auto* handle = new Cronet_UdpTunnel{
++      context, std::make_unique<cronet::UdpTunnel>(context, std::move(p))};
++  context->PostTaskToNetworkThread(
++      FROM_HERE, base::BindOnce(&cronet::UdpTunnel::Start,
++                                base::Unretained(handle->tunnel.get())));
++  return handle;
++}
++
++CRONET_EXPORT void Cronet_UdpTunnel_Destroy(Cronet_UdpTunnelPtr tunnel) {
++  if (!tunnel) {
++    return;
++  }
++  RunOnNetworkThread(tunnel->context,
++                     base::BindOnce([](std::unique_ptr<cronet::UdpTunnel>) {},
++                                    std::move(tunnel->tunnel)));
++  delete tunnel;
++}
++
++CRONET_EXPORT Cronet_UdpTunnelStats
++Cronet_UdpTunnel_GetStats(Cronet_UdpTunnelPtr tunnel) {
++  Cronet_UdpTunnelStats stats = {};
++  RunOnNetworkThread(tunnel->context,
++                     base::BindOnce(
++                         [](cronet::UdpTunnel* t, Cronet_UdpTunnelStats* out) {
++                           *out = t->stats();
++                         },
++                         base::Unretained(tunnel->tunnel.get()),
++                         base::Unretained(&stats)));
++  return stats;
++}
+diff --git a/src/components/cronet/native/udp_tunnel.h b/src/components/cronet/native/udp_tunnel.h
+new file mode 100755
+index 00000000..15d28c39
+--- /dev/null
++++ b/src/components/cronet/native/udp_tunnel.h
+@@ -0,0 +1,102 @@
++// Copyright 2026 The Hikkari Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef COMPONENTS_CRONET_NATIVE_UDP_TUNNEL_H_
++#define COMPONENTS_CRONET_NATIVE_UDP_TUNNEL_H_
++
++#include <stdint.h>
++
++#include <memory>
++#include <string>
++#include <vector>
++
++#include "base/memory/scoped_refptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/message_loop/message_pump_for_io.h"
++#include "components/cronet/native/include/cronet_c.h"
++#include "net/base/io_buffer.h"
++#include "net/base/net_error_details.h"
++#include "net/base/proxy_delegate.h"
++#include "net/log/net_log_with_source.h"
++#include "net/quic/quic_chromium_client_session.h"
++#include "net/quic/quic_proxy_datagram_client_socket.h"
++#include "net/quic/quic_session_pool.h"
++
++namespace cronet {
++
++class CronetContext;
++
++// A CONNECT-UDP tunnel (RFC 9298) through an HTTP/3 proxy, made of what
++// Chrome itself uses to carry QUIC through its IP Protection proxies: a QUIC
++// session to the proxy from the engine's QuicSessionPool, a request stream
++// on it and a net::QuicProxyDatagramClientSocket, whose datagrams are HTTP
++// Datagrams (RFC 9297). What differs from Chrome is only the far end of the
++// socket: instead of a QUIC session to a site, the datagrams go to and come
++// from the embedder through one end of a socket pair, one datagram per
++// message.
++//
++// Lives on the engine's network thread from Start() on.
++class UdpTunnel : public base::MessagePumpForIO::FdWatcher {
++ public:
++  struct Params {
++    std::string proxy_host;
++    uint16_t proxy_port = 0;
++    std::string target_host;
++    uint16_t target_port = 0;
++    // Extra headers of the CONNECT-UDP request, in order.
++    std::vector<std::pair<std::string, std::string>> headers;
++    // A URL naming the tunnel's network partition; empty for none.
++    std::string isolation_key;
++    int fd = -1;
++    Cronet_UdpTunnelCallback callback = nullptr;
++    void* callback_context = nullptr;
++  };
++
++  UdpTunnel(CronetContext* context, Params params);
++  UdpTunnel(const UdpTunnel&) = delete;
++  UdpTunnel& operator=(const UdpTunnel&) = delete;
++  ~UdpTunnel() override;
++
++  // Starts opening the tunnel. Called once, on the network thread.
++  void Start();
++
++  // base::MessagePumpForIO::FdWatcher, for the embedder's end.
++  void OnFileCanReadWithoutBlocking(int fd) override;
++  void OnFileCanWriteWithoutBlocking(int fd) override;
++
++  Cronet_UdpTunnelStats stats() const { return stats_; }
++
++ private:
++  class Headers;
++
++  void OnSession(int rv);
++  void OnStream(int rv);
++  void OnConnected(int rv);
++  void ReadFromProxy();
++  void OnReadFromProxy(int rv);
++  // Hands one datagram from the proxy to the embedder; false once the
++  // tunnel is closed.
++  bool Deliver(int rv);
++  // Ends the tunnel with `net_error` and tells the embedder, once.
++  void Close(int net_error);
++
++  const raw_ptr<CronetContext> context_;
++  Params params_;
++  net::NetLogWithSource net_log_;
++  net::NetErrorDetails net_error_details_;
++  std::unique_ptr<Headers> headers_;
++  std::unique_ptr<net::QuicSessionRequest> session_request_;
++  std::unique_ptr<net::QuicChromiumClientSession::Handle> session_;
++  std::unique_ptr<net::QuicProxyDatagramClientSocket> socket_;
++  base::MessagePumpForIO::FdWatchController fd_watcher_;
++  scoped_refptr<net::IOBufferWithSize> up_buf_;
++  scoped_refptr<net::IOBufferWithSize> down_buf_;
++  Cronet_UdpTunnelStats stats_ = {};
++  bool closed_ = false;
++  base::WeakPtrFactory<UdpTunnel> weak_factory_{this};
++};
++
++}  // namespace cronet
++
++#endif  // COMPONENTS_CRONET_NATIVE_UDP_TUNNEL_H_

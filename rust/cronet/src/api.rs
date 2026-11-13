@@ -1,8 +1,10 @@
 //! libcronet loaded at run time (dlopen), as the Go entry loads it with
 //! purego (cronet-go loader_purego.go, chromium.Load): the calls of
 //! cronet.idl_c.h, cronet_c.h (sagernet's dialer and root certificates) and
-//! bidirectional_stream_c.h that a member makes. The C types are mirrored
-//! here as the headers define them.
+//! bidirectional_stream_c.h that a member makes, and the CONNECT-UDP tunnel
+//! of our patch (rust/cronet/chromium, cronet_c.h `Cronet_UdpTunnel_*`),
+//! which only a patched build has. The C types are mirrored here as the
+//! headers define them.
 
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::sync::OnceLock;
@@ -46,6 +48,50 @@ pub struct Callbacks {
 /// error.
 pub type DialerFn = unsafe extern "C" fn(ctx: Ptr, address: *const c_char, port: u16) -> isize;
 
+/// Cronet_UdpTunnelHeader.
+#[repr(C)]
+pub struct TunnelHeader {
+    pub key: *const c_char,
+    pub value: *const c_char,
+}
+
+/// Cronet_UdpTunnelParams, in the header's order.
+#[repr(C)]
+pub struct TunnelParams {
+    pub proxy_host: *const c_char,
+    pub proxy_port: u16,
+    pub target_host: *const c_char,
+    pub target_port: u16,
+    pub headers: *const TunnelHeader,
+    pub header_count: usize,
+    pub isolation_key: *const c_char,
+    pub fd: c_int,
+}
+
+/// Cronet_UdpTunnelStats.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TunnelStats {
+    pub up_sent: u64,
+    pub up_dropped: u64,
+    pub down_received: u64,
+    pub down_dropped: u64,
+}
+
+/// Cronet_UdpTunnelEvent.
+pub const TUNNEL_UP: c_int = 1;
+pub const TUNNEL_CLOSED: c_int = 2;
+
+/// Cronet_UdpTunnelCallback, called on cronet's network thread.
+pub type TunnelCallback = unsafe extern "C" fn(ctx: Ptr, event: c_int, net_error: c_int);
+
+/// The CONNECT-UDP tunnel's calls, in a patched libcronet only.
+pub struct TunnelApi {
+    pub create: unsafe extern "C" fn(Ptr, *const TunnelParams, TunnelCallback, Ptr) -> Ptr,
+    pub destroy: unsafe extern "C" fn(Ptr),
+    pub stats: unsafe extern "C" fn(Ptr) -> TunnelStats,
+}
+
 pub struct Api {
     pub engine_create: unsafe extern "C" fn() -> Ptr,
     pub engine_destroy: unsafe extern "C" fn(Ptr),
@@ -67,6 +113,8 @@ pub struct Api {
     pub stream_read: unsafe extern "C" fn(*mut Stream, *mut c_char, c_int) -> c_int,
     pub stream_write: unsafe extern "C" fn(*mut Stream, *const c_char, c_int, bool) -> c_int,
     pub stream_cancel: unsafe extern "C" fn(*mut Stream),
+    /// None when the library is not our patched build.
+    pub tunnel: Option<TunnelApi>,
 }
 
 static API: OnceLock<Api> = OnceLock::new();
@@ -151,6 +199,14 @@ fn resolve(h: Ptr) -> Result<Api, String> {
             stream_read: sym(h, "bidirectional_stream_read")?,
             stream_write: sym(h, "bidirectional_stream_write")?,
             stream_cancel: sym(h, "bidirectional_stream_cancel")?,
+            tunnel: match (
+                sym(h, "Cronet_UdpTunnel_Create"),
+                sym(h, "Cronet_UdpTunnel_Destroy"),
+                sym(h, "Cronet_UdpTunnel_GetStats"),
+            ) {
+                (Ok(create), Ok(destroy), Ok(stats)) => Some(TunnelApi { create, destroy, stats }),
+                _ => None,
+            },
         })
     }
 }

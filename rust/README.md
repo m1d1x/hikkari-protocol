@@ -448,3 +448,34 @@ reaching the new one (`exit_drain_linux_test.go`): `TestAnExitDrainWaitsForAQuar
 `TestTheBrainsCallMovesToTheNewSession`, `TestAPipeDrainingItselfOpensNoSessionForTheExitsDrain`,
 `TestARetiredSessionIsCutAfterItsLimit`, `TestAStreamThroughAnExitDrainEndsByteForByte`. The Rust exit sends no `drain`
 yet (its generations are not done).
+
+## Chromium QUIC: the CONNECT-UDP tunnel (R6.1)
+
+Datagrams out of Chromium's own QUIC, for the `h3dgram` wire (R6.3): `cronet/chromium/connect-udp.patch` puts out to
+cronet's C API the client Chrome uses for its IP Protection proxies, `net::QuicProxyDatagramClientSocket`
+(CONNECT-UDP, RFC 9298, over HTTP/3; datagrams are HTTP Datagrams, RFC 9297). The patch only calls what is there: a
+session to the proxy from the engine's `QuicSessionPool` (direct, `SessionUsage::kProxy`, as `ProxyJob` asks for it), a
+request stream on it, the socket over the stream; the CONNECT-UDP's extra headers (`proxy-authorization`) come through
+a `ProxyDelegate` that answers nothing else.
+
+- C API (`cronet_c.h`): `Cronet_UdpTunnel_Create(engine, params, callback, ctx)`, `_Destroy`, `_GetStats`. The params
+  name the proxy, the target in the URI template, the headers, an isolation key (tunnels with different keys never share
+  a QUIC connection) and one end of an AF_UNIX datagram socket pair, which the tunnel owns: a message there is a
+  datagram. The callback (on the network thread) says up or closed with Chromium's net error. A datagram the QUIC
+  connection does not take, or that finds the embedder's end full, is dropped and counted, as UDP would.
+- Rust (`hikkari-cronet`, `tunnel.rs`): `TunnelEngine` (QUIC on, the proxy's domain mapped to its address, every TCP
+  dial refused) and `Tunnel` (the pair's end to read and write like a UDP socket, a wake-up, the state). The calls are
+  optional in `api.rs`: the stock libcronet of the pool still loads, and a tunnel on it says it is not our build.
+- The library: `cronet/chromium/build.sh <workdir> linux/amd64` on a linux/amd64 host (WSL2 Debian on the PC): cronet-go
+  and naiveproxy at the commits the pool's libcronet comes from (Chromium 150.0.7871.63), the patch applied on a clean
+  tree, `build-naive`. Rebuilt from the patch, the library is byte for byte the one checked.
+
+Check (`bench/tunnel.sh`): the reference proxy `bench/go/connectudp` (quic-go's HTTP/3, no code shared with Chromium)
+echoes; `hk-udp-tunnel` sends a call, 160 B every 20 ms, and checks every datagram comes back intact; a wrong key must
+get no tunnel.
+
+```bash
+cargo build --release -p hikkari-cronet --bin hk-udp-tunnel     # linux/amd64, glibc
+(cd bench/go && CGO_ENABLED=0 go build -o ../out/connectudp ./connectudp)
+bench/tunnel.sh 3 1500      # needs /bench/out: connectudp, hk-udp-tunnel, the patched libcronet.so
+```
