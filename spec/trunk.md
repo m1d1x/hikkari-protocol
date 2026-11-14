@@ -192,7 +192,12 @@ without an answer.
 
 The Chromium QUIC wire (`h3dgram`, draft 2026-11-13, R6.2; hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
 "Труба на Rust"): packet members whose datagrams are HTTP Datagrams (RFC 9297) of a CONNECT-UDP request (RFC 9298) over
-HTTP/3, sent by Chromium's own QUIC stack on the entry, so the border sees what Chrome sends to a MASQUE proxy. A member is
+HTTP/3, sent by Chromium's own QUIC stack on the entry, so the border sees what Chrome sends. Chromium uses the member's
+QUIC session as its session to a site (`SessionUsage::kDestination`: packets of 1250 B, Chrome's to any site since early
+2023), not as its session to an IP Protection proxy (`kProxy`: 1350 B, which a Chrome with ML-KEM sends to no one but
+Google's proxies): owner's choice of 2026-11-14 (hikkari-client `plans/research/2026-11-14-h3dgram-wire-shape-research.md`).
+The usage is a knob of the entry's wire (`destination` by default, `proxy`); nothing else on the wire differs, and the exit
+takes both. A member is
 one QUIC connection (TLS 1.3, ALPN `h3`, the exit's UDP port) carrying one CONNECT-UDP request: `:method CONNECT`,
 `:protocol connect-udp`, `:scheme https`, `:path /.well-known/masque/udp/{host}/{port}/` (any target: the exit is the
 trunk's end and opens nothing to it), and `proxy-authorization: Bearer <token>`, where the token is HKDF-SHA256(trunk key,

@@ -33,5 +33,5 @@ pub use api::load;
 pub use conn::{Conn, Form};
 pub use engine::Engine;
 pub use keeper::version;
-pub use tunnel::{Proxy, State, Tunnel, TunnelEngine};
+pub use tunnel::{Proxy, State, Tunnel, TunnelEngine, Usage};
 pub use api::TunnelStats;

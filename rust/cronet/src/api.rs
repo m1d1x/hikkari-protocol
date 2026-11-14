@@ -66,6 +66,7 @@ pub struct TunnelParams {
     pub header_count: usize,
     pub isolation_key: *const c_char,
     pub fd: c_int,
+    pub session_usage: c_int,
 }
 
 /// Cronet_UdpTunnelStats.
@@ -81,6 +82,9 @@ pub struct TunnelStats {
 /// Cronet_UdpTunnelEvent.
 pub const TUNNEL_UP: c_int = 1;
 pub const TUNNEL_CLOSED: c_int = 2;
+/// Cronet_UdpTunnelSessionUsage.
+pub const SESSION_DESTINATION: c_int = 0;
+pub const SESSION_PROXY: c_int = 1;
 
 /// Cronet_UdpTunnelCallback, called on cronet's network thread.
 pub type TunnelCallback = unsafe extern "C" fn(ctx: Ptr, event: c_int, net_error: c_int);

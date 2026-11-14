@@ -8,7 +8,8 @@
 //!
 //! Prints one line: sent, back, lost, rtt p50/p99/max in microseconds, the
 //! longest gap between answers, the exit's pings answered, and exits 1 if a
-//! datagram was lost.
+//! datagram was lost. `--usage destination|proxy` is how Chromium uses the
+//! member's QUIC session (hikkari_cronet::Usage; destination by default).
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -29,7 +30,7 @@ mod call {
     use std::net::SocketAddrV4;
     use std::time::Duration;
 
-    use hikkari_cronet::{Proxy, State, Tunnel, TunnelEngine};
+    use hikkari_cronet::{Proxy, State, Tunnel, TunnelEngine, Usage};
     use hikkari_sys as sys;
     use hikkari_trunk::flow::ECHO_PORT;
     use hikkari_trunk::frame::{self, Frame, F_PONG};
@@ -45,6 +46,7 @@ mod call {
         count: u64,
         every_us: u64,
         size: usize,
+        usage: Usage,
     }
 
     fn args() -> Result<Args, String> {
@@ -58,6 +60,7 @@ mod call {
             count: 1500,
             every_us: 20_000,
             size: 160,
+            usage: Usage::Destination,
         };
         let mut it = std::env::args().skip(1);
         while let Some(k) = it.next() {
@@ -75,6 +78,7 @@ mod call {
                 "--count" => a.count = v()?.parse().map_err(|e| format!("--count: {e}"))?,
                 "--every-us" => a.every_us = v()?.parse().map_err(|e| format!("--every-us: {e}"))?,
                 "--size" => a.size = v()?.parse().map_err(|e| format!("--size: {e}"))?,
+                "--usage" => a.usage = Usage::parse(&v()?)?,
                 _ => return Err(format!("unknown flag {k}")),
             }
         }
@@ -102,7 +106,7 @@ mod call {
         let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.exit, roots: a.roots.clone() })?;
         let auth = h3dgram::authorization(&h3dgram::token(&a.key));
         let t0 = sys::now_ns();
-        let tunnel = Tunnel::open(&engine, ("trunk.hikkari.arpa", 443), &[("proxy-authorization", &auth)], None)?;
+        let tunnel = Tunnel::open(&engine, ("trunk.hikkari.arpa", 443), &[("proxy-authorization", &auth)], None, a.usage)?;
         loop {
             match tunnel.state() {
                 State::Up => break,

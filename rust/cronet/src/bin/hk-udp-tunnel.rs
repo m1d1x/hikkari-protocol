@@ -27,7 +27,7 @@ mod probe {
     use std::net::SocketAddrV4;
     use std::time::Duration;
 
-    use hikkari_cronet::{Proxy, State, Tunnel, TunnelEngine};
+    use hikkari_cronet::{Proxy, State, Tunnel, TunnelEngine, Usage};
     use hikkari_sys as sys;
 
     struct Args {
@@ -40,6 +40,7 @@ mod probe {
         count: u64,
         every_ms: u64,
         size: usize,
+        usage: Usage,
     }
 
     fn args() -> Result<Args, String> {
@@ -53,6 +54,7 @@ mod probe {
             count: 1500,
             every_ms: 20,
             size: 160,
+            usage: Usage::Destination,
         };
         let mut it = std::env::args().skip(1);
         while let Some(k) = it.next() {
@@ -74,6 +76,7 @@ mod probe {
                 "--count" => a.count = v()?.parse().map_err(|e| format!("--count: {e}"))?,
                 "--every-ms" => a.every_ms = v()?.parse().map_err(|e| format!("--every-ms: {e}"))?,
                 "--size" => a.size = v()?.parse().map_err(|e| format!("--size: {e}"))?,
+                "--usage" => a.usage = Usage::parse(&v()?)?,
                 _ => return Err(format!("unknown flag {k}")),
             }
         }
@@ -88,7 +91,7 @@ mod probe {
         hikkari_cronet::load(a.cronet.as_deref())?;
         let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.proxy, roots: a.roots.clone() })?;
         let t0 = sys::now_ns();
-        let tunnel = Tunnel::open(&engine, (&a.target.0, a.target.1), &[("proxy-authorization", &a.auth)], None)?;
+        let tunnel = Tunnel::open(&engine, (&a.target.0, a.target.1), &[("proxy-authorization", &a.auth)], None, a.usage)?;
         loop {
             match tunnel.state() {
                 State::Up => break,

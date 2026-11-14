@@ -12,7 +12,7 @@ index 90cac672..7adaaeea 100644
      "url_request.cc",
      "url_request.h",
 diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
-index 6bdec585..a1493d02 100644
+index 6bdec585..c58959a0 100644
 --- a/src/components/cronet/native/include/cronet_c.h
 +++ b/src/components/cronet/native/include/cronet_c.h
 @@ -5,6 +5,7 @@
@@ -23,7 +23,7 @@ index 6bdec585..a1493d02 100644
  #include <stdint.h>
  
  #include "cronet_export.h"
-@@ -111,6 +112,85 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+@@ -111,6 +112,97 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
  // Calls from Cronet's network thread schedule the close asynchronously.
  CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
  
@@ -63,7 +63,19 @@ index 6bdec585..a1493d02 100644
 +  // read there. A datagram that does not fit (the QUIC connection cannot
 +  // send it, or the embedder's end is full) is dropped and counted.
 +  int fd;
++  // How the QUIC session to the proxy is used, as Chrome sees it (a
++  // Cronet_UdpTunnelSessionUsage): the packets and the certificate's fetches
++  // are those of Chrome's session to a site, or to an IP Protection proxy.
++  int session_usage;
 +} Cronet_UdpTunnelParams;
++
++typedef enum Cronet_UdpTunnelSessionUsage {
++  // As Chrome's session to a site: QUIC packets of 1250 B (IPv4).
++  Cronet_UdpTunnel_SESSION_DESTINATION = 0,
++  // As Chrome's session to an IP Protection proxy: 100 B more a packet, so
++  // that a tunneled QUIC connection still has 1200 B.
++  Cronet_UdpTunnel_SESSION_PROXY = 1,
++} Cronet_UdpTunnelSessionUsage;
 +
 +typedef enum Cronet_UdpTunnelEvent {
 +  // The tunnel carries datagrams. net_error is 0.
@@ -110,11 +122,11 @@ index 6bdec585..a1493d02 100644
  }
  #endif
 diff --git a/src/components/cronet/native/udp_tunnel.cc b/src/components/cronet/native/udp_tunnel.cc
-new file mode 100755
-index 00000000..d5ad358b
+new file mode 100644
+index 00000000..a9fb5173
 --- /dev/null
 +++ b/src/components/cronet/native/udp_tunnel.cc
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,445 @@
 +// Copyright 2026 The Hikkari Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -250,9 +262,13 @@ index 00000000..d5ad358b
 +                                         net::NetLogSourceType::NONE);
 +  headers_ = std::make_unique<Headers>(params_.headers);
 +
-+  // As QuicSessionPool::ProxyJob asks for its session to a proxy: direct,
-+  // used for proxying, at the RFC version (there is no Alt-Svc to choose
-+  // by).
++  // A direct session at the RFC version (there is no Alt-Svc to choose by),
++  // used as the embedder says: kDestination is Chrome's session to a site
++  // (packets of quic::kDefaultMaxPacketSize, 1250 B), kProxy its session to
++  // an IP Protection proxy, as QuicSessionPool::ProxyJob asks it (100 B
++  // more, QuicParams::additional_proxy_packet_length). The wire is the
++  // same otherwise.
++  const bool proxy = params_.session_usage == Cronet_UdpTunnel_SESSION_PROXY;
 +  net::NetworkAnonymizationKey nak;
 +  if (!params_.isolation_key.empty()) {
 +    nak = net::NetworkAnonymizationKey::CreateSameSite(
@@ -265,12 +281,14 @@ index 00000000..d5ad358b
 +  int rv = session_request_->Request(
 +      destination, quic::ParsedQuicVersion::RFCv1(), net::ProxyChain::Direct(),
 +      kTrafficAnnotation, request_context->http_user_agent_settings(),
-+      net::SessionUsage::kProxy, net::PRIVACY_MODE_DISABLED, net::HIGHEST,
-+      net::SocketTag(), nak, net::SecureDnsPolicy::kAllow,
++      proxy ? net::SessionUsage::kProxy : net::SessionUsage::kDestination,
++      net::PRIVACY_MODE_DISABLED, net::HIGHEST, net::SocketTag(), nak,
++      net::SecureDnsPolicy::kAllow,
 +      /*require_dns_https_alpn=*/false,
 +      // A session to a proxy never fetches for its certificate (the pool
-+      // CHECKs it for SessionUsage::kProxy, as ProxyJob sets it).
-+      net::CertVerifier::VERIFY_DISABLE_NETWORK_FETCHES,
++      // CHECKs it for SessionUsage::kProxy, as ProxyJob sets it); one to a
++      // site may, as Chrome's does.
++      proxy ? net::CertVerifier::VERIFY_DISABLE_NETWORK_FETCHES : 0,
 +      GURL(destination.Serialize()), net::handles::kInvalidNetworkHandle,
 +      net_log_, &net_error_details_,
 +      net::MultiplexedSessionCreationInitiator::kUnknown,
@@ -516,6 +534,11 @@ index 00000000..d5ad358b
 +  if (params->isolation_key) {
 +    p.isolation_key = params->isolation_key;
 +  }
++  if (params->session_usage != Cronet_UdpTunnel_SESSION_DESTINATION &&
++      params->session_usage != Cronet_UdpTunnel_SESSION_PROXY) {
++    return nullptr;
++  }
++  p.session_usage = params->session_usage;
 +  p.fd = params->fd;
 +  p.callback = callback;
 +  p.callback_context = callback_context;
@@ -550,11 +573,11 @@ index 00000000..d5ad358b
 +  return stats;
 +}
 diff --git a/src/components/cronet/native/udp_tunnel.h b/src/components/cronet/native/udp_tunnel.h
-new file mode 100755
-index 00000000..15d28c39
+new file mode 100644
+index 00000000..3d7e917a
 --- /dev/null
 +++ b/src/components/cronet/native/udp_tunnel.h
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,104 @@
 +// Copyright 2026 The Hikkari Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -605,6 +628,8 @@ index 00000000..15d28c39
 +    std::vector<std::pair<std::string, std::string>> headers;
 +    // A URL naming the tunnel's network partition; empty for none.
 +    std::string isolation_key;
++    // A Cronet_UdpTunnelSessionUsage.
++    int session_usage = Cronet_UdpTunnel_SESSION_DESTINATION;
 +    int fd = -1;
 +    Cronet_UdpTunnelCallback callback = nullptr;
 +    void* callback_context = nullptr;

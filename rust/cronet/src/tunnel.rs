@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use hikkari_sys as sys;
 
-use crate::api::{self, Ptr, TunnelHeader, TunnelParams, TunnelStats, TUNNEL_CLOSED, TUNNEL_UP};
+use crate::api::{self, Ptr, TunnelHeader, TunnelParams, TunnelStats, SESSION_DESTINATION, SESSION_PROXY, TUNNEL_CLOSED, TUNNEL_UP};
 
 // Chromium's net error for a dial the engine must not make
 // (net/base/net_error_list.h).
@@ -138,6 +138,36 @@ pub enum State {
     Closed(i32),
 }
 
+/// How Chromium uses a tunnel's QUIC session (net::SessionUsage), the one
+/// thing on the wire it changes being the size of its packets: as Chrome's
+/// session to a site (1250 B, the default since the owner's choice of
+/// 2026-11-14, hikkari-client plans/research/2026-11-14-h3dgram-wire-shape-
+/// research.md) or to an IP Protection proxy (1350 B).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Usage {
+    #[default]
+    Destination,
+    Proxy,
+}
+
+impl Usage {
+    /// A usage by its name: `destination` or `proxy`.
+    pub fn parse(s: &str) -> Result<Usage, String> {
+        match s {
+            "destination" => Ok(Usage::Destination),
+            "proxy" => Ok(Usage::Proxy),
+            _ => Err(format!("session usage {s:?} is not destination or proxy")),
+        }
+    }
+
+    fn c(self) -> c_int {
+        match self {
+            Usage::Destination => SESSION_DESTINATION,
+            Usage::Proxy => SESSION_PROXY,
+        }
+    }
+}
+
 /// What the network thread tells the loop.
 struct Shared {
     wake: sys::Wake,
@@ -162,12 +192,14 @@ impl Tunnel {
     /// Starts a tunnel to `target` (host, port) through the engine's proxy,
     /// with `headers` on its CONNECT-UDP, in the network partition named by
     /// `isolation_key` (a URL; tunnels with different keys never share a
-    /// QUIC connection). Returns at once; the wake-up rings when it is up.
+    /// QUIC connection), its QUIC session used as `usage` says. Returns at
+    /// once; the wake-up rings when it is up.
     pub fn open(
         engine: &Arc<TunnelEngine>,
         target: (&str, u16),
         headers: &[(&str, &str)],
         isolation_key: Option<&str>,
+        usage: Usage,
     ) -> Result<Tunnel, String> {
         let a = api::api().ok_or("cronet: libcronet is not loaded")?;
         let t = a.tunnel.as_ref().ok_or("cronet: this libcronet has no CONNECT-UDP tunnel")?;
@@ -194,6 +226,7 @@ impl Tunnel {
             header_count: hdrs.len(),
             isolation_key: key.as_ref().map_or(std::ptr::null(), |k| k.as_ptr()),
             fd: theirs.as_raw_fd(),
+            session_usage: usage.c(),
         };
         let ctx = Arc::into_raw(shared.clone()) as Ptr;
         // SAFETY: params and the strings it points to live through the call,
@@ -268,4 +301,19 @@ unsafe extern "C" fn event(ctx: Ptr, ev: c_int, net_error: c_int) {
         _ => return,
     }
     s.wake.ring();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tunnel's session is Chrome's to a site unless proxy is named, and
+    /// the names give the patch's Cronet_UdpTunnelSessionUsage values.
+    #[test]
+    fn a_session_is_a_sites_unless_proxy_is_named() {
+        assert_eq!(Usage::default(), Usage::Destination);
+        assert_eq!(Usage::parse("destination").map(Usage::c), Ok(0));
+        assert_eq!(Usage::parse("proxy").map(Usage::c), Ok(1));
+        assert!(Usage::parse("kProxy").is_err());
+    }
 }
