@@ -91,10 +91,16 @@
 ## 7. Проверка перед коммитом
 
 ```bash
-cd rust && cargo clippy --all-targets && cargo test                        # мак: trunk и ctl
-cargo clippy --release --target aarch64-unknown-linux-musl --all-targets   # Linux: всё
-cargo test --release --target aarch64-unknown-linux-musl --no-run          # бинари тестов, гнать в docker (rust/README.md)
+cd rust && cargo clippy --release --all-targets && cargo test --release   # Linux (WSL2 на ПК): всё
 cd trunk && go vet ./... && go test -race ./...
 ```
 
-`trunk/pipectl` против собранного `hk-pipe` в docker: команда в `rust/README.md`, раздел «Brain and pipe».
+Linux-сборки и тесты идут на ПК в WSL2 (Debian), а не в docker на маке. На маке без Linux собираются и тестируются
+только `hikkari-trunk` и `ctl`. Выход (`hikkari-exit`) тянет `quiche` с BoringSSL: для сборки нужны `cmake` и
+`libclang-dev`.
+
+Бинари для боксов собирает hub (`hikkari-control/Dockerfile.hub`): под glibc, а не musl (труба грузит `libcronet.so`),
+кросс-сборкой `x86_64-unknown-linux-gnu` и `aarch64-unknown-linux-gnu` с `--locked`. Новый бинарь или новая
+зависимость с C-кодом попадает на бокс только вместе с правкой этой стадии.
+
+`trunk/pipectl` против собранного `hk-pipe` и `hk-exit`: команда в `rust/README.md`, раздел «Brain and pipe».
