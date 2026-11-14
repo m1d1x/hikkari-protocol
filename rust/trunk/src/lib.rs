@@ -7,6 +7,7 @@
 
 pub mod buf;
 pub mod flow;
+pub mod frag;
 pub mod frame;
 pub mod guard;
 pub mod h3dgram;

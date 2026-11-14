@@ -16,6 +16,7 @@ use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, sockaddr_in, SendBatch, BATCH};
+use hikkari_trunk::frag::{self, Reasm};
 use hikkari_trunk::health::Health;
 use hikkari_trunk::udpwire::{Seal, OVERHEAD};
 
@@ -184,22 +185,34 @@ impl Wire {
     /// Puts one frame of `need` bytes of class c (written by `put`) into p's
     /// glue, sealing first what is there when it would not fit; a frame
     /// alone over the window's size goes alone. On the QUIC wire it goes
-    /// into p's scheduler. False for a frame no datagram holds: dropped, as
-    /// udpwire drops a write over MaxDatagram.
+    /// into p's scheduler, cut when one datagram does not hold it
+    /// (spec/trunk.md, `h3dgram`: a frame over the room; written first into
+    /// the glue, which the QUIC wire's peers do not use). False for a frame
+    /// no datagram holds (on the QUIC wire, no cut): dropped, as udpwire
+    /// drops a write over MaxDatagram.
     #[inline]
     pub fn glue(&mut self, p: &mut Peer, c: Class, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
         let (most, window) = self.room(p);
-        if need > most {
-            self.dropped += 1;
-            return false;
-        }
         if let Form::H3(h) = &mut self.form {
-            h.put(p.conn, p.stream, c, need, now, put);
+            if need <= most {
+                h.put(p.conn, p.stream, c, need, now, put);
+            } else {
+                let n = if need <= frag::WHOLE_MAX { put(&mut p.glue[..need]) } else { 0 };
+                if n == 0 || !h.put_cut(p.conn, p.stream, c, &p.glue[..n], p.cut, now) {
+                    self.dropped += 1;
+                    return false;
+                }
+                p.cut = p.cut.wrapping_add(1);
+            }
             self.frames += 1;
             if p.glue_since == 0 {
                 p.glue_since = now;
             }
             return true;
+        }
+        if need > most {
+            self.dropped += 1;
+            return false;
         }
         if p.glue_n > 0 && p.glue_n + need > window {
             self.seal(p, now);
@@ -249,6 +262,11 @@ pub struct Peer {
     glue: Box<[u8]>,
     pub glue_n: usize,
     pub glue_since: u64,
+    /// The QUIC wire's: the count of frames cut for this member (the next
+    /// cut's id), and the entry's cut frames being put together, made with
+    /// the first one.
+    pub cut: u16,
+    pub reasm: Option<Box<Reasm>>,
 }
 
 impl Peer {
@@ -270,6 +288,8 @@ impl Peer {
             glue: vec![0; SLOT].into_boxed_slice(),
             glue_n: 0,
             glue_since: 0,
+            cut: 0,
+            reasm: None,
         }
     }
 
@@ -306,6 +326,9 @@ impl Peer {
         self.heard = now;
         self.glue_n = 0;
         self.glue_since = 0;
+        if let Some(r) = self.reasm.as_mut() {
+            r.clear();
+        }
     }
 
     /// A member: its hello answered, in a session.

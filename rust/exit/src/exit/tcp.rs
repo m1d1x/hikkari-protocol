@@ -200,7 +200,7 @@ impl Exit {
                 // Datagrams ride the packet wires (the Rust entry sends them
                 // there); a pool member's are R2's.
                 Frame::Dgram { .. } => self.t.link_dgrams += 1,
-                Frame::Drain | Frame::Observe { .. } | Frame::Other => {}
+                Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Other => {}
             }
             at = next;
         }

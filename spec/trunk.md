@@ -41,6 +41,7 @@ Both ways, big-endian:
 | ping 8, pong 9 | token u64 |
 | drain 10 | (exit to entry) |
 | observe 11 | kind u8 (1 stream, 2 flow), stream u32, id u64 (exit to entry) |
+| frag 12 | id u16, index u8, count u8, n u16, n bytes (packet members of the `h3dgram` wire only, "Wires") |
 
 The entry's first frame on a member is hello with its session id (random per entry run) and a zero epoch; the exit answers
 hello with the same id and the epoch of its session (random per exit session). The entry has no epoch: the first byte of
@@ -213,9 +214,19 @@ Datagram of the member holds, whatever its packet number's length (R6.3): 1194 B
 1294 B in packets of 1350 B (`proxy`), that is the packet less a long header with the version, the exit's 16-byte and
 Chromium's 8-byte connection ids, a 2-byte length and a 4-byte packet number, the 16-byte tag, the DATAGRAM frame's type
 and the HTTP Datagram's 2-byte head. Chromium resets the request stream (and with it the member) on a datagram over the
-room it has now, so the entry never writes one over that limit: a frame alone over it is dropped and counted, as udpwire
-drops one over its datagram. Live datagrams of clients (voice, games) fit; a client's own QUIC packets (1250–1350 B) do
-not and go on a wire that carries them.
+room it has now, so neither end writes one over that limit. Live datagrams of clients (voice, games) fit; a client's own
+QUIC packets do not: QUIC's Initial is 1200 B at least (RFC 9000, 14.1), Chrome's packets are 1250–1350 B.
+
+A frame over the room is cut, not carried by another wire (owner's choice of 2026-11-14: what crosses the border is one
+shape, Chromium's to a site, and a flow stays on its member's wire). The sender cuts the frame's bytes into `count`
+pieces (2 to 4, as even as they go), each a frag frame: `id` the sender's count of cut frames on this member (u16,
+wrapping), `index` from 0, and the piece. All pieces of a frame go on the same member, in order, each in a datagram that
+holds it, glued with other frames like any frame; they wait and age in the member's scheduler as any frame does, so one
+dropped there loses the frame. The receiver puts a frame together per member by `id` from its `count` pieces, and reads
+it as the one frame it must be (a dgram frame; anything else is dropped as a torn frame would be). A member keeps at most
+8 frames being put together; a frame not whole 150 ms after its first piece, or pushed out by a ninth, is lost and
+counted. A piece seen twice is dropped. A frame that 4 pieces do not hold is dropped and counted, as udpwire drops a write
+over its datagram. Only this wire's members cut frames: every other wire's datagram holds any client's.
 
 The entry opens its members itself, not the brain (R6.3): one Chromium engine per wire, a CONNECT-UDP tunnel per member,
 each in a network partition of its own, so no two members share a QUIC connection. A member's UDP socket is the entry's,

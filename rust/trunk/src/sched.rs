@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 
+use crate::frag;
 use crate::guard::Guard;
 
 /// The longest a frame may wait (datagram.StaleAfter).
@@ -140,6 +141,20 @@ impl Sched {
             b.deficit = 0;
             self.round.push_back(i);
         }
+    }
+
+    /// A frame f of class c over `room`, cut (spec/trunk.md, `h3dgram`: a
+    /// frame over the room) into frag frames of cut frame `id`, put at `now`
+    /// in order into its bucket; false when frag::PIECES_MAX pieces do not
+    /// hold it (the caller drops and counts it, as one over the room).
+    pub fn put_cut(&mut self, c: Class, f: &[u8], room: usize, id: u16, now: u64) -> bool {
+        let Some((count, piece)) = frag::cut(f.len(), room) else {
+            return false;
+        };
+        for (i, p) in f.chunks(piece).enumerate() {
+            self.put(c, frag::HEAD + p.len(), now, |b| frag::put_piece(b, id, i as u8, count as u8, p));
+        }
+        true
     }
 
     /// Drops what waited over STALE_NS at `now`, the oldest first.

@@ -512,6 +512,9 @@ impl Pipe {
                 let limited = w.members.iter().filter(|m| m.guard.rate() > 0.0).count();
                 let guard_ms: u64 = w.members.iter().map(|m| m.guard.limited_ns(now) / 1_000_000).sum();
                 s += &format!(" stale={stale} wait_max_ms={:.1} guard_ms={guard_ms} limited={limited}", wait_max as f64 / 1e6);
+                let cuts: u64 = w.members.iter().map(|m| m.cuts).sum();
+                let (whole, lost) = w.members.iter().filter_map(|m| m.reasm.as_ref()).fold((0, 0), |(a, b), r| (a + r.n.whole, b + r.n.lost));
+                s += &format!(" cut={cuts} cut_in={whole} cut_lost={lost}");
             }
         }
         if self.has_tcp() {

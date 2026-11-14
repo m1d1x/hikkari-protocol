@@ -156,6 +156,8 @@ pub struct Counts {
     pub stray: u64,
     pub too_big: u64,
     pub full: u64,
+    /// Frames cut down (spec/trunk.md, `h3dgram`: a frame over the room).
+    pub cut: u64,
     /// Datagrams down QUIC took.
     pub dgrams: u64,
     /// The schedulers' counts and the guards' time limited of connections
@@ -354,6 +356,19 @@ impl H3Wire {
         if let Some(m) = self.conns[ci].as_mut().and_then(|c| c.members.iter_mut().find(|m| m.stream == stream)) {
             m.sched.put(c, need, now, put);
         }
+    }
+
+    /// Frame f of class c, over what a datagram holds now (room), cut for
+    /// the member of request `stream` on ci (cut id `id`); false when no cut
+    /// holds it. Counted in `cut`.
+    pub fn put_cut(&mut self, ci: usize, stream: u64, c: Class, f: &[u8], id: u16, now: u64) -> bool {
+        let room = self.room(ci, stream);
+        let Some(m) = self.conns[ci].as_mut().and_then(|c| c.members.iter_mut().find(|m| m.stream == stream)) else {
+            return false;
+        };
+        let ok = m.sched.put_cut(c, f, room, id, now);
+        self.n.cut += ok as u64;
+        ok
     }
 
     /// The member of request `stream` on ci sends what waits, as far as its

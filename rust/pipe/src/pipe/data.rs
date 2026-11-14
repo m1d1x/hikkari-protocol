@@ -3,6 +3,7 @@
 use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, now_ns, BATCH};
+use hikkari_trunk::frag::Reasm;
 use hikkari_trunk::frame::{self, Frame};
 use hikkari_trunk::sched::Class;
 
@@ -118,13 +119,40 @@ impl Pipe {
                             | Frame::Other => {}
                             // The exit marked a tester's flow (marks.rs).
                             Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
+                            // A piece of a frame the exit cut (spec/trunk.md,
+                            // `h3dgram`): the frame once whole is the one dgram it
+                            // must be, sent out of where it was put together.
+                            Frame::Frag { id, index, count, off, len } => {
+                                let r = m.reasm.get_or_insert_with(|| Box::new(Reasm::new()));
+                                if let Some(whole) = r.piece(now, id, index, count, &p[off..off + len]) {
+                                    match frame::next_frame(whole, 0) {
+                                        Some((Frame::Dgram { stream, seq, off, len, .. }, end)) if end == whole.len() => {
+                                            w.t.down_pkts += 1;
+                                            w.t.down_bytes += len as u64;
+                                            *moved += 1;
+                                            deliver(flows, listens, ctl, out, &whole[off..off + len], stream, seq, now, sess);
+                                        }
+                                        _ => *bad += 1,
+                                    }
+                                    if r.full() {
+                                        for l in listens.iter_mut() {
+                                            l.down.flush(l.sock.as_raw_fd());
+                                        }
+                                        r.release();
+                                    }
+                                }
+                            }
                         }
                         at = nx;
                     }
                 }
-                // The answers point into wrecv: send them before reading again.
+                // The answers point into wrecv and the frames put together:
+                // send them before reading again.
                 for l in listens.iter_mut() {
                     l.down.flush(l.sock.as_raw_fd());
+                }
+                if let Some(r) = m.reasm.as_mut() {
+                    r.release();
                 }
                 if n < BATCH {
                     break;

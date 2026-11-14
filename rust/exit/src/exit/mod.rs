@@ -387,12 +387,13 @@ impl Exit {
             t.bad,
             self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum::<u64>()
         );
-        for w in &self.wires {
+        for (wi, w) in self.wires.iter().enumerate() {
             if let Form::H3(h) = &w.form {
                 let n = &h.n;
                 let d = h.down(now_ns());
+                let (whole, lost) = self.peers.iter().filter(|p| p.wire == wi).filter_map(|p| p.reasm.as_ref()).fold((0, 0), |(a, b), r| (a + r.n.whole, b + r.n.lost));
                 eprintln!(
-                    "hk-exit: h3dgram wire {} conns={} accepted={} refused={} stray={} too_big={} full={} stale={} wait_ms mean={:.2} max={:.1} guard_ms={} limited={}",
+                    "hk-exit: h3dgram wire {} conns={} accepted={} refused={} stray={} too_big={} full={} stale={} wait_ms mean={:.2} max={:.1} guard_ms={} limited={} cut={} cut_in={} cut_lost={}",
                     w.id,
                     h.open(),
                     n.conns,
@@ -404,7 +405,10 @@ impl Exit {
                     d.sched.wait_ns as f64 / d.sched.sent.max(1) as f64 / 1e6,
                     d.sched.wait_max_ns as f64 / 1e6,
                     d.guard_ns / 1_000_000,
-                    d.limited
+                    d.limited,
+                    n.cut,
+                    whole,
+                    lost
                 );
             }
         }

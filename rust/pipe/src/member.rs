@@ -13,6 +13,7 @@ use std::os::fd::AsRawFd;
 
 use hikkari_cronet::Tunnel;
 use hikkari_sys::{self as sys, SendBatch, BATCH};
+use hikkari_trunk::frag::Reasm;
 use hikkari_trunk::guard::{Guard, Snap};
 use hikkari_trunk::sched::{Class, Sched};
 use hikkari_trunk::health::Health;
@@ -49,10 +50,17 @@ pub struct Member {
     /// Its datagrams are the frames unsealed (the QUIC wire's members), at
     /// most frames_max bytes each: Chromium resets a tunnel's stream on an
     /// HTTP Datagram over its QUIC packet's room, so one that would not fit
-    /// is dropped here and counted in too_big.
+    /// is cut (spec/trunk.md, `h3dgram`: a frame over the room), and one
+    /// that four pieces do not hold is dropped and counted in too_big.
     pub plain: bool,
     pub frames_max: usize,
     pub too_big: u64,
+    /// The QUIC wire's: the count of frames cut on this member (the next
+    /// cut's id), and the exit's cut frames being put together, made with
+    /// the first one.
+    pub cut: u16,
+    pub cuts: u64,
+    pub reasm: Option<Box<Reasm>>,
     /// The QUIC wire's: frames waiting for its datagrams, and the guard of
     /// its connection (a new one per tunnel).
     pub sched: Option<Box<Sched>>,
@@ -83,6 +91,9 @@ impl Member {
             plain: false,
             frames_max: 0,
             too_big: 0,
+            cut: 0,
+            cuts: 0,
+            reasm: None,
             sched: None,
             guard: Guard::default(),
             tun: None,
@@ -112,17 +123,28 @@ impl Member {
         self.fd = self.tun.as_ref().map_or(-1, |t| t.fd());
         self.port = port;
         self.guard = Guard::over_a_sender();
+        if let Some(r) = self.reasm.as_mut() {
+            r.clear();
+        }
     }
 
     /// One frame of class c (written by `put` at most `need` bytes): on the
-    /// QUIC wire into the scheduler, a frame over frames_max dropped and
-    /// counted; on the bare UDP wire into the glue.
+    /// QUIC wire into the scheduler, a frame over frames_max cut (written
+    /// first into the glue, which the QUIC wire uses only while it drains);
+    /// on the bare UDP wire into the glue.
     #[inline]
     pub fn frame(&mut self, c: Class, need: usize, max: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) {
-        let fits = need <= self.frames_max;
         match &mut self.sched {
-            Some(s) if fits => s.put(c, need, now, put),
-            Some(_) => self.too_big += 1,
+            Some(s) if need <= self.frames_max => s.put(c, need, now, put),
+            Some(s) => {
+                let n = if need <= SLOT { put(&mut self.glue[..need]) } else { 0 };
+                if n > 0 && s.put_cut(c, &self.glue[..n], self.frames_max, self.cut, now) {
+                    self.cut = self.cut.wrapping_add(1);
+                    self.cuts += 1;
+                } else {
+                    self.too_big += 1;
+                }
+            }
             None => self.glue_frame(need, max, now, put),
         }
     }
@@ -348,8 +370,9 @@ mod tests {
 
     /// The QUIC wire's member (spec/trunk.md, `h3dgram`, "How each end
     /// sends"): frames wait in its scheduler and go as one datagram of the
-    /// frames as they are, up to its room; one alone over the room is
-    /// dropped and counted (Chromium would reset the member's stream on it).
+    /// frames as they are, up to its room; one over the room is cut in
+    /// pieces that fit it (Chromium would reset the member's stream on it),
+    /// one that four pieces do not hold is dropped and counted.
     #[test]
     fn a_quic_members_frames_go_unsealed_up_to_its_room() {
         use std::os::fd::AsRawFd;
@@ -364,7 +387,7 @@ mod tests {
             b[..594].fill(2);
             594
         });
-        m.frame(Class::Flow(3), 1195, 1194, 3, |_| unreachable!("a frame over the room is not written"));
+        m.frame(Class::Flow(3), SLOT + 1, 1194, 3, |_| unreachable!("a frame no cut holds is not written"));
         assert_eq!((m.queued(), m.too_big, m.glue_n), (2, 1, 0), "two frames wait, nothing in the glue");
         m.send_now(4);
         assert_eq!((m.queued(), m.dgrams), (0, 1));
@@ -372,6 +395,21 @@ mod tests {
         let n = sys::recv_nowait(theirs.as_raw_fd(), &mut b);
         assert_eq!(n, 1194, "one datagram of both frames, no seal around them");
         assert!(b[..600].iter().all(|&x| x == 1) && b[600..1194].iter().all(|&x| x == 2));
+        m.frame(Class::Flow(3), 1195, 1194, 5, |b| {
+            b[..1195].fill(3);
+            1195
+        });
+        assert_eq!((m.queued(), m.cuts, m.cut), (2, 1, 1), "a frame over the room, in two pieces");
+        m.send_now(6);
+        let mut pieces = Vec::new();
+        for _ in 0..2 {
+            let n = sys::recv_nowait(theirs.as_raw_fd(), &mut b) as usize;
+            match hikkari_trunk::frame::next_frame(&b[..n], 0) {
+                Some((hikkari_trunk::frame::Frame::Frag { id: 0, index, count: 2, len, .. }, end)) if end == n => pieces.push((index, len)),
+                _ => panic!("a datagram of one piece"),
+            }
+        }
+        assert_eq!(pieces, [(0, 598), (1, 597)]);
         let mut d = [9u8; 40];
         assert_eq!(m.open(&mut d), Some((0, 40)), "what comes down is frames as they are");
         let mut h = [0u8; 64];

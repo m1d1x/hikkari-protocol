@@ -7,6 +7,7 @@
 
 use hikkari_sys::{self as sys, BATCH};
 use hikkari_trunk::flow::ECHO_PORT;
+use hikkari_trunk::frag::Reasm;
 use hikkari_trunk::frame::{self, Frame, DGRAM_HEAD, F_PONG, KIND_PACKET, KIND_STREAMS};
 use hikkari_trunk::health::Health;
 
@@ -96,6 +97,7 @@ impl Exit {
                     }
                 }
                 Frame::Dgram { stream, seq, port, off, len } => self.dgram(pi, stream, seq, port, &p[off..off + len], now),
+                Frame::Frag { id, index, count, off, len } => self.piece(pi, id, index, count, &p[off..off + len], now),
                 // A packet member carries no stream's frames (spec/trunk.md,
                 // "Wires": dropped there), and drain and observe go the
                 // other way.
@@ -103,6 +105,28 @@ impl Exit {
             }
             at = next;
         }
+    }
+
+    /// A piece of a frame the entry cut, on peer pi (spec/trunk.md,
+    /// `h3dgram`: a frame over the room): the frame once whole is the one
+    /// dgram it must be; its payload is written to the relay at once, so its
+    /// slot is free again.
+    fn piece(&mut self, pi: usize, id: u16, index: u8, count: u8, p: &[u8], now: u64) {
+        let gen = self.peers[pi].gen;
+        let mut r = self.peers[pi].reasm.take().unwrap_or_else(|| Box::new(Reasm::new()));
+        if let Some(whole) = r.piece(now, id, index, count, p) {
+            match frame::next_frame(whole, 0) {
+                Some((Frame::Dgram { stream, seq, port, off, len }, end)) if end == whole.len() => {
+                    self.dgram(pi, stream, seq, port, &whole[off..off + len], now)
+                }
+                _ => self.t.bad += 1,
+            }
+            r.release();
+        }
+        if self.peers[pi].gen != gen {
+            r.clear();
+        }
+        self.peers[pi].reasm = Some(r);
     }
 
     /// A hello on peer pi: a packet member joins the session it names, made

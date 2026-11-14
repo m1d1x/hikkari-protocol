@@ -12,6 +12,8 @@ pub const F_PING: u8 = 8;
 pub const F_PONG: u8 = 9;
 pub const F_DRAIN: u8 = 10;
 pub const F_OBSERVE: u8 = 11;
+/// A piece of a frame cut for a datagram that does not hold it (frag.rs).
+pub const F_FRAG: u8 = 12;
 
 /// The entry's capabilities, the first byte of the epoch its hello sends
 /// (spec/trunk.md, "Frames": hello; trunk capObserve): it reads observe
@@ -180,6 +182,9 @@ pub enum Frame {
     /// The exit marked a stream or flow of the entry's (OBS_STREAM,
     /// OBS_FLOW) for both ends to report under observation id `token`.
     Observe { kind: u8, stream: u32, token: u64 },
+    /// Piece `index` of `count` of the sender's cut frame `id`, its bytes at
+    /// `off..off + len` (frag.rs).
+    Frag { id: u16, index: u8, count: u8, off: usize, len: usize },
     Other,
 }
 
@@ -235,6 +240,15 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
         F_OBSERVE => {
             let next = fixed(13)?;
             Some((Frame::Observe { kind: p[b], stream: be32(b + 1), token: be64(b + 5) }, next))
+        }
+        F_FRAG => {
+            if rest < 6 {
+                return None;
+            }
+            let n = u16::from_be_bytes([p[b + 4], p[b + 5]]) as usize;
+            let next = fixed(6 + n)?;
+            let id = u16::from_be_bytes([p[b], p[b + 1]]);
+            Some((Frame::Frag { id, index: p[b + 2], count: p[b + 3], off: b + 6, len: n }, next))
         }
         F_DATA => {
             if rest < 14 {

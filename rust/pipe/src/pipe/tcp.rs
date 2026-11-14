@@ -319,7 +319,7 @@ impl Pipe {
                 Frame::Drain => *drains |= 1u32 << sess,
                 // The exit marked a tester's stream or flow (marks.rs).
                 Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
-                Frame::Open { .. } | Frame::Other => {}
+                Frame::Open { .. } | Frame::Frag { .. } | Frame::Other => {}
             }
             at = next;
         }
