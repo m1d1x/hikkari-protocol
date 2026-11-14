@@ -6,7 +6,8 @@
 //! come over it. The exit ends when the brain does.
 //!
 //! Without it (the bench) the flags fix what the brain would decide: one
-//! wire on `--listen` under `--key`, the pool's port of plain TCP stream
+//! wire on `--listen` under `--key` (or the key in `--key-file`, so that it
+//! is in no process table), the pool's port of plain TCP stream
 //! members on `--pool`, the ports in `--ports` (the call's port 0 always),
 //! the glue window, the stall and Quiet. `--h3 ip:port` adds the Chromium
 //! QUIC wire (`h3dgram`, id `--h3-wire-id`) under the same key, with the
@@ -57,6 +58,7 @@ mod linux {
                 "--ctl-fd" => ctl = Some(v.parse().expect("--ctl-fd N")),
                 "--listen" => a.listen = v.parse().expect("--listen ip:port"),
                 "--key" => a.key = v,
+                "--key-file" => a.key = std::fs::read_to_string(&v).expect("--key-file").trim().to_string(),
                 "--wire-id" => a.wire = v.parse().expect("--wire-id"),
                 "--glue-us" => a.glue_ns = v.parse::<u64>().expect("--glue-us") * 1000,
                 "--glue-max" => a.glue_max = v.parse().expect("--glue-max"),
