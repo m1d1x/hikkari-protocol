@@ -31,6 +31,10 @@ const OFF: f64 = 2.0;
 /// The limit grows only while the round trip is within this of the least
 /// seen since it came on (guardProbeRTT).
 const PROBE_RTT_NS: u64 = 50_000_000;
+/// Experiment (exp/guard-rtt-trigger): a stretch of at least ON_PACKETS
+/// whose round trip is this far over the least seen on the connection is
+/// a full queue, as loss is: the limit comes on or follows the path.
+const ON_QUEUE_NS: u64 = 50_000_000;
 /// The least the limit falls to, bytes a second: 1 Mbit/s (guardFloor).
 const FLOOR: f64 = 125_000.0;
 /// How much of the limit may go at once (guardBurst), and at least two
@@ -64,6 +68,8 @@ pub struct Guard {
     /// The time spent limited before the current limit, and when it came on.
     limited_ns: u64,
     since: u64,
+    /// The least round trip seen on the connection, limited or not.
+    least_any_ns: u64,
 }
 
 impl Guard {
@@ -88,7 +94,11 @@ impl Guard {
         let delivered = s.acked_bytes - self.base.acked_bytes;
         let packets = s.sent - self.base.sent;
         let loss = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
-        let lossy = packets >= ON_PACKETS && loss > ON_LOSS;
+        if rtt_ns > 0 && (self.least_any_ns == 0 || rtt_ns < self.least_any_ns) {
+            self.least_any_ns = rtt_ns;
+        }
+        let queued = packets >= ON_PACKETS && rtt_ns > self.least_any_ns + ON_QUEUE_NS;
+        let lossy = packets >= ON_PACKETS && loss > ON_LOSS || queued;
         let delivered = FLOOR.max(SHARE * delivered as f64 / secs);
         if !self.limited && lossy {
             self.limited = true;
