@@ -15,6 +15,7 @@ use std::os::fd::OwnedFd;
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::Behind;
+use hikkari_trunk::observe::StreamObs;
 use hikkari_trunk::stream::{Recv, Send, CHUNK, WINDOW};
 
 use crate::peer::NONE;
@@ -150,6 +151,12 @@ pub struct Stream {
     pub read_done: bool,
     /// The entry's FIN reached the local end.
     pub write_done: bool,
+    /// What it did, for a tester's report (spec/trunk.md, "Observation"),
+    /// and its local connection's port, which the brain knows it by.
+    pub obs: StreamObs,
+    pub local_port: u16,
+    /// The loopback port it reaches (0: the trunk's own download).
+    pub port: u16,
 }
 
 impl Stream {
@@ -168,6 +175,9 @@ impl Stream {
             wire: ANY_WIRE,
             read_done: false,
             write_done: false,
+            obs: StreamObs::default(),
+            local_port: 0,
+            port: 0,
         }
     }
 
@@ -266,13 +276,13 @@ impl Streams {
     }
 
     /// A new stream `id` of session s: its slot.
-    pub fn open(&mut self, s: usize, id: u32) -> usize {
+    pub fn open(&mut self, s: usize, id: u32, now: u64) -> usize {
         let i = self.free.pop().unwrap_or_else(|| {
             self.all.push(Stream::vacant());
             self.all.len() - 1
         });
         let gen = self.all[i].gen.wrapping_add(1);
-        self.all[i] = Stream { live: true, gen, session: s, id, ..Stream::vacant() };
+        self.all[i] = Stream { live: true, gen, session: s, id, obs: StreamObs::new(now), ..Stream::vacant() };
         self.open += 1;
         self.n.opened += 1;
         i
@@ -358,10 +368,10 @@ mod tests {
     #[test]
     fn a_slot_used_again_is_a_new_stream() {
         let mut s = Streams::new();
-        let i = s.open(0, 7);
+        let i = s.open(0, 7, 1);
         let g = s.all[i].gen;
         s.end(i);
-        let j = s.open(0, 8);
+        let j = s.open(0, 8, 2);
         assert_eq!((i, s.open), (j, 1));
         assert!(s.at(i, g).is_none(), "the old stream's readiness finds nothing");
         assert_eq!(s.n.opened, 2);

@@ -229,7 +229,7 @@ impl Pipe {
                     let key = client_key(li, &sa);
                     take_client(flows, wires, swires, *route, &listens[li], li, sa, key, payload, payload.len(), now, moved, *cur);
                 }
-                Some(Msg::Dgram { .. }) | None => {}
+                Some(Msg::Dgram { .. } | Msg::Gen { .. }) | None => {}
             }
         }
     }

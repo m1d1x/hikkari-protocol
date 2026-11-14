@@ -17,15 +17,30 @@ impl Exit {
             let n = rb.recv(self.wires[wi].fd());
             for i in 0..n {
                 let (from, len, slot) = (rb.addr[i], rb.len[i], rb.slot);
-                let h = self.wires[wi].h3().expect("a QUIC wire");
-                match h.recv(from, &mut rb.buf[i * slot..i * slot + len]) {
-                    Some(ci) => self.h3_conn(wi, ci, now),
-                    None => self.t.bad += 1,
+                let d = &mut rb.buf[i * slot..i * slot + len];
+                // A packet of a connection an older generation issued goes
+                // to it (generation.rs).
+                if !self.gens.older.is_empty() {
+                    let g = self.wires[wi].h3().expect("a QUIC wire").owner(d);
+                    if let Some(o) = g.and_then(|g| self.gens.older_of_gen(g)) {
+                        self.gens.forward(o, self.wires[wi].id, &from, d);
+                        continue;
+                    }
                 }
+                self.h3_packet(wi, from, d, now);
             }
             if n < BATCH {
                 break;
             }
+        }
+    }
+
+    /// One packet of the QUIC wire wi, read or handed by the newer
+    /// generation: given to its connection.
+    pub(super) fn h3_packet(&mut self, wi: usize, from: hikkari_sys::sockaddr_in, d: &mut [u8], now: u64) {
+        match self.wires[wi].h3().expect("a QUIC wire").recv(from, d) {
+            Some(ci) => self.h3_conn(wi, ci, now),
+            None => self.t.bad += 1,
         }
     }
 

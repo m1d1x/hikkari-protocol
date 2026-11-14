@@ -58,6 +58,10 @@ impl Exit {
                     break 'streams;
                 }
                 st.send.resent(i, carrier(li, l.gen));
+                st.obs.carried(li);
+                if o.kind == F_DATA {
+                    st.obs.resent += 1;
+                }
                 l.owe(o.len as usize, now);
             }
             sess.stranded.pop_first();
@@ -94,6 +98,7 @@ impl Exit {
             let st = &mut streams.all[slot];
             if st.send.strand(c) {
                 sess.stranded.insert(st.id);
+                st.obs.deaths += 1;
                 hit += 1;
             }
         }

@@ -1,11 +1,13 @@
 package pipectl
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"sync"
 	"syscall"
@@ -20,6 +22,13 @@ type ExitConfig struct {
 	Args   []string // its other flags (--tick-us, --flow-idle-ms)
 	Stderr io.Writer
 	Logf   func(format string, a ...any)
+	// Local hears of each connection the exit opens to its relay and closes
+	// (Mark names the stream or flow behind one); Observe gets the exit's
+	// reports of the testers' streams and flows the brain marked, their Tag
+	// the one Mark was given. Both are called on the brain's reading
+	// goroutine: neither may block.
+	Local   func(ExitLocal)
+	Observe func(trunk.Report)
 }
 
 // ExitWire is a wire the exit's pipe serves, as the brain configures it.
@@ -58,12 +67,26 @@ type Exit struct {
 
 	mu     sync.Mutex
 	pid    int
-	wires  map[trunk.WireID]*net.UDPConn
-	pool   *net.TCPListener
+	wires  map[trunk.WireID]ExitWire
+	pool   *exitPool
+	ports  []uint16
 	tick   ExitTick
 	tickAt time.Time
 
 	hello chan struct{}
+	// tags are what the streams and flows the brain marked were marked
+	// with, by observation id, until their end is reported.
+	tags map[uint64]string
+	// drained is closed once the exit, draining, says it carries nothing
+	// more.
+	drained     chan struct{}
+	drainedOnce sync.Once
+}
+
+// exitPool is the pool's port as the brain gave it.
+type exitPool struct {
+	l            *net.TCPListener
+	stall, quiet time.Duration
 }
 
 // StartExit runs the exit's pipe under this brain, as Start runs the
@@ -76,7 +99,8 @@ func StartExit(cfg ExitConfig) (*Exit, error) {
 	if err != nil {
 		return nil, err
 	}
-	x := &Exit{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*net.UDPConn{}, hello: make(chan struct{})}
+	x := &Exit{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]ExitWire{}, hello: make(chan struct{}), drained: make(chan struct{}),
+		tags: map[uint64]string{}}
 	go func() {
 		x.err = cmd.Wait()
 		close(x.done)
@@ -128,14 +152,15 @@ func (x *Exit) SetWire(w ExitWire) error {
 		return err
 	}
 	x.mu.Lock()
-	x.wires[w.ID] = w.Conn
+	x.wires[w.ID] = w
 	x.mu.Unlock()
 	return nil
 }
 
 // SetPool gives the exit the pool's port: stream members (plain TCP here;
 // Chromium's TLS under them is R2) connect to l, bound by the brain, which
-// keeps it. Their stall and the session's Quiet as in ExitWire
+// keeps it; with l nil the exit listens on nothing and its members come by
+// Link. Their stall and the session's Quiet as in ExitWire
 // (trunk.DefaultStall, trunk.ExitQuiet when 0). Given once.
 func (x *Exit) SetPool(l *net.TCPListener, stall, quiet time.Duration) error {
 	if stall == 0 {
@@ -144,11 +169,17 @@ func (x *Exit) SetPool(l *net.TCPListener, stall, quiet time.Duration) error {
 	if quiet == 0 {
 		quiet = trunk.ExitQuiet
 	}
-	if err := x.send(putExitPool(stall, quiet), l); err != nil {
+	var err error
+	if l != nil {
+		err = x.send(putExitPool(stall, quiet), l)
+	} else {
+		err = x.send(putExitPool(stall, quiet))
+	}
+	if err != nil {
 		return err
 	}
 	x.mu.Lock()
-	x.pool = l
+	x.pool = &exitPool{l: l, stall: stall, quiet: quiet}
 	x.mu.Unlock()
 	return nil
 }
@@ -156,7 +187,15 @@ func (x *Exit) SetPool(l *net.TCPListener, stall, quiet time.Duration) error {
 // SetPorts says which loopback ports are open to the trunk (trunk
 // Local.DialFlow and DialStream refuse the others); the set replaces the one
 // before. The trunk's call and download, port 0, are always answered.
-func (x *Exit) SetPorts(ports []uint16) error { return x.send(putExitPorts(ports)) }
+func (x *Exit) SetPorts(ports []uint16) error {
+	if err := x.send(putExitPorts(ports)); err != nil {
+		return err
+	}
+	x.mu.Lock()
+	x.ports = append([]uint16(nil), ports...)
+	x.mu.Unlock()
+	return nil
+}
 
 // Tick is the latest tick and when it came.
 func (x *Exit) Tick() (ExitTick, time.Time) {
@@ -177,13 +216,28 @@ func (x *Exit) Close() error {
 	<-x.done
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	for _, c := range x.wires {
-		c.Close()
+	for _, w := range x.wires {
+		w.Conn.Close()
 	}
-	if x.pool != nil {
-		x.pool.Close()
+	if x.pool != nil && x.pool.l != nil {
+		x.pool.l.Close()
 	}
 	return nil
+}
+
+// Link gives the exit a stream member's connected socket, as if accepted on
+// the pool's port: the relay's brain takes a member's CONNECT itself and
+// hands its own end of a socket pair over (edge trunk_pipe.go). It needs
+// SetPool first, with or without a listening socket. The exit has its own
+// descriptor: the caller closes c's.
+func (x *Exit) Link(c *os.File) error {
+	x.mu.Lock()
+	pool := x.pool
+	x.mu.Unlock()
+	if pool == nil {
+		return errors.New("pipectl: a member before the pool: SetPool first")
+	}
+	return x.send([]byte{xLink}, c)
 }
 
 func (x *Exit) read() {
@@ -225,10 +279,80 @@ func (x *Exit) read() {
 			x.mu.Lock()
 			x.tick, x.tickAt = t, time.Now()
 			x.mu.Unlock()
+		case xpLocal:
+			l, err := parseExitLocal(m)
+			if err != nil {
+				x.cfg.Logf("%v", err)
+				continue
+			}
+			if x.cfg.Local != nil {
+				x.cfg.Local(l)
+			}
+		case xpObserved:
+			o, err := parseObserved(m)
+			if err != nil {
+				x.cfg.Logf("%v", err)
+				continue
+			}
+			r := o.Report
+			x.mu.Lock()
+			r.Tag = x.tags[r.ID]
+			if r.Phase == trunk.PhaseEnd {
+				delete(x.tags, r.ID)
+			}
+			x.mu.Unlock()
+			if x.cfg.Observe != nil {
+				x.cfg.Observe(r)
+			}
+		case xpDrained:
+			x.cfg.Logf("pipectl: the exit drained")
+			x.drainedOnce.Do(func() { close(x.drained) })
 		case xpError:
 			x.cfg.Logf("pipectl: the exit: %s", m[1:])
 		default:
 			x.cfg.Logf("pipectl: a message from the exit the brain does not know: type %#x", m[0])
+		}
+	}
+}
+
+// Mark marks the stream or flow `stream` of the session for both ends to
+// report (spec/trunk.md, "Observation"; trunk Session.Observe): the relay
+// admitted a tester's key on its connection, whose local port the exit told
+// Local. The brain draws the observation's id; tag goes into the exit's
+// reports of it (Observe), never across the trunk. A stream or flow already
+// ended or marked is not marked again: the exit reports nothing for it.
+func (x *Exit) Mark(kind trunk.ObsKind, session trunk.SessionID, stream uint32, tag string) (uint64, error) {
+	id := obsID()
+	x.mu.Lock()
+	// A mark that reached the exit after its stream ended is never
+	// reported, and its tag never asked for: past maxTags one is forgotten.
+	if len(x.tags) >= maxTags {
+		for k := range x.tags {
+			delete(x.tags, k)
+			break
+		}
+	}
+	x.tags[id] = tag
+	x.mu.Unlock()
+	if err := x.send(putExitMark(kind, session, stream, id)); err != nil {
+		x.mu.Lock()
+		delete(x.tags, id)
+		x.mu.Unlock()
+		return 0, err
+	}
+	return id, nil
+}
+
+// maxTags bounds the marks waiting for their end.
+const maxTags = 4096
+
+// obsID is a random observation id, never 0 (trunk newObsID).
+func obsID() uint64 {
+	var b [8]byte
+	for {
+		_, _ = rand.Read(b[:])
+		if id := binary.LittleEndian.Uint64(b[:]); id != 0 {
+			return id
 		}
 	}
 }

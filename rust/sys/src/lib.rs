@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 mod tcp;
 mod wake;
 pub use wake::Wake;
-pub use tcp::{accept, connected, into_raw, member_connect, read, shutdown_both, shutdown_write, tcp_connect, tcp_from_fd, tcp_info, tcp_listen, write, Io, TcpInfo};
+pub use tcp::{accept, connected, into_raw, member_connect, read, shutdown_both, shutdown_write, stream_from_fd, tcp_connect, tcp_from_fd, tcp_info, tcp_listen, write, Io, TcpInfo};
 
 /// An IPv4 address as the kernel keeps it: what a batch reads a datagram
 /// from and sends an answer to.
@@ -299,6 +299,17 @@ pub(crate) fn inet4(fd: i32) -> bool {
     // Safe: sa is a sockaddr_storage the kernel fills up to len.
     let rc = unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) };
     rc == 0 && sa.ss_family as i32 == libc::AF_INET
+}
+
+/// The port an IPv4 socket is bound to (getsockname); None for a socket
+/// that is no IPv4 one or not bound.
+pub fn local_port(fd: i32) -> Option<u16> {
+    let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // Safe: sa is a sockaddr_in the kernel fills up to len; a wider address
+    // comes torn, and its family says it is no IPv4 one.
+    let rc = unsafe { libc::getsockname(fd, &mut sa as *mut _ as *mut libc::sockaddr, &mut len) };
+    (rc == 0 && sa.sin_family as i32 == libc::AF_INET && sa.sin_port != 0).then(|| u16::from_be(sa.sin_port))
 }
 
 pub(crate) fn not_inet4() -> io::Error {

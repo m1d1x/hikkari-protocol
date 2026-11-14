@@ -32,6 +32,8 @@ pub struct Session {
     /// The members of each wire, by wire id: what an answer of a flow
     /// whose own members are gone goes on (flow::Flow::carriers).
     pub by_wire: Vec<(u8, Vec<Seen>)>,
+    /// Its entry reads observe frames (its hello said frame::CAP_OBSERVE).
+    pub observe: bool,
     /// Since when it has had no member (0 while it has one).
     pub empty_since: u64,
     pub flows: HashMap<u32, usize>,
@@ -59,6 +61,7 @@ impl Session {
             members: Vec::new(),
             links: Vec::new(),
             by_wire: Vec::new(),
+            observe: false,
             empty_since: 0,
             flows: HashMap::with_capacity(256),
             streams: HashMap::new(),
@@ -149,6 +152,11 @@ impl Sessions {
         self.all[s].empty_since = now;
         self.by_id.insert(id, s);
         s
+    }
+
+    /// The session of `id`, if there is one.
+    pub fn find(&self, id: &[u8; 16]) -> Option<usize> {
+        self.by_id.get(id).copied()
     }
 
     /// Ends session s: the caller has ended its flows.

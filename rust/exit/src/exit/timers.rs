@@ -7,6 +7,7 @@
 
 use hikkari_trunk::frame::{self, F_PING};
 use hikkari_trunk::health::Verdict;
+use hikkari_trunk::observe::{END_IDLE, END_SESSION};
 
 use super::Exit;
 use crate::peer::Class;
@@ -46,6 +47,7 @@ impl Exit {
         }
         if now >= self.tick_at {
             self.sweep(now);
+            self.check_drained();
             self.send_tick(now);
             self.tick_at = if self.tick_at + TICK_EVERY > now { self.tick_at + TICK_EVERY } else { now + TICK_EVERY };
         }
@@ -101,7 +103,7 @@ impl Exit {
         }
         for fi in 0..self.flows.all.len() {
             let f = &self.flows.all[fi];
-            if f.live && now.saturating_sub(f.used) > self.flow_idle_ns && self.end_flow(fi) {
+            if f.live && now.saturating_sub(f.used) > self.flow_idle_ns && self.end_flow(fi, END_IDLE, now) {
                 self.t.flows_idle += 1;
             }
         }
@@ -118,11 +120,12 @@ impl Exit {
             let flows: Vec<usize> = x.flows.values().copied().collect();
             let streams: Vec<usize> = x.streams.values().copied().collect();
             for fi in flows {
-                self.end_flow(fi);
+                self.end_flow(fi, END_SESSION, now);
             }
             // No member is left to tell: the streams end without a reset
             // (trunk Session.Close).
             for slot in streams {
+                self.stream_ended(slot, END_SESSION, now);
                 if let Some(fd) = self.streams.all[slot].local.as_ref().and_then(|l| l.fd()) {
                     self.tcp.del(std::os::fd::AsRawFd::as_raw_fd(fd));
                 }

@@ -10,14 +10,25 @@ use hikkari_trunk::flow::ECHO_PORT;
 use hikkari_trunk::frag::Reasm;
 use hikkari_trunk::frame::{self, Frame, DGRAM_HEAD, F_PONG, KIND_PACKET, KIND_STREAMS};
 use hikkari_trunk::health::Health;
+use hikkari_trunk::observe::END_LOCAL;
 
 use super::Exit;
+use crate::flow::{link_slot, Seen, LINK_SEEN};
 use crate::peer::{Class, Form};
+
+/// A peer's key among the exit's: its wire's index and its address.
+#[inline]
+pub(super) fn peer_key(wi: usize, from: &sys::sockaddr_in) -> u64 {
+    sys::addr_key(from) | (wi as u64) << 48
+}
 
 impl Exit {
     /// Everything each readable wire has, batch by batch.
     pub(super) fn read_wires(&mut self, now: u64) {
-        let first = self.ctl.is_some() as usize;
+        if !self.reads_wires() {
+            return;
+        }
+        let first = self.wires_at;
         let mut rb = self.wrecv.take().expect("the wire's batch");
         for wi in 0..self.wires.len() {
             if !self.poll.readable(first + wi) {
@@ -42,9 +53,14 @@ impl Exit {
     }
 
     /// One sealed datagram from `from` on wire wi: opened in place, its
-    /// frames handled in order.
-    fn datagram(&mut self, wi: usize, from: sys::sockaddr_in, d: &mut [u8], now: u64) {
-        let at = sys::addr_key(&from) | (wi as u64) << 48;
+    /// frames handled in order; one of an address an older generation
+    /// keeps goes to it (generation.rs).
+    pub(super) fn datagram(&mut self, wi: usize, from: sys::sockaddr_in, d: &mut [u8], now: u64) {
+        if let Some(o) = self.gens.owner_of(self.wires[wi].id, &from) {
+            self.gens.forward(o, self.wires[wi].id, &from, d);
+            return;
+        }
+        let at = peer_key(wi, &from);
         let (pi, n) = match self.peer_of(at) {
             Some(pi) => match self.peers[pi].seal.open(d) {
                 Some(n) => (pi, n),
@@ -142,7 +158,7 @@ impl Exit {
         if flags & KIND_PACKET == 0 || flags & KIND_STREAMS != 0 {
             return;
         }
-        let Exit { wires, peers, sessions, t, pause, moved, .. } = self;
+        let Exit { wires, peers, sessions, t, pause, moved, gens, .. } = self;
         let peer = &mut peers[pi];
         if !peer.joined() {
             let s = sessions.of(h.session, wires[peer.wire].quiet_ns, now);
@@ -156,6 +172,10 @@ impl Exit {
             sess.join((pi, peer.gen), wire_id);
             t.members += 1;
             t.joined += 1;
+            sess.observe |= h.epoch[0] & frame::CAP_OBSERVE != 0;
+            if gens.told {
+                wires[peer.wire].glue(peer, Class::Own, 1, now, frame::put_drain);
+            }
         }
         let sess = &sessions.all[peer.session];
         let (id, epoch, kind) = (sess.id, sess.epoch, Some((peer.wire_id, peer.flags)));
@@ -173,6 +193,13 @@ impl Exit {
             return;
         }
         let (s, m, wire_id) = (p.session, (pi, p.gen), p.wire_id);
+        self.flow_dgram(s, m, wire_id, stream, seq, port, payload, now);
+    }
+
+    /// A datagram of flow `stream` of session s that came on member m (a
+    /// peer, or a stream member: LINK_SEEN) of wire `wire_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn flow_dgram(&mut self, s: usize, m: Seen, wire_id: u8, stream: u32, seq: u32, port: u16, payload: &[u8], now: u64) {
         let fi = match self.sessions.all[s].flows.get(&stream) {
             Some(&fi) => fi,
             None => {
@@ -182,7 +209,7 @@ impl Exit {
                 }
                 let fi = self.flows.open(&mut self.sessions.all[s].flows, s, stream, port, now);
                 if port != ECHO_PORT && self.relay_open(fi).is_err() {
-                    self.end_flow(fi);
+                    self.end_flow(fi, END_LOCAL, now);
                     self.t.refused += 1;
                     return;
                 }
@@ -193,6 +220,7 @@ impl Exit {
         if f.arrived(m, wire_id, seq) {
             if !f.echo() {
                 self.t.dgrams_copy += 1;
+                f.obs.copies += 1;
             }
             return;
         }
@@ -202,24 +230,55 @@ impl Exit {
             return;
         }
         self.t.dgrams_in += 1;
-        if !sys::send_nowait(f.fd, payload) {
+        if sys::send_nowait(f.fd, payload) {
+            f.obs.delivered += 1;
+        } else {
             self.t.refused += 1;
         }
     }
 
     /// One answer of flow fi down to the entry: the flow's next seq, glued
-    /// for the members that carry it (flow::Flow::carriers).
+    /// for the members that carry it (flow::Flow::carriers). A flow that
+    /// came on the pool's members, or whose session has no packet member up,
+    /// is answered on its stream members (trunk dgramLocked: the Go exit
+    /// answers a datagram on whatever member it has).
     pub(super) fn answer(&mut self, fi: usize, payload: &[u8], now: u64) {
-        let Exit { flows, sessions, peers, wires, carriers, .. } = self;
+        let Exit { flows, sessions, peers, wires, carriers, links, .. } = self;
         let f = &mut flows.all[fi];
         f.seq = f.seq.wrapping_add(1);
+        f.obs.out += 1;
         let (stream, seq, port, s) = (f.stream, f.seq, f.port, f.session);
         let sess = &sessions.all[s];
-        let up = |m: (usize, u32)| peers.get(m.0).is_some_and(|p| p.live && p.gen == m.1 && p.session == s);
-        let n = f.carriers(up, sess.of_wire(f.wire), &sess.members, carriers);
-        for &(pi, _) in &carriers[..n] {
-            let p = &mut peers[pi];
-            wires[p.wire].glue(p, Class::Flow(stream), DGRAM_HEAD + payload.len(), now, |b| frame::put_dgram(b, stream, seq, port, payload));
+        let link_up = |li: usize, gen: u32| links.all.get(li).is_some_and(|l| l.live && l.gen as u32 == gen && l.session == s && l.h.up);
+        let up = |m: Seen| match link_slot(m) {
+            Some(li) => link_up(li, m.1),
+            None => peers.get(m.0).is_some_and(|p| p.live && p.gen == m.1 && p.session == s),
+        };
+        let mut n = f.carriers(up, sess.of_wire(f.wire), &sess.members, carriers);
+        let want = (f.copies as usize).clamp(1, 2);
+        for &(li, _) in &sess.links {
+            if n >= want {
+                break;
+            }
+            let m = (li | LINK_SEEN, links.all[li].gen as u32);
+            if link_up(li, m.1) && !carriers[..n].contains(&m) {
+                carriers[n] = m;
+                n += 1;
+            }
+        }
+        let len = DGRAM_HEAD + payload.len();
+        for &m in &carriers[..n] {
+            match link_slot(m) {
+                // A member whose buffer is full takes no writes and dies by
+                // its stall: the answer is lost, as on a full socket.
+                Some(li) => {
+                    let _ = links.all[li].out.frame(len, |b| frame::put_dgram(b, stream, seq, port, payload));
+                }
+                None => {
+                    let p = &mut peers[m.0];
+                    wires[p.wire].glue(p, Class::Flow(stream), len, now, |b| frame::put_dgram(b, stream, seq, port, payload));
+                }
+            }
         }
     }
 }

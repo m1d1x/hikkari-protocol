@@ -12,7 +12,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 
 use hikkari_sys as sys;
-use hikkari_trunk::frame::{self, ACK_FIN, ACK_LEN, NO_GOT};
+use hikkari_trunk::frame::{self, ACK_FIN, ACK_LEN, NO_GOT, OBS_STREAM};
+use hikkari_trunk::observe::{END_FIN, END_LOCAL, END_PEER};
 use hikkari_trunk::stream::{CHUNK, NO_CARRIER};
 
 use super::tcp::{pick, tag, TAG_STREAM};
@@ -66,9 +67,10 @@ impl Exit {
             self.links.all[li].out.frame(5, |b| frame::put_rst(b, id));
             return;
         }
-        let slot = self.streams.open(s, id);
+        let slot = self.streams.open(s, id, now);
         sess.streams.insert(id, slot);
         self.streams.all[slot].wire = wire;
+        self.streams.all[slot].port = port;
         if let Some(e) = sess.early.remove(&id) {
             sess.early_bytes -= e.bytes;
             for f in e.frames {
@@ -98,7 +100,11 @@ impl Exit {
         }
         match sys::tcp_connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)) {
             Ok(fd) if self.tcp.add_io(fd.as_raw_fd(), tag(TAG_STREAM, slot, gen)).is_ok() => {
-                self.streams.all[slot].local = Some(Local::Tcp { fd, up: false });
+                let local = sys::local_port(fd.as_raw_fd()).unwrap_or(0);
+                let st = &mut self.streams.all[slot];
+                st.local = Some(Local::Tcp { fd, up: false });
+                st.local_port = local;
+                self.tell_local(true, OBS_STREAM, local, s, id);
             }
             _ => {
                 self.t.refused_streams += 1;
@@ -134,6 +140,7 @@ impl Exit {
             st.can_read = true;
         }
         self.streams.n.down += wrote as u64;
+        st.obs.down += wrote as u64;
         st.recv.wrote(wrote);
         ack_on(&mut self.links.all[li].out, st, got);
         if gone {
@@ -177,7 +184,11 @@ impl Exit {
         let Some(&slot) = self.sessions.all[s].streams.get(&id) else { return };
         let Exit { streams, released, .. } = self;
         let st = &mut streams.all[slot];
-        st.send.acked(received, credit, flags, got, |o| released.push((o.carrier, o.len)));
+        let obs = &mut st.obs;
+        st.send.acked(received, credit, flags, got, |o| {
+            released.push((o.carrier, o.len));
+            obs.waited(now.saturating_sub(o.at));
+        });
         self.confirm(now);
         self.resend(s, now);
         if self.streams.all[slot].finished() {
@@ -230,8 +241,15 @@ impl Exit {
     /// remembered (trunk endStreamLocked).
     pub(super) fn end_doomed(&mut self, now: u64) {
         while let Some((slot, gen, why)) = self.doomed.pop() {
+            let Some(st) = self.streams.all.get(slot).filter(|st| st.live && st.gen == gen) else { continue };
+            let end = match (st.finished(), why) {
+                (true, _) | (_, Why::Done) => END_FIN,
+                (false, Why::Peer) => END_PEER,
+                (false, Why::Local) => END_LOCAL,
+            };
+            self.stream_ended(slot, end, now);
             let Exit { streams, sessions, links, .. } = self;
-            let Some(st) = streams.all.get_mut(slot).filter(|st| st.live && st.gen == gen) else { continue };
+            let st = &mut streams.all[slot];
             let sess = &mut sessions.all[st.session];
             match (st.finished(), why) {
                 (true, _) | (_, Why::Done) => streams.n.fin += 1,
@@ -298,6 +316,9 @@ impl Exit {
                     l.out.chunk_done(st.id, off, k);
                     l.owe(k, now);
                     streams.n.up += k as u64;
+                    st.obs.up += k as u64;
+                    st.obs.chunks += 1;
+                    st.obs.carried(li);
                     *moved += 1;
                 }
                 Read::Again => {
@@ -313,6 +334,7 @@ impl Exit {
                         break;
                     }
                     st.send.fin(carrier(li, l.gen), now);
+                    st.obs.carried(li);
                     l.owe(0, now);
                     st.read_done = true;
                     *moved += 1;
@@ -340,6 +362,7 @@ impl Exit {
             };
             if k > 0 {
                 streams.n.down += k as u64;
+                st.obs.down += k as u64;
                 *moved += 1;
                 if st.recv.wrote(k) {
                     if let Some(li) = pick(links, &sessions.all[st.session].links, st.wire, false) {

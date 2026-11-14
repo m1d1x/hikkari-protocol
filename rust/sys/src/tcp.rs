@@ -136,6 +136,30 @@ pub fn tcp_from_fd(fd: i32) -> io::Result<OwnedFd> {
     Ok(owned)
 }
 
+/// A connected stream socket from a descriptor the brain passed (a member
+/// the relay took the CONNECT of: its end of a socket pair, or a TCP
+/// connection), non-blocking. One that is no stream socket is refused.
+pub fn stream_from_fd(fd: i32) -> io::Result<OwnedFd> {
+    if fd < 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut ty: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // Safe: ty is a c_int the kernel fills up to len.
+    if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, &mut ty as *mut _ as *mut _, &mut len) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if ty != libc::SOCK_STREAM {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a stream socket"));
+    }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
+}
+
 /// A pool member's TCP connection to addr from local port `from` (0: the
 /// kernel's choice), begun and not waited for: Nagle off and the keepalive
 /// of Go's net.Dialer (15 s idle, 15 s apart, 9 probes), as the Go entry's

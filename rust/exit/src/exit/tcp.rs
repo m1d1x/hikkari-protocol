@@ -17,6 +17,7 @@ use hikkari_trunk::health::{Health, Verdict};
 
 use super::stream::{ack_on, Why};
 use super::Exit;
+use crate::flow::LINK_SEEN;
 use crate::link::Links;
 use crate::streams::{Local, ANY_WIRE};
 
@@ -39,10 +40,11 @@ pub(super) fn tag(kind: u64, slot: usize, gen: u32) -> u64 {
     kind | (slot as u64) << 32 | gen as u64
 }
 
-/// The pool's port: the listening socket stream members connect to, their
-/// stall and the session's Quiet.
+/// The pool's port: the listening socket stream members connect to (None:
+/// the brain accepts them and hands each over, Exit::link), their stall and
+/// the session's Quiet.
 pub struct Pool {
-    pub fd: OwnedFd,
+    pub fd: Option<OwnedFd>,
     pub stall_ns: u64,
     pub quiet_ns: u64,
 }
@@ -69,9 +71,33 @@ pub(super) fn pick(links: &Links, of: &[(usize, u8)], wire: u8, chunk: bool) -> 
 impl Exit {
     /// The pool's port, its listening socket watched with the stream sockets.
     pub(super) fn set_pool(&mut self, p: Pool) -> std::io::Result<()> {
-        self.tcp.add_io(p.fd.as_raw_fd(), TAG_POOL)?;
+        if let Some(fd) = &p.fd {
+            self.tcp.add_io(fd.as_raw_fd(), TAG_POOL)?;
+        }
         self.pool = Some(p);
         Ok(())
+    }
+
+    /// A stream member the brain accepted (B_LINK): taken as one accepted on
+    /// the pool's port. An exit that drains takes it too and says drain on
+    /// it once its hello names a session (spec/trunk.md, "An exit's own
+    /// process replaced").
+    pub(super) fn link(&mut self, fd: OwnedFd, now: u64) -> Result<(), String> {
+        if self.pool.is_none() {
+            return Err("exit: a member before the pool".into());
+        }
+        self.take_link(fd, now);
+        Ok(())
+    }
+
+    fn take_link(&mut self, fd: OwnedFd, now: u64) {
+        let raw = fd.as_raw_fd();
+        let Some(i) = self.links.take(fd, now) else { return };
+        if self.tcp.add_io(raw, tag(TAG_LINK, i, self.links.all[i].gen as u32)).is_err() {
+            self.links.close(i);
+            return;
+        }
+        self.moved += 1;
     }
 
     /// What the stream sockets' epoll says, kept on each socket.
@@ -111,16 +137,9 @@ impl Exit {
     /// New connections on the pool's port: each a member once its hello
     /// comes (trunk Exit.ServeMember).
     fn accept_links(&mut self, now: u64) {
-        let Some(pool) = &self.pool else { return };
-        let lfd = pool.fd.as_raw_fd();
+        let Some(lfd) = self.pool.as_ref().and_then(|p| p.fd.as_ref()).map(|fd| fd.as_raw_fd()) else { return };
         while let Some(fd) = sys::accept(lfd) {
-            let raw = fd.as_raw_fd();
-            let Some(i) = self.links.take(fd, now) else { continue };
-            if self.tcp.add_io(raw, tag(TAG_LINK, i, self.links.all[i].gen as u32)).is_err() {
-                self.links.close(i);
-                continue;
-            }
-            self.moved += 1;
+            self.take_link(fd, now);
         }
     }
 
@@ -197,9 +216,14 @@ impl Exit {
                         self.doom(slot, Why::Peer);
                     }
                 }
-                // Datagrams ride the packet wires (the Rust entry sends them
-                // there); a pool member's are R2's.
-                Frame::Dgram { .. } => self.t.link_dgrams += 1,
+                // A datagram on a pool member: the entry's packet wires are
+                // down or it has none (the pool is UDP's fallback, R2.3).
+                Frame::Dgram { stream, seq, port, off, len } => {
+                    self.t.link_dgrams += 1;
+                    let l = &self.links.all[li];
+                    let (s, m, wire) = (l.session, (li | LINK_SEEN, l.gen as u32), l.wire);
+                    self.flow_dgram(s, m, wire, stream, seq, port, &inb[off..off + len], now);
+                }
                 Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Other => {}
             }
             at = next;
@@ -241,10 +265,14 @@ impl Exit {
         l.h = Health::new(false);
         l.h.join(now);
         sess.link_join(li, wire);
+        sess.observe |= h.epoch[0] & frame::CAP_OBSERVE != 0;
         t.links += 1;
         t.joined += 1;
         let (id, epoch) = (sess.id, sess.epoch);
         l.out.frame(31, |b| frame::put_hello(b, &id, &epoch, t2.map(|f| (wire, f))));
+        if self.gens.told {
+            l.out.frame(1, frame::put_drain);
+        }
         for &slot in sess.streams.values() {
             ack_on(&mut l.out, &mut streams.all[slot], NO_GOT);
         }

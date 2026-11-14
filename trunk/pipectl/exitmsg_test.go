@@ -5,6 +5,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/m1d1x/hikkari-protocol/trunk"
 )
 
 // The same bytes as rust/exit/src/ctl.rs WIRE_GOLDEN, TICK_GOLDEN and
@@ -77,5 +79,48 @@ func TestExitGolden(t *testing.T) {
 	}
 	if _, err := parseExitTick(m[:len(m)-1]); err == nil {
 		t.Fatal("a torn exit tick read")
+	}
+}
+
+// The same bytes as rust/exit/src/ctl.rs OBSERVED_GOLDEN, LOCAL_GOLDEN and
+// MARK_GOLDEN.
+const (
+	exitObservedGolden = "8888776655443322110100bb01dc050000000400000000000000080000000000000300000000000000010000000000000002010000002800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	exitLocalGolden    = "870102419c000102030405060708090a0b0c0d0e0f07000000"
+	exitMarkGolden     = "0f01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa090000000807060504030201"
+)
+
+func TestExitObservationGolden(t *testing.T) {
+	m, _ := hex.DecodeString(exitObservedGolden)
+	o, err := parseObserved(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := trunk.Report{ID: 0x1122334455667788, Kind: trunk.ObsStream, Phase: trunk.PhaseMark, Port: 443, Age: 1500 * time.Millisecond,
+		Up: 1024, Down: 2048, Chunks: 3, Resent: 1, Carriers: 2, Deaths: 1, MaxWait: 40 * time.Millisecond}
+	if !reflect.DeepEqual(o.Report, want) || o.HaveTCP {
+		t.Fatalf("the exit's observed %+v (tcp %v), want %+v", o.Report, o.HaveTCP, want)
+	}
+	m, _ = hex.DecodeString(exitLocalGolden)
+	l, err := parseExitLocal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sid trunk.SessionID
+	for i := range sid {
+		sid[i] = byte(i)
+	}
+	if l != (ExitLocal{Open: true, Kind: trunk.ObsFlow, Port: 40001, Session: sid, Stream: 7}) {
+		t.Fatalf("the exit's local %+v", l)
+	}
+	if _, err := parseExitLocal(m[:len(m)-1]); err == nil {
+		t.Fatal("a torn local read")
+	}
+	var aa trunk.SessionID
+	for i := range aa {
+		aa[i] = 0xaa
+	}
+	if got := hex.EncodeToString(putExitMark(trunk.ObsStream, aa, 9, 0x0102030405060708)); got != exitMarkGolden {
+		t.Fatalf("exit mark %s, want %s", got, exitMarkGolden)
 	}
 }

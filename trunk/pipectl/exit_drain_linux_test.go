@@ -227,8 +227,10 @@ func TestTheBrainsCallMovesToTheNewSession(t *testing.T) {
 	var got atomic.Int64
 	var last atomic.Int64
 	var gap atomic.Int64
+	// The monotonic clock: the wall clock steps (brainCall).
+	start := time.Now()
 	f := p.OpenCallFlow(trunk.FlowOptions{Class: trunk.ClassVoice, Copies: 1, Pin: dgramWire}, func(b []byte) {
-		now := time.Now().UnixNano()
+		now := int64(time.Since(start))
 		if l := last.Swap(now); l != 0 && now-l > gap.Load() {
 			gap.Store(now - l)
 		}

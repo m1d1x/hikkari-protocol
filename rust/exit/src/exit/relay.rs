@@ -8,6 +8,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 
 use hikkari_sys as sys;
+use hikkari_trunk::frame::OBS_FLOW;
+use hikkari_trunk::observe::END_LOCAL;
 
 use super::Exit;
 
@@ -24,12 +26,19 @@ impl Exit {
         self.relays.add(fd, fi as u64 | (f.gen as u64) << 32)?;
         f.fd = fd;
         f.sock = Some(sock);
+        f.local_port = sys::local_port(fd).unwrap_or(0);
+        let (port, s, stream) = (f.local_port, f.session, f.stream);
+        self.tell_local(true, OBS_FLOW, port, s, stream);
         Ok(())
     }
 
-    /// Ends flow fi: off the poll, out of its session, its socket closed.
-    /// Whether it was a client's.
-    pub(super) fn end_flow(&mut self, fi: usize) -> bool {
+    /// Ends flow fi: off the poll, out of its session, its socket closed,
+    /// its end reported if it was a tester's (observe::END_*). Whether it
+    /// was a client's.
+    pub(super) fn end_flow(&mut self, fi: usize, end: u8, now: u64) -> bool {
+        if self.flows.all[fi].live {
+            self.flow_ended(fi, end, now);
+        }
         let f = &self.flows.all[fi];
         if f.fd >= 0 {
             self.relays.del(f.fd);
@@ -59,7 +68,7 @@ impl Exit {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        self.end_flow(fi);
+                        self.end_flow(fi, END_LOCAL, now);
                         break;
                     }
                 }

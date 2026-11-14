@@ -69,6 +69,24 @@ was handed for a flow it no longer has goes back to the new one with it, which o
 process that accepted it. An old process that carries nothing more says so and leaves, at the latest after 30 minutes; one
 that is gone gives every address it held to the new one.
 
+An exit's own process replaced (the Rust exit's `drain` and `adopt`, R6.4; the relay's generations, edge `handoff.go`)
+cuts nothing either, and is what sends the drain above. Every process of the exit holds the same sockets: each packet
+wire's UDP socket and the pool's port. The old process sends drain on every member of every session it holds, and on
+any member that joins it later; it stops reading the shared UDP sockets and stops accepting on the pool's port, and
+first tells the new one every entry address its members of the bare UDP wire come from (an address it holds is its
+own from the first datagram that opened, before the hello is answered). The new one reads no packet wire before every
+older process said that list is whole. From then on a datagram of the bare UDP wire from an address an older process
+holds, and a QUIC packet of the `h3dgram` wire whose destination connection id an older process issued, the new one
+hands to that process, which takes it as one it read and answers out of the shared socket. Every connection id an exit
+process issues names its generation, as the relay's do (the first byte is the second's XOR the generation, so the
+first byte on the wire is as random as the rest); a packet of a connection id that is no exit's, or of the newest
+generation, is the newest process's. A stream member stays with the process that accepted it. The old process lets an
+address go when it forgets its member (dead, or silent past PeerIdle); a datagram it was handed for an address it no
+longer holds goes back to the new one with it, which takes it as its own (a hello there makes a member of the new
+process). The old process says when it carries nothing more (no client's flow, no stream; the trunk's call is no
+client's); the one that started it closes it then, or after 30 minutes. One that is gone leaves every address it held
+to the new one: a member there that says no hello carries nothing, dies by its health on the entry and is replaced.
+
 ## Streams
 
 A stream is one client TCP connection to an exit loopback port, opened by the entry. Its bytes are numbered by offset; data

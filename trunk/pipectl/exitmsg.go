@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/m1d1x/hikkari-protocol/trunk"
 	"github.com/m1d1x/hikkari-protocol/trunk/h3dgram"
 	"github.com/m1d1x/hikkari-protocol/trunk/udpwire"
 )
@@ -16,21 +17,29 @@ import (
 // entry's members and their streams.
 
 // ExitVersion is the exit's socket's version.
-const ExitVersion = 2
+const ExitVersion = 3
 
 // Brain → exit.
 const (
 	xHello = 0x01 // ver u16
 	xWire  = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; on FormH3Dgram then cert_len u16, cert path, key_len u16, key path; one socket
 	xPorts = 0x0a // n u16, port u16 × n
-	xPool  = 0x0b // dead_ms u16, quiet_ms u32; one socket: the pool's listening TCP socket
+	xPool  = 0x0b // dead_ms u16, quiet_ms u32; one socket: the pool's listening TCP socket, or none (members come by xLink)
+	xGen   = 0x0c // gen u8: the generation the exit's QUIC connection ids name, before any wire
+	xDrain = 0x0d // one socket: the old end of a handoff (HandoffLink)
+	xAdopt = 0x0e // one socket: the new end of a handoff
+	xMark  = 0x0f // kind u8, session [16], stream u32, id u64: a tester's stream or flow
+	xLink  = 0x10 // one socket: a stream member's connected socket, as if accepted on the pool's port
 )
 
 // Exit → brain.
 const (
-	xpHello = 0x81 // ver u16, pid u32
-	xpTick  = 0x82
-	xpError = 0x85 // text
+	xpHello    = 0x81 // ver u16, pid u32
+	xpTick     = 0x82
+	xpError    = 0x85 // text
+	xpDrained  = 0x86 // an exit draining carries nothing more: no client's flow, no stream
+	xpLocal    = 0x87 // open u8, kind u8, port u16, session [16], stream u32: a connection to the relay
+	xpObserved = 0x88 // a report of a tester's stream or flow, as the entry pipe's pObserved (no client TCP)
 )
 
 // maxExitKeys is the most trunk keys one exit wire opens under.
@@ -153,4 +162,34 @@ func parseExitTick(m []byte) (ExitTick, error) {
 		*p = le.Uint64(m[at+8*k:])
 	}
 	return t, nil
+}
+
+// ExitLocal is a connection of the exit to its relay, opened or closed: the
+// relay sees its local port as its peer's, and the brain knows by it which
+// stream or flow of which session a connection is (the Go exit's
+// trunkTargets, edge trunk_observe.go).
+type ExitLocal struct {
+	Open    bool
+	Kind    trunk.ObsKind
+	Port    uint16
+	Session trunk.SessionID
+	Stream  uint32
+}
+
+const exitLocalLen = 25
+
+func parseExitLocal(m []byte) (ExitLocal, error) {
+	if len(m) != exitLocalLen || m[0] != xpLocal || m[1] > 1 {
+		return ExitLocal{}, fmt.Errorf("pipectl: the exit's local of %d bytes", len(m))
+	}
+	l := ExitLocal{Open: m[1] == 1, Kind: trunk.ObsKind(m[2]), Port: binary.LittleEndian.Uint16(m[3:]),
+		Stream: binary.LittleEndian.Uint32(m[21:])}
+	copy(l.Session[:], m[5:21])
+	return l, nil
+}
+
+func putExitMark(kind trunk.ObsKind, session trunk.SessionID, stream uint32, id uint64) []byte {
+	b := append([]byte{xMark, byte(kind)}, session[:]...)
+	b = binary.LittleEndian.AppendUint32(b, stream)
+	return binary.LittleEndian.AppendUint64(b, id)
 }

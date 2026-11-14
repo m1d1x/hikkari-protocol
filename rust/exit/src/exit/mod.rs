@@ -20,11 +20,15 @@
 //! datagrams), h3.rs (the Chromium QUIC wire's connections and requests), relay.rs (flows to and from the loopback services), tcp.rs
 //! (stream members and their streams), death.rs (what a dead stream member
 //! carried, again), timers.rs (members' health on their clock, idle flows,
-//! members and sessions), brain.rs (the brain's messages, the tick).
+//! members and sessions), brain.rs (the brain's messages, the tick),
+//! generation.rs (a reload: the old exit drains to the new one on the same
+//! sockets), observe.rs (testers' streams and flows marked and reported).
 
 mod brain;
 mod death;
+mod generation;
 mod h3;
+mod observe;
 mod relay;
 mod stream;
 mod tcp;
@@ -132,6 +136,13 @@ pub struct Exit {
     stats_at: u64,
     moved: u64,
     t: Tick,
+    /// The exit among its generations (generation.rs), and where their
+    /// sockets are in the poll set.
+    gens: generation::Gens,
+    gslots: Vec<generation::GenSlot>,
+    gen_at: usize,
+    /// Where the wires' sockets are in the poll set.
+    wires_at: usize,
 }
 
 impl Exit {
@@ -172,6 +183,10 @@ impl Exit {
             stats_at: now,
             moved: 0,
             t: Tick::default(),
+            gens: generation::Gens::new(),
+            gslots: Vec::new(),
+            gen_at: 0,
+            wires_at: 0,
         })
     }
 
@@ -203,7 +218,7 @@ impl Exit {
             x.ports[p as usize] = true;
         }
         if let Some(addr) = a.pool {
-            x.set_pool(Pool { fd: sys::tcp_listen(addr)?, stall_ns: a.stall_ns, quiet_ns: a.quiet_ns })?;
+            x.set_pool(Pool { fd: Some(sys::tcp_listen(addr)?), stall_ns: a.stall_ns, quiet_ns: a.quiet_ns })?;
         }
         Ok(x)
     }
@@ -261,6 +276,7 @@ impl Exit {
                 self.poll.all();
             }
             let now = now_ns();
+            self.read_generations(now);
             self.read_wires(now);
             self.read_relays(now);
             self.tcp_events(now);
@@ -273,17 +289,28 @@ impl Exit {
         }
     }
 
-    /// The poll set: the brain, each wire, the relays' epoll and the stream
-    /// sockets' (each readable when any of its sockets has something).
+    /// The poll set: the brain, each wire (waited for only while the exit
+    /// reads them: generation.rs), the relays' epoll and the stream sockets'
+    /// (each readable when any of its sockets has something), the other
+    /// generations' sockets.
     fn rebuild_poll(&mut self) {
         let mut fds: Vec<i32> = Vec::with_capacity(3 + self.wires.len());
         if let Some(c) = &self.ctl {
             fds.push(c.fd);
         }
+        self.wires_at = fds.len();
         fds.extend(self.wires.iter().map(|w| w.fd()));
         fds.push(self.relays.fd);
         fds.push(self.tcp.fd);
+        self.gen_at = fds.len();
+        fds.extend(self.gens.fds());
+        self.gslots = self.gen_slots();
         self.poll.set(fds.into_iter());
+        if !self.reads_wires() {
+            for wi in 0..self.wires.len() {
+                self.poll.want(self.wires_at + wi, false, false);
+            }
+        }
         self.dirty = false;
     }
 
@@ -352,6 +379,8 @@ impl Exit {
             self.sessions.all[s].leave((i, p.gen), now);
             self.t.members -= 1;
         }
+        self.let_go(i);
+        let p = &mut self.peers[i];
         p.live = false;
         p.session = NONE;
         p.glue_n = 0;

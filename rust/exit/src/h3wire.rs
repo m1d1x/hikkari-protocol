@@ -189,6 +189,9 @@ pub struct H3Wire {
     body: Vec<u8>,
     /// A datagram down being made: its head, then its frames.
     dg: Vec<u8>,
+    /// The exit's generation: every connection id it issues names it
+    /// (spec/trunk.md, "An exit's own process replaced").
+    gen: u8,
     pub n: Counts,
 }
 
@@ -231,6 +234,7 @@ impl H3Wire {
             send: SendBatch::new(),
             body: vec![0; 4096],
             dg: vec![0; HEAD_MAX + DGRAM],
+            gen: 0,
             n: Counts::default(),
         })
     }
@@ -238,6 +242,23 @@ impl H3Wire {
     #[inline]
     pub fn fd(&self) -> i32 {
         self.sock.as_raw_fd()
+    }
+
+    /// The exit's generation, which the ids of its connections name from now
+    /// on.
+    pub fn set_gen(&mut self, gen: u8) {
+        self.gen = gen;
+    }
+
+    /// The generation a packet is for when it is another's: its destination
+    /// id is as long as the exit's, no connection here has it, and it names
+    /// another generation (server/generation.go packetOwner, for this
+    /// exit's ids). None: the packet is this process's (a connection of its
+    /// own, or a new one).
+    pub fn owner(&self, d: &[u8]) -> Option<u8> {
+        let id = dcid(d).filter(|id| id.len() == CID)?;
+        let g = id[0] ^ id[1];
+        (g != self.gen && !self.by_cid.contains_key(&cid_key(id)?)).then_some(g)
     }
 
     /// One packet from `from`: the connection it is for, made on a new
@@ -277,6 +298,7 @@ impl H3Wire {
         }
         let mut id = [0u8; CID];
         sys::urandom(&mut id);
+        id[0] = id[1] ^ self.gen;
         let scid = quiche::ConnectionId::from_ref(&id);
         let peer = SocketAddr::V4(addr_of(&from));
         let q = quiche::accept_with_buf_factory::<Bufs>(&scid, None, self.local, peer, &mut self.config).ok()?;

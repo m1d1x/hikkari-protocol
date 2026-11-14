@@ -1,17 +1,21 @@
-//! The messages between two generations of the pipe (spec/trunk.md, "An
-//! entry's own process replaced"; the Go entry's mailboxes, trunkentry
-//! handoff.go): one local SOCK_SEQPACKET socket the brain made, its ends
-//! passed to the old pipe with `drain` and to the new one with `adopt`, one
-//! message per datagram.
+//! The messages between two generations of a pipe, the entry's or the
+//! exit's (spec/trunk.md, "An entry's own process replaced", "An exit's own
+//! process replaced"; the Go entry's mailboxes, trunkentry handoff.go): one
+//! local SOCK_SEQPACKET socket the brain made, its ends passed to the old
+//! pipe with `drain` and to the new one with `adopt`, one message per
+//! datagram.
 //!
-//! Old → new: `own` (client addresses whose flows the old pipe keeps, as
-//! many as fit one message), `all`
-//! (the list of them is whole: the new pipe may read the clients' sockets),
-//! `free` (the old pipe ended that flow; with the datagram it was handed for
-//! it, if any, which the new pipe carries itself). New → old: `dgram` (a
-//! client datagram for one of the old pipe's flows). An address is the
-//! listened port's id (the brain's, the same in both pipes), the IPv4
-//! address as on the wire, the port; integers little-endian.
+//! Old → new: `gen` (the exit's: the generation its QUIC connection ids
+//! name, before anything else), `own` (addresses the old pipe keeps: the
+//! entry's client addresses of its flows, the exit's entry addresses of its
+//! bare UDP wire's members; as many as fit one message), `all` (the list of
+//! them is whole: the new pipe may read the shared sockets), `free` (the
+//! old pipe let that address go; with the datagram it was handed for it, if
+//! any, which the new pipe takes itself). New → old: `dgram` (a datagram
+//! from an address, or of a connection, the old pipe keeps). An address is
+//! the id of its listened port or wire (the brain's, the same in both
+//! pipes), the IPv4 address as on the wire, the port; integers
+//! little-endian.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
@@ -19,6 +23,7 @@ pub const OWN: u8 = 0x01;
 pub const ALL: u8 = 0x02;
 pub const FREE: u8 = 0x03;
 pub const DGRAM: u8 = 0x04;
+pub const GEN: u8 = 0x05;
 
 /// An address: listen, IPv4, port.
 pub const ADDR: usize = 1 + 4 + 2;
@@ -33,6 +38,8 @@ pub enum Msg<'a> {
     /// The addresses, ADDR bytes each: read them with `addrs`.
     Own { addrs: &'a [u8] },
     All,
+    /// The exit's generation (spec/trunk.md: its connection ids name it).
+    Gen { gen: u8 },
     Free { listen: u8, addr: SocketAddrV4, payload: &'a [u8] },
     Dgram { listen: u8, addr: SocketAddrV4, payload: &'a [u8] },
 }
@@ -42,6 +49,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
     let kind = *m.first()?;
     match kind {
         ALL => return (m.len() == 1).then_some(Msg::All),
+        GEN => return (m.len() == 2).then(|| Msg::Gen { gen: m[1] }),
         OWN => return (m.len() - 1).is_multiple_of(ADDR).then_some(Msg::Own { addrs: &m[1..] }),
         _ => {}
     }
@@ -102,6 +110,7 @@ mod tests {
         assert_eq!(addrs(got).collect::<Vec<_>>(), vec![(7, a), (2, "10.0.0.9:9".parse().unwrap())]);
         assert_eq!(parse(&[OWN]), Some(Msg::Own { addrs: b"" }), "an own of no address");
         assert_eq!(parse(&[ALL]), Some(Msg::All));
+        assert_eq!(parse(&[GEN, 3]), Some(Msg::Gen { gen: 3 }));
     }
 
     #[test]
@@ -113,6 +122,7 @@ mod tests {
         let n = put_head(&mut b, DGRAM, 0, a);
         assert!(parse(&b[..n - 1]).is_none(), "a dgram torn");
         assert!(parse(&[ALL, 0]).is_none());
+        assert!(parse(&[GEN]).is_none(), "a gen torn");
         b[0] = 0x7f;
         assert!(parse(&b[..n]).is_none(), "unknown");
         assert!(parse(&[]).is_none());

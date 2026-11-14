@@ -162,6 +162,25 @@ pub fn put_ping(out: &mut [u8], typ: u8, token: u64) -> usize {
     9
 }
 
+/// The exit's observe (spec/trunk.md, "Observation"): stream or flow
+/// `stream` (kind OBS_STREAM or OBS_FLOW) is a tester's, its observation
+/// `id`.
+#[inline]
+pub fn put_observe(out: &mut [u8], kind: u8, stream: u32, id: u64) -> usize {
+    out[0] = F_OBSERVE;
+    out[1] = kind;
+    out[2..6].copy_from_slice(&stream.to_be_bytes());
+    out[6..14].copy_from_slice(&id.to_be_bytes());
+    14
+}
+
+/// The exit's drain (spec/trunk.md, "Drain"): its process is being replaced.
+#[inline]
+pub fn put_drain(out: &mut [u8]) -> usize {
+    out[0] = F_DRAIN;
+    1
+}
+
 /// One frame read from a datagram's plaintext.
 pub enum Frame {
     Hello,

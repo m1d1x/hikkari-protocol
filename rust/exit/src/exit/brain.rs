@@ -61,7 +61,8 @@ impl Exit {
                     Wire::udp(id, sock, keys, stall, quiet, glue, glue_max as usize)
                 } else {
                     let path = |b: &[u8]| std::str::from_utf8(b).map(str::to_owned).map_err(|_| format!("exit: wire {id}: a file's path is not UTF-8"));
-                    let h = H3Wire::new(sock, &path(cert)?, &path(key)?, keys).map_err(|e| format!("exit: wire {id}: {e}"))?;
+                    let mut h = H3Wire::new(sock, &path(cert)?, &path(key)?, keys).map_err(|e| format!("exit: wire {id}: {e}"))?;
+                    h.set_gen(self.gens.gen);
                     Wire::h3dgram(id, h, stall, quiet, glue, glue_max as usize)
                 };
                 self.wires.push(w);
@@ -72,14 +73,33 @@ impl Exit {
                 if self.pool.is_some() {
                     return Err("exit: the pool's port is set already".into());
                 }
-                if fds.len() != 1 {
-                    return Err(format!("exit: the pool came with {} sockets, want 1", fds.len()));
-                }
-                let fd = sys::tcp_from_fd(fds.remove(0)).map_err(|e| format!("exit: the pool's socket: {e}"))?;
+                // No socket: the brain accepts the members itself (Link).
+                let fd = match fds.len() {
+                    0 => None,
+                    1 => Some(sys::tcp_from_fd(fds.remove(0)).map_err(|e| format!("exit: the pool's socket: {e}"))?),
+                    n => return Err(format!("exit: the pool came with {n} sockets, want 1 or none")),
+                };
                 let p = Pool { fd, stall_ns: dead_ms as u64 * 1_000_000, quiet_ns: quiet_ms as u64 * 1_000_000 };
                 self.set_pool(p).map_err(|e| format!("exit: the pool's socket: {e}"))?;
                 Ok(())
             }
+            Msg::Link => {
+                if fds.len() != 1 {
+                    return Err(format!("exit: a member came with {} sockets, want 1", fds.len()));
+                }
+                let fd = sys::stream_from_fd(fds.remove(0)).map_err(|e| format!("exit: a member's socket: {e}"))?;
+                self.link(fd, sys::now_ns())
+            }
+            Msg::Gen { gen } => {
+                self.set_gen(gen);
+                Ok(())
+            }
+            Msg::Drain => self.drain(fds),
+            Msg::Mark { kind, session, stream, id } => {
+                self.mark(kind, &session, stream, id, sys::now_ns());
+                Ok(())
+            }
+            Msg::Adopt => self.adopt(fds),
             Msg::Ports { ports } => {
                 self.ports.iter_mut().for_each(|p| *p = false);
                 for i in 0..ports.len() / 2 {
@@ -90,7 +110,7 @@ impl Exit {
         }
     }
 
-    fn error(&mut self, text: &str) {
+    pub(super) fn error(&mut self, text: &str) {
         eprintln!("{text}");
         if let Some(c) = self.ctl.as_mut() {
             let mut b = [0u8; 512];

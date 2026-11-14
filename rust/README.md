@@ -193,7 +193,7 @@ ackedLocked, holdEarlyLocked, endStreamLocked, readLocal, writeLocal; the exit's
 The brain is the edge process (keys from the hub, the ports open to the trunk; later observation and generations); its
 side is `trunk/pipectl` `StartExit`, `Exit.SetWire` (the wire's socket by `SCM_RIGHTS`, its keys, stall, Quiet, glue),
 `Exit.SetPool` (the pool's listening socket, stream members' stall and Quiet), `Exit.SetPorts`, `Exit.Tick`. The messages
-are `exit/src/ctl.rs` (version 2), both sides hold the same golden bytes:
+are `exit/src/ctl.rs` (version 2 then; 3 since R6.4, below), both sides hold the same golden bytes:
 
 | Message | What |
 | --- | --- |
@@ -205,10 +205,9 @@ are `exit/src/ctl.rs` (version 2), both sides hold the same golden bytes:
 | exit `tick` | once a second: its latest pause, pauses, the latest turn past due, sessions, packet members up, clients' flows, stream members up, streams open; since the start members joined, buried by their stall, by Quiet, gone (a packet member's address idle, a stream member's connection), the clients' datagrams sent, delivered, copies dropped, flows ended idle, datagrams refused (a port not open, a relay that refused), sealed datagrams in and out, frames out, bad, dropped; streams opened, ended by FINs, reset by the entry and here, member deaths that hit a stream, chunks sent again, bytes up and down, early frames held and dropped, opens refused, datagrams that came on stream members |
 | exit `error` | a message it could not take |
 
-Left out on purpose: datagrams on stream members (the Go entry's pool may carry them; they are counted in the tick as
-`link_dgrams` and dropped, R2 carries them), drain and generations (R4), `observe` (the relay's marks of a tester's flow,
-and the edge's tracking of each flow's and stream's connection), IPv6, the pool's Chromium wire (R2), the edge's own use
-of it (R5).
+Left out on purpose: IPv6, the pool's Chromium wire (R2). Datagrams on stream members (the pool as UDP's fallback,
+R2.3) are carried since R6.4.3 and counted in the tick as `link_dgrams`; the edge runs the exit since R6.4.3 (its
+members come by `link`).
 
 Tests against the Go side, on the Go exit and the Rust exit alike (`trunk/pipectl`): the health scenarios with the pipe as
 the entry (`health_linux_test.go`) and with the Go entry (`exit_health_linux_test.go`: a member cut alone buried once at
@@ -527,3 +526,57 @@ cargo build --release -p hikkari-cronet --bin hk-h3dgram-call
 OUT=<dir> bench/h3dgram.sh 3 1500      # needs in OUT: hk-exit, hk-h3dgram-call, the patched libcronet.so; openssl
 OUT=<dir> bench/h3dgram-cost.sh 8 4000 10
 ```
+
+## The exit's generations and testers (R6.4.1, R6.4.2)
+
+Every wire of an entry and exit pair ends in one `hk-exit` (hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
+R6.4; owner's decision of 2026-11-14): a stream or flow that moves from wire to wire stays in one process, which numbers
+its answers on, so the entry's window of copies keeps them. For that the exit needs what the Go exit of the relay has:
+generations and the testers' marks.
+
+Generations (`exit/src/exit/generation.rs`; spec/trunk.md, "An exit's own process replaced"; the entry pipe's R4, whose
+messages it shares: `hikkari_trunk::handoff`). The brain says each exit's generation (`gen`, before any wire): every
+QUIC connection id the exit issues names it, `id[0] = id[1] ^ gen`, as the relay's do. A reload is one SOCK_SEQPACKET
+socket: its old end with `drain` to the old exit, its new end with `adopt` to the new one, which got the same sockets
+(`pipectl.Exit.Handoff`). The old exit sends drain on every member of every session (and on every member that joins it
+after), stops reading its packet wires and accepting on the pool's port, and tells the new one its generation, every
+entry address of its `udp` members (`own`), then `all`. The new exit reads no packet wire before every older one said
+`all`; then a `udp` datagram from an address an older exit holds, and an `h3dgram` packet whose 16-byte destination id
+names an older generation and no connection of its own, go to that exit (`dgram`), which takes them as read and answers
+out of the shared socket. The old exit lets an address go when it forgets its member (`free`), with a datagram it was
+handed for one it no longer holds, which the new one then takes. Stream members stay where they were accepted. The old
+exit says `drained` once it carries no client's flow and no stream; the brain closes it then or after
+`pipectl.ExitRetireLimit` (30 minutes).
+
+Testers (`exit/src/exit/observe.rs`; spec/trunk.md, "Observation"; the Go exit's `Session.Observe`, edge
+`trunk_observe.go`). The relay that knows a client's key is the brain's process: the exit tells the brain each
+connection it opens to the relay and closes (`local`: its port on loopback, the stream's or flow's kind, session id and
+stream id), the brain marks the one whose connection the relay admitted a tester's key on (`mark`, with an observation
+id it draws; `pipectl.Exit.Mark` keeps the tag), and the exit reports it at the mark and at its end (`observed`, the
+entry pipe's layout without the client's TCP) and sends `observe` on two members to an entry whose hello said it reads
+them. A stream counts its bytes each way, chunks, chunks sent again, members that carried it and died owing it, the
+longest wait for a confirmation; a flow its answers, datagrams delivered and copies dropped
+(`hikkari_trunk::observe`, the entry's counters).
+
+The exit's socket is version 3:
+
+| Message | What |
+| --- | --- |
+| brain `gen` | the exit's generation, before any wire |
+| brain `drain` | one socket: the old end of a reload's handoff |
+| brain `adopt` | one socket: the new end |
+| brain `mark` | kind, session id, stream id, observation id |
+| brain `link` | one socket: a stream member the brain accepted (the relay took its CONNECT), as if accepted on the pool's port; `pool` then comes with no socket |
+| exit `drained` | a draining exit carries nothing more |
+| exit `local` | a connection to the relay opened or closed: kind, port, session id, stream id |
+| exit `observed` | a report of a tester's stream or flow |
+
+Checks (`trunk/pipectl`, `HK_PIPE`, `HK_EXIT`; the QUIC one also `HK_CRONET`):
+`TestACallGoesThroughAReloadOfTheRustExit` (a client and the brain's call on the `udp` wire through a reload: no pause
+over 150 ms, nothing lost, the old exit drains once the call hangs up), `TestAStreamThroughAReloadOfTheRustExitEndsByteForByte`
+(64 MiB on the pool through a reload), `TestAQuicWireCallGoesThroughAReloadOfTheRustExit` (the same on `h3dgram`
+through Chromium), `TestATestersStreamAndFlowAreReportedByTheRustExitAndThePipeUnderOneID`,
+`TestAMemberLinkedByTheBrainCarriesAStreamThroughAReload` (members the brain accepted and linked, 64 MiB through a
+reload), `TestACallRidesThePoolLinkedByTheBrain` (a call on the pool alone, the exit answers on the members it came
+on), and the golden bytes `TestExitObservationGolden` against `ctl.rs`. The brain's call measures by the monotonic clock:
+the wall clock of WSL2 steps by seconds, and a step read as a pause failed the reload test twice in ten with 3.4 to 3.6 s.

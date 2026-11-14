@@ -13,7 +13,7 @@
 //! - pipe: the loop (brain, timers, data)
 
 pub mod ctl;
-pub mod handoff;
+pub use hikkari_trunk::handoff;
 #[cfg(target_os = "linux")]
 mod carry;
 #[cfg(target_os = "linux")]

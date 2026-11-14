@@ -16,11 +16,22 @@ use std::collections::HashMap;
 use std::net::UdpSocket;
 
 use hikkari_trunk::flow::{Replay, COPIES, ECHO_PORT};
+use hikkari_trunk::observe::FlowObs;
 
 use crate::peer::NONE;
 
-/// A member a flow came on: its slot and the slot's use (Peer.gen).
+/// A member a flow came on: its slot and the slot's use (Peer.gen, or
+/// Link.gen for a stream member, whose slot has LINK_SEEN set).
 pub type Seen = (usize, u32);
+
+/// Marks a Seen slot as a stream member's (a link slot), not a peer's.
+pub const LINK_SEEN: usize = 1 << 48;
+
+/// The link slot of m, if m is a stream member.
+#[inline]
+pub fn link_slot(m: Seen) -> Option<usize> {
+    (m.0 != NONE && m.0 & LINK_SEEN != 0).then_some(m.0 & !LINK_SEEN)
+}
 
 pub struct Flow {
     pub live: bool,
@@ -42,6 +53,10 @@ pub struct Flow {
     pub sock: Option<UdpSocket>,
     pub fd: i32,
     pub used: u64,
+    /// What it did, for a tester's report (spec/trunk.md, "Observation"),
+    /// and its relay socket's port, which the brain knows it by.
+    pub obs: FlowObs,
+    pub local_port: u16,
 }
 
 impl Flow {
@@ -60,6 +75,8 @@ impl Flow {
             sock: None,
             fd: -1,
             used: 0,
+            obs: FlowObs::default(),
+            local_port: 0,
         }
     }
 
@@ -134,7 +151,7 @@ impl Flows {
             self.all.len() - 1
         });
         let gen = self.all[i].gen.wrapping_add(1);
-        self.all[i] = Flow { live: true, gen, session: s, stream, port, used: now, ..Flow::vacant() };
+        self.all[i] = Flow { live: true, gen, session: s, stream, port, used: now, obs: FlowObs::new(now), ..Flow::vacant() };
         by_stream.insert(stream, i);
         if port != ECHO_PORT {
             self.clients += 1;
