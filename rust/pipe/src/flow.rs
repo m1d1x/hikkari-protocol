@@ -197,6 +197,16 @@ impl Flows {
         }
     }
 
+    /// The brain's flows on session `sess` forget the answers they saw: the
+    /// exit restarted under it and numbers its answers anew.
+    pub fn forget_answers(&mut self, sess: u8) {
+        for f in self.list.iter_mut() {
+            if f.sess == sess && matches!(f.dest, Dest::Brain { .. }) {
+                f.replay = Replay::default();
+            }
+        }
+    }
+
     /// Ends every client's flow on session `sess` (it closed with them);
     /// their keys go to `ended`. How many there were.
     pub fn end_session(&mut self, sess: u8, ended: &mut Vec<u64>) -> usize {

@@ -53,7 +53,7 @@ impl Pipe {
 
     /// Wires → clients and the brain.
     pub(super) fn read_wires(&mut self) {
-        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, drains, cur, .. } = self;
+        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, drains, cur, epochs, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Member(wi, mi) = *s else { continue };
             if !poll.readable(si) {
@@ -87,6 +87,9 @@ impl Pipe {
                                 deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess);
                             }
                             Frame::Hello => {
+                                if let Some(h) = frame::read_hello(p, at) {
+                                    epochs.push((sess, h.epoch));
+                                }
                                 if !m.h.up {
                                     m.h.join(now);
                                     if sess == *cur {
@@ -130,6 +133,7 @@ impl Pipe {
             }
         }
         self.send_events();
+        self.saw_epochs();
     }
 }
 

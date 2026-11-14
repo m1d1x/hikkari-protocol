@@ -55,13 +55,16 @@ pub(super) struct Sess {
     /// When it was opened, and when it was retired (0: not).
     pub opened_at: u64,
     pub retired_at: u64,
+    /// The exit's epoch its members' hellos said (spec/trunk.md, "Frames":
+    /// hello); none before the first.
+    pub epoch: Option<[u8; 8]>,
 }
 
 impl Sess {
     pub fn new(now: u64) -> Sess {
         let mut id = [0u8; 16];
         sys::urandom(&mut id);
-        Sess { id, live: true, exit_drains: false, answered: false, opened_at: now, retired_at: 0 }
+        Sess { id, live: true, exit_drains: false, answered: false, opened_at: now, retired_at: 0, epoch: None }
     }
 }
 
@@ -282,6 +285,38 @@ impl Pipe {
         }
     }
 
+    /// The exits' epochs the members' hellos said since the last call
+    /// (trunk entry.go, the hello's epoch): a session's first is said; a
+    /// later one that differs means the exit restarted under the session
+    /// and lost what it held of it (trunk Session.Reset). The session's
+    /// clients' streams are cut and their flows end (a client's next
+    /// datagram opens a new one), and the brain's flows forget the answers
+    /// they saw: the exit's new process numbers its answers anew. The
+    /// members stay.
+    pub(super) fn saw_epochs(&mut self) {
+        while let Some((s, epoch)) = self.epochs.pop() {
+            let ss = &mut self.sessions[s as usize];
+            if !ss.live {
+                continue;
+            }
+            match ss.epoch {
+                Some(e) if e == epoch => {}
+                None => {
+                    ss.epoch = Some(epoch);
+                    eprintln!("hk-pipe: trunk: exit epoch {}", hex(&epoch));
+                }
+                Some(old) => {
+                    ss.epoch = Some(epoch);
+                    eprintln!("hk-pipe: trunk: exit epoch {} after {}: streams reset", hex(&epoch), hex(&old));
+                    let flows = self.flows.end_session(s, &mut self.freed);
+                    self.flows.forget_answers(s);
+                    let streams = self.cut_streams(s);
+                    eprintln!("hk-pipe: the exit lost the session: {streams} stream(s) and {flows} flow(s) ended");
+                }
+            }
+        }
+    }
+
     /// The streams of session s cut: their clients' connections close.
     fn cut_streams(&mut self, s: u8) -> usize {
         let mut n = 0;
@@ -294,4 +329,9 @@ impl Pipe {
         self.end_doomed();
         n
     }
+}
+
+/// Bytes in lower-case hex, as Go's %x.
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }

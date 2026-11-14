@@ -236,12 +236,13 @@ impl Pipe {
             }
         }
         self.send_events();
+        self.saw_epochs();
     }
 
     /// The whole frames read on member li of wire wi; false for bytes that
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
-        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, .. } = self;
+        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, .. } = self;
         let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
         let sess = *sess;
         let Link { inb, in_n, out, h, up_at, .. } = &mut links[li];
@@ -256,6 +257,9 @@ impl Pipe {
             };
             match fr {
                 Frame::Hello => {
+                    if let Some(hl) = frame::read_hello(&inb[..*in_n], at) {
+                        epochs.push((sess, hl.epoch));
+                    }
                     if !h.up {
                         h.join(now);
                         *up_at = now;

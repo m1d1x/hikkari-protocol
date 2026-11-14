@@ -138,6 +138,9 @@ pub struct Pipe {
     cur: u8,
     next: Option<u8>,
     drains: u32,
+    /// The exits' epochs the members' hellos said this turn, by session
+    /// (session.rs saw_epochs).
+    epochs: Vec<(u8, [u8; 8])>,
     gone: Vec<WireTick>,
     take_over_ns: u64,
     retire_ns: u64,
@@ -204,6 +207,7 @@ impl Pipe {
             cur: 0,
             next: None,
             drains: 0,
+            epochs: Vec::new(),
             gone: Vec::new(),
             take_over_ns: session::TAKE_OVER_NS,
             retire_ns: session::RETIRE_NS,
