@@ -84,6 +84,10 @@ type Pipe struct {
 
 	nextTag atomic.Uint32
 	hello   chan struct{}
+	// clients carries the pipe's answer to Clients; clientsMu keeps one
+	// question out at a time.
+	clients   chan Clients
+	clientsMu sync.Mutex
 	// drained is closed once the pipe, draining, says it carries nothing
 	// more.
 	drained     chan struct{}
@@ -120,7 +124,7 @@ func Start(cfg Config) (*Pipe, error) {
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
 		listens: map[byte]*listenConf{}, tcpListens: map[byte]*tcpListenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
-		drained: make(chan struct{})}
+		drained: make(chan struct{}), clients: make(chan Clients, 1)}
 	go func() {
 		p.err = cmd.Wait()
 		close(p.done)
@@ -525,6 +529,16 @@ func (p *Pipe) read() {
 			}
 		case pError:
 			p.cfg.Logf("pipectl: the pipe: %s", m[1:])
+		case pClients:
+			c, err := parseClients(m)
+			if err != nil {
+				p.cfg.Logf("%v", err)
+				continue
+			}
+			select {
+			case p.clients <- c:
+			default: // nobody asks any more: the answer came after its wait
+			}
 		case pDrained:
 			p.cfg.Logf("pipectl: the pipe drained")
 			p.drainedOnce.Do(func() { close(p.drained) })
@@ -587,4 +601,30 @@ func (p *Pipe) Run(ctx context.Context, sel *trunk.Selector, wires []trunk.WireI
 		})
 	}
 	trunk.SteerOn(ctx, p, sel, logf)
+}
+
+// clientsWait is how long Clients waits for the pipe's answer.
+const clientsWait = 2 * time.Second
+
+// Clients is the leg client → entry since the last call (or the pipe's
+// start): the pipe reads every client's socket now and starts the next
+// minute.
+func (p *Pipe) Clients() (Clients, error) {
+	p.clientsMu.Lock()
+	defer p.clientsMu.Unlock()
+	select {
+	case <-p.clients: // a late answer to an earlier question
+	default:
+	}
+	if err := p.send([]byte{bClients}); err != nil {
+		return Clients{}, err
+	}
+	select {
+	case c := <-p.clients:
+		return c, nil
+	case <-p.done:
+		return Clients{}, errors.New("pipectl: the pipe ended")
+	case <-time.After(clientsWait):
+		return Clients{}, errors.New("pipectl: no clients from the pipe in 2 s")
+	}
 }

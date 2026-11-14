@@ -261,6 +261,7 @@ Brain → pipe:
 | `drain` | the old end of a reload's handoff socket (one): the pipe takes no new client (below, «Generations») |
 | `adopt` | the new end of a handoff socket (one): an older pipe drains to this one; it comes before the client ports |
 | `tcp_listen` | a client port of streams (one listening TCP socket): id, the exit's loopback port; every connection accepted is a stream on the pools (R4.2) |
+| `clients` | the leg client → entry of the minute, now: the pipe reads every client's TCP socket (`tcp_info`) and answers `clients` |
 | `pool` | a wire of stream members the pipe dials itself from its book of source ports: id, form (plain TCP to the exit's member port, or Chromium's CONNECT to its relay), members, their stall, the book's range, the exit; for Chromium the relay's domain, the trunk key, libcronet's path and PEM roots (empty: the system's). The same pool again changes only the stall; a new form, exit or number of members brings the members up anew, no stream reset (R4.2) |
 
 Pipe → brain:
@@ -273,10 +274,16 @@ Pipe → brain:
 | `dgram` | an answer on a brain's flow |
 | `error` | a message the pipe could not take |
 | `drained` | a pipe draining carries nothing more: no client's flow, no stream |
+| `clients` | the answer to the brain's `clients`: client sockets open and closed in the minute, the sockets that sent, segments sent to clients and sent again (`tcpi_segs_out`, `tcpi_total_retrans`, a socket read each minute and once more as it closes), the round trips of the sockets that sent at p50 and p90; no client named, as the Go entry's `clients tcp` line |
 
 A client port must be bound for IPv4 (`udp4`, `tcp4`): the pipe reads clients' addresses as `sockaddr_in` and refuses
 any other socket with an `error`, since a dual-stack one (Go's `:port`) gives IPv4-mapped IPv6 addresses and every answer
 would go nowhere.
+
+The exit's epoch (spec/trunk.md, "Frames": hello): every member's hello answer says it; the session's first is logged
+(`trunk: exit epoch …`), a later one that differs means the exit restarted under the session: its clients' streams are
+cut, their flows end and the brain's flows forget the answers they saw (`trunk: exit epoch … after …: streams reset`), as
+trunk `Session.Reset`; `pipectl` `TestAStreamEndsWhenTheExitRestartsUnderIt`, `TestAnExitRestartedUnderTheSessionEndsItsFlowsAndACallComesBack`.
 
 Left for later: `ceiling`, `observe` (the exit's marks of a tester's flow), IPv6, packet forms other than `udp`. The pipe passes over a wire with no member
 up for any wire that has one, as `trunk.Route` does, before the selector moves the route.

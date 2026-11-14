@@ -197,3 +197,32 @@ pub fn shutdown_both(fd: &OwnedFd) {
 pub fn into_raw(fd: OwnedFd) -> i32 {
     std::os::fd::IntoRawFd::into_raw_fd(fd)
 }
+
+/// What the kernel says of a TCP socket (struct tcp_info, Linux uapi
+/// linux/tcp.h; the Go entry reads the same through unix.GetsockoptTCPInfo):
+/// its smoothed round trip, the segments it sent again, the segments it
+/// sent, since it opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpInfo {
+    pub rtt_us: u32,
+    pub total_retrans: u32,
+    pub segs_out: u32,
+}
+
+/// The kernel's tcp_info of fd; None when it is no TCP socket or the kernel
+/// is older than tcpi_segs_out (4.2).
+pub fn tcp_info(fd: i32) -> Option<TcpInfo> {
+    // The struct's layout is the kernel's ABI: u32 fields at these offsets.
+    const RTT: usize = 68;
+    const TOTAL_RETRANS: usize = 100;
+    const SEGS_OUT: usize = 136;
+    let mut b = [0u8; 256];
+    let mut len = b.len() as libc::socklen_t;
+    // SAFETY: the kernel writes at most len bytes into b and says how many.
+    let r = unsafe { libc::getsockopt(fd, libc::IPPROTO_TCP, libc::TCP_INFO, b.as_mut_ptr() as *mut _, &mut len) };
+    if r != 0 || (len as usize) < SEGS_OUT + 4 {
+        return None;
+    }
+    let u = |o: usize| u32::from_ne_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    Some(TcpInfo { rtt_us: u(RTT), total_retrans: u(TOTAL_RETRANS), segs_out: u(SEGS_OUT) })
+}

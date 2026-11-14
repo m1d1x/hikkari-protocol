@@ -26,7 +26,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 5
+const Version = 6
 
 // Brain → pipe.
 const (
@@ -44,6 +44,7 @@ const (
 	// tcp_listen and pool: the streams' part (rust/pipe/src/pipe/pool.rs).
 	bTCPListen = 0x0c // id u8, to u16; one socket: a listening TCP socket
 	bPool      = 0x0d // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots
+	bClients   = 0x0e // the leg client → entry of the minute, now (answered by pClients)
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -61,6 +62,7 @@ const (
 	pDgram   = 0x84 // tag u32, payload
 	pError   = 0x85 // text
 	pDrained = 0x86 // a pipe draining carries nothing more
+	pClients = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
 )
 
 // FormUDP is the bare UDP wire (trunk/udpwire): the brain dials its members.
@@ -315,4 +317,31 @@ func parseTick(m []byte) (Tick, error) {
 		t.Wires = append(t.Wires, w)
 	}
 	return t, nil
+}
+
+// Clients is a minute of the leg client → entry over every client's TCP
+// socket of the pipe (rust/pipe/src/streams.rs Leg; the Go entry's
+// trunkentry clients.go adds up the same): sockets open and closed in the
+// minute, the sockets that sent, the segments sent to clients and sent
+// again, and the round trip of the sockets that sent at p50 and p90 (-1:
+// none sent). No client is named in it.
+type Clients struct {
+	Conns, Closed, Sending uint32
+	Segs, Retrans          uint64
+	RTTP50, RTTP90         time.Duration
+}
+
+func parseClients(m []byte) (Clients, error) {
+	if len(m) != 37 || m[0] != pClients {
+		return Clients{}, fmt.Errorf("pipectl: clients of %d bytes", len(m))
+	}
+	le := binary.LittleEndian
+	us := func(v uint32) time.Duration {
+		if v == noneMS {
+			return -1
+		}
+		return time.Duration(v) * time.Microsecond
+	}
+	return Clients{Conns: le.Uint32(m[1:]), Closed: le.Uint32(m[5:]), Sending: le.Uint32(m[9:]),
+		Segs: le.Uint64(m[13:]), Retrans: le.Uint64(m[21:]), RTTP50: us(le.Uint32(m[29:])), RTTP90: us(le.Uint32(m[33:]))}, nil
 }

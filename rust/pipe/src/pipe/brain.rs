@@ -76,6 +76,16 @@ impl Pipe {
                 self.msg = msg;
                 return res;
             }
+            // The leg client → entry of the minute (streams.rs Leg).
+            Some(Msg::Clients) => {
+                let m = crate::streams::Leg::minute(&mut self.streams);
+                if let Some(c) = &mut self.ctl {
+                    let mut b = [0u8; 40];
+                    let k = ctl::put_clients(&mut b, &m);
+                    c.send(&b[..k]);
+                }
+                return Ok(());
+            }
             Some(Msg::Unwire { id }) => self.unpool(id),
             Some(Msg::Wire { h3: Some(_), .. }) => {
                 // The QUIC wire's strings point into the message buffer.
@@ -198,7 +208,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) => unreachable!("taken above"),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Clients => unreachable!("taken above"),
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));

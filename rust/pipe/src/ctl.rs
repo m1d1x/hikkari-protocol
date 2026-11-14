@@ -5,7 +5,7 @@
 //! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
 //! here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -20,6 +20,7 @@ pub const B_MEMBER: u8 = 0x09; // wire u8, index u8; one fd: the member's new so
 pub const B_DRAIN: u8 = 0x0a; // one fd: the old end of a handoff socket (handoff.rs); the pipe takes no new client
 pub const B_ADOPT: u8 = 0x0b; // one fd: the new end of a handoff socket; a pipe draining sends on its other end
 pub const B_TCP_LISTEN: u8 = 0x0c; // id u8, to u16; one fd: a listening TCP socket, a client port of streams
+pub const B_CLIENTS: u8 = 0x0e; // the leg client → entry of the minute, now (answered by P_CLIENTS)
 pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots (rest)
 
 // Pipe → brain.
@@ -29,6 +30,7 @@ pub const P_MEMBER: u8 = 0x83; // wire u8, index u8, up u8, why u8
 pub const P_DGRAM: u8 = 0x84; // tag u32, payload
 pub const P_ERROR: u8 = 0x85; // text
 pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no client's flow, no stream
+pub const P_CLIENTS: u8 = 0x87; // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (NONE_MS: none)
 
 /// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
 pub const FORM_UDP: u8 = 1;
@@ -74,6 +76,7 @@ pub enum Msg<'a> {
     Adopt,
     TcpListen { id: u8, to: u16 },
     Pool(Pool<'a>),
+    Clients,
 }
 
 /// A wire of stream members (B_POOL): its members, their stall and source
@@ -162,6 +165,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_ADOPT if m.len() == 1 => Msg::Adopt,
         B_TCP_LISTEN => Msg::TcpListen { id: r.u8()?, to: r.u16()? },
         B_POOL => Msg::Pool(pool(&mut r)?),
+        B_CLIENTS if m.len() == 1 => Msg::Clients,
         _ => return None,
     })
 }
@@ -305,6 +309,20 @@ pub fn put_member(out: &mut [u8], wire: u8, index: u8, up: bool, why: u8) -> usi
     5
 }
 
+/// The leg client → entry of the minute (P_CLIENTS).
+pub fn put_clients(out: &mut [u8], m: &crate::streams::LegMinute) -> usize {
+    out[0] = P_CLIENTS;
+    let (p50, p90) = m.rtt_us.unwrap_or((NONE_MS, NONE_MS));
+    out[1..5].copy_from_slice(&m.conns.to_le_bytes());
+    out[5..9].copy_from_slice(&m.closed.to_le_bytes());
+    out[9..13].copy_from_slice(&m.sending.to_le_bytes());
+    out[13..21].copy_from_slice(&m.segs.to_le_bytes());
+    out[21..29].copy_from_slice(&m.retrans.to_le_bytes());
+    out[29..33].copy_from_slice(&p50.to_le_bytes());
+    out[33..37].copy_from_slice(&p90.to_le_bytes());
+    37
+}
+
 pub fn put_dgram(out: &mut [u8], tag: u32, payload: &[u8]) -> usize {
     out[0] = P_DGRAM;
     out[1..5].copy_from_slice(&tag.to_le_bytes());
@@ -327,6 +345,7 @@ mod tests {
     const POOL_PLAIN_GOLDEN: &str = "0d0001202c01204eff7f7f000001de4f";
     const POOL_CHROMIUM_GOLDEN: &str = "0d0002042c01204eff7f7f000001bb010a686b2e6578616d706c651a676f6c64656e2d746573742d6b65792d3031323334353637383911002f6f70742f6c696263726f6e65742e736f50454d";
     const TCP_LISTEN_GOLDEN: &str = "0c01fb20";
+    const CLIENTS_GOLDEN: &str = "870c00000003000000090000005abc000000000000250000000000000060470000e8ee0000";
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
     #[test]
@@ -433,5 +452,18 @@ mod tests {
         let n = put_tick(&mut b, &p, &[w]);
         assert_eq!(n, TICK_HEAD + TICK_WIRE);
         assert_eq!(&b[..n], &unhex(TICK_GOLDEN)[..]);
+    }
+
+    #[test]
+    fn clients_golden() {
+        let m = crate::streams::LegMinute { conns: 12, closed: 3, sending: 9, segs: 48218, retrans: 37, rtt_us: Some((18272, 61160)) };
+        let mut b = [0u8; 64];
+        let n = put_clients(&mut b, &m);
+        assert_eq!(b[..n], unhex(CLIENTS_GOLDEN)[..]);
+        let none = crate::streams::LegMinute::default();
+        let n = put_clients(&mut b, &none);
+        assert_eq!(&b[29..n], &[0xff; 8]);
+        assert!(matches!(parse(&[B_CLIENTS]), Some(Msg::Clients)));
+        assert!(parse(&[B_CLIENTS, 0]).is_none());
     }
 }

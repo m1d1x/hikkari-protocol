@@ -11,7 +11,7 @@
 //! (trunk closedMemory), so an id used again soon would be reset.
 
 use std::collections::HashMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::Behind;
@@ -79,6 +79,9 @@ pub struct Stream {
     pub sess: u8,
     /// The exit's FIN is written: the client's side is shut.
     pub write_done: bool,
+    /// The client socket's segments out and sent again as last counted in
+    /// the leg (Leg).
+    leg_seen: (u32, u32),
 }
 
 impl Stream {
@@ -126,6 +129,8 @@ pub struct Streams {
     pub unopened: usize,
     pub open: usize,
     pub n: StreamCounts,
+    /// The leg client → entry of the minute (Leg).
+    pub leg: Leg,
 }
 
 impl Streams {
@@ -138,6 +143,7 @@ impl Streams {
             unopened: 0,
             open: 0,
             n: StreamCounts::default(),
+            leg: Leg::default(),
         }
     }
 
@@ -155,6 +161,7 @@ impl Streams {
             read_done: false,
             sess,
             write_done: false,
+            leg_seen: (0, 0),
         };
         let slot = match self.free.pop() {
             Some(s) => {
@@ -214,9 +221,12 @@ impl Streams {
         self.list.iter().flatten().filter(|st| st.sess == sess).count()
     }
 
-    /// Ends the stream in `slot`: its client connection closes.
+    /// Ends the stream in `slot`: its client connection closes, read once
+    /// more for the leg.
     pub fn end(&mut self, slot: usize) {
-        if let Some(st) = self.list[slot].take() {
+        if let Some(mut st) = self.list[slot].take() {
+            self.leg.read(&mut st);
+            self.leg.closed += 1;
             self.by_id.remove(&st.id);
             if !st.opened {
                 self.unopened -= 1;
@@ -224,5 +234,72 @@ impl Streams {
             self.open -= 1;
             self.free.push(slot);
         }
+    }
+}
+
+/// Round trips a minute keeps for its percentiles, at most.
+const LEG_RTTS: usize = 8192;
+
+/// The leg client → entry over every client's socket (the Go entry's
+/// trunkentry clients.go, the same sums): segments the pipe sent its clients
+/// and sent again, and the round trip of each socket that sent, since the
+/// last minute. No client is named in it.
+#[derive(Default)]
+pub struct Leg {
+    pub segs: u64,
+    pub retrans: u64,
+    pub closed: u32,
+    pub rtts_us: Vec<u32>,
+}
+
+/// One minute of the leg, as the brain gets it (ctl::put_clients).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LegMinute {
+    pub conns: u32,
+    pub closed: u32,
+    pub sending: u32,
+    pub segs: u64,
+    pub retrans: u64,
+    /// The sockets' round trips at p50 and p90 in µs; None: no socket sent.
+    pub rtt_us: Option<(u32, u32)>,
+}
+
+impl Leg {
+    /// Counts what a client's socket did since it was last read.
+    fn read(&mut self, st: &mut Stream) {
+        let Some(i) = sys::tcp_info(st.client.fd.as_raw_fd()) else { return };
+        self.add(st, i);
+    }
+
+    fn add(&mut self, st: &mut Stream, i: sys::TcpInfo) {
+        let segs = i.segs_out.wrapping_sub(st.leg_seen.0);
+        let retrans = i.total_retrans.wrapping_sub(st.leg_seen.1);
+        st.leg_seen = (i.segs_out, i.total_retrans);
+        if segs == 0 {
+            return;
+        }
+        self.segs += segs as u64;
+        self.retrans += retrans as u64;
+        if i.rtt_us > 0 && self.rtts_us.len() < LEG_RTTS {
+            self.rtts_us.push(i.rtt_us);
+        }
+    }
+
+    /// The minute's sums, with them every live socket read, and the next
+    /// minute begun.
+    pub fn minute(streams: &mut Streams) -> LegMinute {
+        let Streams { list, leg, open, .. } = streams;
+        for st in list.iter_mut().flatten() {
+            leg.read(st);
+        }
+        let mut m = LegMinute { conns: *open as u32, closed: leg.closed, sending: leg.rtts_us.len() as u32, segs: leg.segs, retrans: leg.retrans, rtt_us: None };
+        if !leg.rtts_us.is_empty() {
+            leg.rtts_us.sort_unstable();
+            let at = |q: f64| leg.rtts_us[(q * (leg.rtts_us.len() - 1) as f64) as usize];
+            m.rtt_us = Some((at(0.5), at(0.9)));
+        }
+        *leg = Leg { rtts_us: std::mem::take(&mut leg.rtts_us), ..Leg::default() };
+        leg.rtts_us.clear();
+        m
     }
 }

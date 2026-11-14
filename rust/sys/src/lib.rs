@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 mod tcp;
 mod wake;
 pub use wake::Wake;
-pub use tcp::{accept, connected, into_raw, member_connect, read, shutdown_both, shutdown_write, tcp_connect, tcp_from_fd, tcp_listen, write, Io};
+pub use tcp::{accept, connected, into_raw, member_connect, read, shutdown_both, shutdown_write, tcp_connect, tcp_from_fd, tcp_info, tcp_listen, write, Io, TcpInfo};
 
 /// An IPv4 address as the kernel keeps it: what a batch reads a datagram
 /// from and sends an answer to.

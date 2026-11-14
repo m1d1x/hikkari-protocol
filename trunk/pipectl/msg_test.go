@@ -84,3 +84,26 @@ func TestGolden(t *testing.T) {
 		t.Fatalf("route % x", got)
 	}
 }
+
+// TestClientsGolden: the leg's minute in the bytes the pipe writes
+// (rust/pipe/src/ctl.rs clients_golden).
+func TestClientsGolden(t *testing.T) {
+	m, _ := hex.DecodeString("870c00000003000000090000005abc000000000000250000000000000060470000e8ee0000")
+	c, err := parseClients(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Clients{Conns: 12, Closed: 3, Sending: 9, Segs: 48218, Retrans: 37, RTTP50: 18272 * time.Microsecond, RTTP90: 61160 * time.Microsecond}
+	if c != want {
+		t.Fatalf("clients %+v, want %+v", c, want)
+	}
+	for i := 29; i < 37; i++ {
+		m[i] = 0xff
+	}
+	if c, _ := parseClients(m); c.RTTP50 != -1 || c.RTTP90 != -1 {
+		t.Fatalf("no round trip read as %v, %v", c.RTTP50, c.RTTP90)
+	}
+	if _, err := parseClients(m[:36]); err == nil {
+		t.Fatal("a torn clients read")
+	}
+}
