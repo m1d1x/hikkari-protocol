@@ -103,7 +103,7 @@ mod call {
     pub fn run() -> Result<(), String> {
         let a = args()?;
         hikkari_cronet::load(a.cronet.as_deref())?;
-        let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.exit, roots: a.roots.clone() })?;
+        let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.exit, roots: a.roots.clone() }, false)?;
         let auth = h3dgram::authorization(&h3dgram::token(&a.key));
         let t0 = sys::now_ns();
         let tunnel = Tunnel::open(&engine, ("trunk.hikkari.arpa", 443), &[("proxy-authorization", &auth)], None, a.usage)?;

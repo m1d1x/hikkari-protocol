@@ -77,10 +77,20 @@ impl Pipe {
                 return res;
             }
             Some(Msg::Unwire { id }) => self.unpool(id),
+            Some(Msg::Wire { h3: Some(_), .. }) => {
+                // The QUIC wire's strings point into the message buffer.
+                let msg = std::mem::take(&mut self.msg);
+                let res = match ctl::parse(&msg[..n]) {
+                    Some(Msg::Wire { id, glue_us, glue_max, dead_ms, key, h3: Some(h), .. }) => self.set_h3(id, glue_us, glue_max, dead_ms, key, &h),
+                    _ => unreachable!("parsed as a QUIC wire above"),
+                };
+                self.msg = msg;
+                return res;
+            }
             _ => {}
         }
         let (cur, taker) = (self.cur, self.taker());
-        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, gone, .. } = self;
+        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, gone, h3s, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
         };
@@ -104,7 +114,7 @@ impl Pipe {
                 }
                 *dirty = true;
             }
-            Msg::Wire { id, form, glue_us, glue_max, dead_ms, key } => {
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, key, .. } => {
                 if form != ctl::FORM_UDP {
                     return Err(format!("wire {id}: form {form} is not one the pipe carries"));
                 }
@@ -122,6 +132,10 @@ impl Pipe {
                     sys::tune(&s, false).map_err(|e| format!("wire {id}: {e}"))?;
                     socks.push(s);
                 }
+                // A QUIC wire of the same id in this session goes: the id
+                // is the bare UDP wire's now.
+                wires.retain(|w| !(w.id == id && w.sess == sess && w.h3));
+                h3s.retain(|h| wires.iter().any(|w| w.id == h.id && w.h3));
                 let at = match wires.iter().position(|w| w.id == id && w.sess == sess) {
                     Some(i) => i,
                     None => {
@@ -160,6 +174,7 @@ impl Pipe {
             }
             Msg::Unwire { id } => {
                 wires.retain(|w| w.id != id);
+                h3s.retain(|h| h.id != id);
                 gone.retain(|g| g.id != id);
                 *dirty = true;
             }
@@ -188,7 +203,8 @@ impl Pipe {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
                 }
-                let Some(m) = wires.iter_mut().find(|w| w.id == wire && w.sess == cur).and_then(|w| w.members.get_mut(index as usize)) else {
+                // The QUIC wire's members are the pipe's own (h3.rs).
+                let Some(m) = wires.iter_mut().find(|w| w.id == wire && w.sess == cur && !w.h3).and_then(|w| w.members.get_mut(index as usize)) else {
                     return Err(format!("member {wire}/{index}: no such member"));
                 };
                 // Only a member down of the session that replaces its

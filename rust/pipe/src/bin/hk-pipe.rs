@@ -14,7 +14,12 @@
 //! key `--key`, trusting the PEM roots in `--tcp-roots` (tests) or the
 //! system's, libcronet from `--cronet` or found as the Go entry finds it.
 //! The stream members' source ports come from the book of `--ports lo-hi`
-//! (trunk's 20000-32767 without it). With `--members 0` there is no wire of
+//! (trunk's 20000-32767 without it). With `--h3dgram <domain>` the wire is
+//! the Chromium QUIC wire to the exit's QUIC port at `--wire` (spec/trunk.md,
+//! `h3dgram`), its members CONNECT-UDP tunnels from source ports of the same
+//! book, the certificate checked by the PEM roots in `--h3-roots` or the
+//! system's, the sessions used as `--usage destination|proxy` says
+//! (destination by default). With `--members 0` there is no wire of
 //! packet members, and clients' datagrams ride the stream members (the
 //! pool's wire 0, as the Go entry's voice on its pool).
 //!
@@ -56,7 +61,9 @@ mod linux {
             tcp_members: 4,
             tcp_chromium: None,
             ports: (hikkari_trunk::ports::LO, hikkari_trunk::ports::HI),
+            h3: None,
         };
+        let (mut h3, mut h3_roots, mut usage): (Option<String>, Option<String>, hikkari_cronet::Usage) = (None, None, Default::default());
         let (mut chromium, mut roots, mut cronet): (Option<String>, Option<String>, Option<String>) = (None, None, None);
         let mut flow_idle_ms: Option<u64> = None;
         let (mut take_over_ms, mut retire_ms): (Option<u64>, Option<u64>) = (None, None);
@@ -90,6 +97,9 @@ mod linux {
                 "--tcp-chromium" => chromium = Some(v),
                 "--tcp-roots" => roots = Some(std::fs::read_to_string(&v).expect("--tcp-roots file")),
                 "--cronet" => cronet = Some(v),
+                "--h3dgram" => h3 = Some(v),
+                "--h3-roots" => h3_roots = Some(std::fs::read_to_string(&v).expect("--h3-roots file")),
+                "--usage" => usage = hikkari_cronet::Usage::parse(&v).expect("--usage"),
                 "--ports" => {
                     let (lo, hi) = v.split_once('-').expect("--ports lo-hi");
                     a.ports = (lo.parse().expect("--ports lo"), hi.parse().expect("--ports hi"));
@@ -103,6 +113,11 @@ mod linux {
             let form = hikkari_cronet::Form::new(a.tcp_exit, &sni, &a.key, roots).expect("--tcp-chromium");
             a.tcp_chromium = Some(hikkari_cronet::Engine::new(form));
             eprintln!("hk-pipe: stream members by Chromium {}", hikkari_cronet::version().unwrap_or_default());
+        }
+        if let Some(sni) = h3 {
+            hikkari_cronet::load(cronet.as_deref()).expect("libcronet");
+            eprintln!("hk-pipe: the QUIC wire by Chromium {}, sessions {usage:?}", hikkari_cronet::version().unwrap_or_default());
+            a.h3 = Some((sni, h3_roots, usage));
         }
         let mut p = match ctl {
             Some(fd) => {

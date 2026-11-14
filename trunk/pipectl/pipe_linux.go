@@ -49,6 +49,9 @@ type Wire struct {
 	// Every member silent at once dies only after Quiet, the pipe's 1 s.
 	// trunk.DefaultStall when 0.
 	Stall time.Duration
+	// H3, when set, makes it the Chromium QUIC wire to the exit's QUIC port
+	// at Exit (FormH3Dgram): the pipe opens its members itself.
+	H3 *H3Form
 }
 
 // staleTick is how old the latest tick may be before the brain takes the
@@ -289,6 +292,9 @@ func (p *Pipe) SetWire(w Wire) error {
 	}
 	if w.Stall == 0 {
 		w.Stall = trunk.DefaultStall
+	}
+	if w.H3 != nil {
+		return p.setH3(w)
 	}
 	key, err := udpwire.Key(w.Key)
 	if err != nil {
@@ -542,7 +548,8 @@ func (p *Pipe) renew(id trunk.WireID, index int) {
 	p.mu.Lock()
 	wc := p.wires[id]
 	p.mu.Unlock()
-	if wc == nil || index >= len(wc.members) {
+	// A QUIC wire's members are the pipe's own: it opens them anew.
+	if wc == nil || wc.w.H3 != nil || index >= len(wc.members) {
 		return
 	}
 	c, err := dialMember(wc.w.Exit)

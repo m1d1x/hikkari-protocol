@@ -32,7 +32,7 @@ const Version = 5
 const (
 	bHello  = 0x01 // ver u16
 	bListen = 0x02 // id u8, class u8, to u16, copies u8; one socket
-	bWire   = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; a socket per member
+	bWire   = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; FormUDP: a socket per member; FormH3Dgram: see putH3
 	bUnwire = 0x04 // id u8
 	bRoute  = 0x05 // voice u8, bulk u8
 	bOpen   = 0x06 // tag u32, class u8, pin u8, port u16, copies u8
@@ -63,13 +63,19 @@ const (
 	pDrained = 0x86 // a pipe draining carries nothing more
 )
 
-// FormUDP is the bare UDP wire (trunk/udpwire), the only form the entry's
-// pipe carries so far.
+// FormUDP is the bare UDP wire (trunk/udpwire): the brain dials its members.
 const FormUDP = 1
 
 // FormH3Dgram is the Chromium QUIC wire (spec/trunk.md, h3dgram, trunk/h3dgram):
-// the exit's pipe serves it since R6.2, the entry's pipe not yet (R6.3).
+// the exit's pipe serves it since R6.2, the entry's since R6.3, whose members
+// are CONNECT-UDP tunnels the pipe opens itself (rust/pipe/src/pipe/h3.rs).
 const FormH3Dgram = 2
+
+// How a QUIC wire's member uses its session (H3Form.Usage).
+const (
+	usageDestination = 0
+	usageProxy       = 1
+)
 
 // noneMS is a duration the pipe has no value for.
 const noneMS = ^uint32(0)
@@ -91,6 +97,56 @@ func putWire(id trunk.WireID, form byte, glue time.Duration, glueMax int, dead t
 	b = binary.LittleEndian.AppendUint16(b, uint16(glueMax))
 	b = binary.LittleEndian.AppendUint16(b, uint16(dead/time.Millisecond))
 	return append(b, key...), nil
+}
+
+// H3Form is what the QUIC wire's members are opened with: the exit's domain
+// (its certificate is checked against it), libcronet's path ("": found as
+// the Go entry finds it), PEM roots that replace the system's ("": the
+// system's), how the members use their QUIC sessions (Usage: "destination",
+// Chrome's to a site, the default by the owner's choice of 2026-11-14, or
+// "proxy") and the book of their source ports (Ports: lo, hi; the pipe's
+// 20000-32767 when zero). A wire given another form comes up anew.
+type H3Form struct {
+	SNI, Cronet, Roots string
+	Usage              string
+	Ports              [2]uint16
+}
+
+// putH3 is a QUIC wire's B_WIRE: the head as putWire's with the wire's
+// token for its key, then members u8, usage u8, lo u16, hi u16, exit ip [4]
+// port u16, sni u8+n, cronet u16+n, roots (rest).
+func putH3(id trunk.WireID, glue time.Duration, glueMax int, dead time.Duration, token []byte, members int, exit netip.AddrPort, f H3Form) ([]byte, error) {
+	if members < 1 || members > 255 {
+		return nil, fmt.Errorf("pipectl: wire %d: %d members, want 1-255", id, members)
+	}
+	if !exit.Addr().Is4() {
+		return nil, fmt.Errorf("pipectl: wire %d: exit %v is not IPv4", id, exit)
+	}
+	var usage byte
+	switch f.Usage {
+	case "", "destination":
+		usage = usageDestination
+	case "proxy":
+		usage = usageProxy
+	default:
+		return nil, fmt.Errorf("pipectl: wire %d: session usage %q is not destination or proxy", id, f.Usage)
+	}
+	if len(f.SNI) > 255 || len(f.Cronet) > 65535 {
+		return nil, fmt.Errorf("pipectl: wire %d: a domain or path too long", id)
+	}
+	b, err := putWire(id, FormH3Dgram, glue, glueMax, dead, token)
+	if err != nil {
+		return nil, err
+	}
+	b = append(b, byte(members), usage)
+	b = binary.LittleEndian.AppendUint16(b, f.Ports[0])
+	b = binary.LittleEndian.AppendUint16(b, f.Ports[1])
+	ip := exit.Addr().As4()
+	b = append(b, ip[:]...)
+	b = binary.LittleEndian.AppendUint16(b, exit.Port())
+	b = append(append(b, byte(len(f.SNI))), f.SNI...)
+	b = append(binary.LittleEndian.AppendUint16(b, uint16(len(f.Cronet))), f.Cronet...)
+	return append(b, f.Roots...), nil
 }
 
 func putListen(id byte, class trunk.Class, to uint16, copies int) []byte {

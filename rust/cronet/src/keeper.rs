@@ -34,6 +34,9 @@ pub(crate) enum Job {
     Close(Arc<Shared>),
     /// A handle on an engine dropped.
     Release(Arc<Hub>),
+    /// Anything else that waits for a network thread (a tunnel engine's
+    /// start, a tunnel's or an engine's end), off the pipe's loop.
+    Run(Box<dyn FnOnce() + Send>),
 }
 
 static KEEPER: OnceLock<Sender<Job>> = OnceLock::new();
@@ -58,6 +61,7 @@ pub(crate) fn send(job: Job) {
                             release(hub);
                         }
                         Job::Release(hub) => release(hub),
+                        Job::Run(f) => f(),
                     }
                 }
             })
@@ -65,6 +69,18 @@ pub(crate) fn send(job: Job) {
         tx
     });
     let _ = tx.send(job);
+}
+
+/// Runs f on the keeper's thread: for what blocks on cronet's network
+/// thread and must not block the pipe's loop.
+pub fn off_loop(f: impl FnOnce() + Send + 'static) {
+    send(Job::Run(Box::new(f)));
+}
+
+/// Drops t on the keeper's thread (a tunnel, an engine's last handle: their
+/// ends wait for the network thread).
+pub fn let_go<T: Send + 'static>(t: T) {
+    off_loop(move || drop(t));
 }
 
 /// The Chromium build the members speak, from an engine made for the asking.

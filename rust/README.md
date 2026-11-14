@@ -253,11 +253,11 @@ Brain → pipe:
 | --- | --- |
 | `hello` | version |
 | `listen` | a client port (one socket): id, class (bulk, voice), the exit's loopback port, copies |
-| `wire` | a wire and its members (one connected socket each): id, form (`udp`; later `quic`, `h3`), glue window and size, its members' stall (dead_ms: Stall, the pipe adds the rest of the rule), the wire's own key (udpwire.Key of the trunk key: the pipe never sees the trunk key) |
+| `wire` | a wire and its members: id, form, glue window and size, its members' stall (dead_ms: Stall, the pipe adds the rest of the rule), the wire's own key (the pipe never sees the trunk key). Form `udp`: one connected socket per member, the key udpwire.Key. Form `h3dgram` (R6.3): no sockets, the pipe opens its members itself (CONNECT-UDP tunnels over Chromium's QUIC from ports of the wire's book) and renews dead ones; the key is h3dgram.Token, then members, session usage (`destination`, `proxy`), the book's range, the exit's QUIC port, its domain, libcronet's path and PEM roots (empty: the system's). A new form brings the wire up anew |
 | `unwire` | a wire taken away; its flows go on by the route |
 | `route` | the wire of each class; the pipe moves the next datagram, nothing to migrate: the exit answers a flow on the wire the entry last sent it on |
 | `open`, `dgram`, `close` | a flow of the brain's own (its call on a wire, pinned: dropped while the wire has no member up) and its datagrams |
-| `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer |
+| `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer; never for an `h3dgram` wire |
 | `drain` | the old end of a reload's handoff socket (one): the pipe takes no new client (below, «Generations») |
 | `adopt` | the new end of a handoff socket (one): an older pipe drains to this one; it comes before the client ports |
 | `tcp_listen` | a client port of streams (one listening TCP socket): id, the exit's loopback port; every connection accepted is a stream on the pools (R4.2) |

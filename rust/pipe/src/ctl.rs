@@ -10,7 +10,7 @@ pub const VERSION: u16 = 5;
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
 pub const B_LISTEN: u8 = 0x02; // id u8, class u8, to u16, copies u8; one fd: a bound UDP socket
-pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; one fd per member
+pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; FORM_UDP: one fd per member; FORM_H3DGRAM: see H3
 pub const B_UNWIRE: u8 = 0x04; // id u8
 pub const B_ROUTE: u8 = 0x05; // voice u8, bulk u8
 pub const B_OPEN: u8 = 0x06; // tag u32, class u8, pin u8, port u16, copies u8
@@ -30,8 +30,16 @@ pub const P_DGRAM: u8 = 0x84; // tag u32, payload
 pub const P_ERROR: u8 = 0x85; // text
 pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no client's flow, no stream
 
-/// The only wire form so far: the bare UDP wire (trunk/udpwire).
+/// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
 pub const FORM_UDP: u8 = 1;
+/// The Chromium QUIC wire (spec/trunk.md, `h3dgram`): the pipe opens its
+/// members itself, CONNECT-UDP tunnels over Chromium's QUIC from ports of
+/// the wire's book; the message's key is the token (h3dgram::token of the
+/// trunk key) and its tail an H3.
+pub const FORM_H3DGRAM: u8 = 2;
+/// How a QUIC wire's member uses its session (hikkari_cronet::Usage).
+pub const USAGE_DESTINATION: u8 = 0;
+pub const USAGE_PROXY: u8 = 1;
 /// A pool's forms: stream members over plain TCP to the exit's member port
 /// (tests, the bench), or Chromium's CONNECT to the exit's relay (the
 /// pool's form, trunk/chromium).
@@ -55,7 +63,7 @@ pub const MAX_FDS: usize = 64;
 pub enum Msg<'a> {
     Hello { ver: u16 },
     Listen { id: u8, class: u8, to: u16, copies: u8 },
-    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, key: [u8; 32] },
+    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, key: [u8; 32], h3: Option<H3<'a>> },
     Unwire { id: u8 },
     Route { voice: u8, bulk: u8 },
     Open { tag: u32, class: u8, pin: u8, port: u16, copies: u8 },
@@ -79,6 +87,22 @@ pub struct Pool<'a> {
     pub exit: std::net::SocketAddrV4,
     pub sni: &'a str,
     pub key: &'a str,
+    /// libcronet's path; empty: found as the Go entry finds it.
+    pub cronet: &'a str,
+    /// PEM roots that replace the system's trust; empty: the system's.
+    pub roots: &'a str,
+}
+
+/// The tail of a QUIC wire's B_WIRE: members u8, usage u8, lo u16, hi u16,
+/// exit ip [4] port u16, sni u8+n, cronet u16+n, roots (rest). Its members
+/// are tunnels to the exit's QUIC port at `exit`, whose certificate names
+/// `sni`, from source ports of [lo, hi].
+pub struct H3<'a> {
+    pub members: u8,
+    pub usage: u8,
+    pub ports: (u16, u16),
+    pub exit: std::net::SocketAddrV4,
+    pub sni: &'a str,
     /// libcronet's path; empty: found as the Go entry finds it.
     pub cronet: &'a str,
     /// PEM roots that replace the system's trust; empty: the system's.
@@ -118,14 +142,16 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
     Some(match *m.first()? {
         B_HELLO => Msg::Hello { ver: r.u16()? },
         B_LISTEN => Msg::Listen { id: r.u8()?, class: r.u8()?, to: r.u16()?, copies: r.u8()? },
-        B_WIRE => Msg::Wire {
-            id: r.u8()?,
-            form: r.u8()?,
-            glue_us: r.u32()?,
-            glue_max: r.u16()?,
-            dead_ms: r.u16()?,
-            key: r.take(32)?.try_into().ok()?,
-        },
+        B_WIRE => {
+            let (id, form, glue_us, glue_max, dead_ms) = (r.u8()?, r.u8()?, r.u32()?, r.u16()?, r.u16()?);
+            let key = r.take(32)?.try_into().ok()?;
+            let h3 = match form {
+                FORM_H3DGRAM => Some(h3(&mut r)?),
+                _ if r.at == r.p.len() => None,
+                _ => return None,
+            };
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, key, h3 }
+        }
         B_UNWIRE => Msg::Unwire { id: r.u8()? },
         B_ROUTE => Msg::Route { voice: r.u8()?, bulk: r.u8()? },
         B_OPEN => Msg::Open { tag: r.u32()?, class: r.u8()?, pin: r.u8()?, port: r.u16()?, copies: r.u8()? },
@@ -138,6 +164,23 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_POOL => Msg::Pool(pool(&mut r)?),
         _ => return None,
     })
+}
+
+fn h3<'a>(r: &mut Rd<'a>) -> Option<H3<'a>> {
+    let (members, usage) = (r.u8()?, r.u8()?);
+    if usage > USAGE_PROXY {
+        return None;
+    }
+    let ports = (r.u16()?, r.u16()?);
+    let ip: [u8; 4] = r.take(4)?.try_into().ok()?;
+    let exit = std::net::SocketAddrV4::new(ip.into(), r.u16()?);
+    let text = |b: &'a [u8]| std::str::from_utf8(b).ok();
+    let n = r.u8()? as usize;
+    let sni = text(r.take(n)?)?;
+    let n = r.u16()? as usize;
+    let cronet = text(r.take(n)?)?;
+    let roots = text(r.rest())?;
+    Some(H3 { members, usage, ports, exit, sni, cronet, roots })
 }
 
 fn pool<'a>(r: &mut Rd<'a>) -> Option<Pool<'a>> {
@@ -284,6 +327,7 @@ mod tests {
     const POOL_PLAIN_GOLDEN: &str = "0d0001202c01204eff7f7f000001de4f";
     const POOL_CHROMIUM_GOLDEN: &str = "0d0002042c01204eff7f7f000001bb010a686b2e6578616d706c651a676f6c64656e2d746573742d6b65792d3031323334353637383911002f6f70742f6c696263726f6e65742e736f50454d";
     const TCP_LISTEN_GOLDEN: &str = "0c01fb20";
+    const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
     #[test]
     fn parses_the_brains_pool_and_tcp_port() {
@@ -313,18 +357,39 @@ mod tests {
     fn parses_the_brains_wire() {
         let m = unhex(WIRE_GOLDEN);
         match parse(&m) {
-            Some(Msg::Wire { id, form, glue_us, glue_max, dead_ms, key }) => {
+            Some(Msg::Wire { id, form, glue_us, glue_max, dead_ms, key, h3: None }) => {
                 assert_eq!((id, form, glue_us, glue_max, dead_ms), (3, FORM_UDP, 1000, 1200, 300));
                 assert_eq!(key[31], 31);
             }
             _ => panic!("not a wire"),
         }
+        let mut more = m.clone();
+        more.push(0);
+        assert!(parse(&more).is_none(), "a bare UDP wire carries nothing after its key");
         assert!(parse(&m[..m.len() - 1]).is_none());
         assert!(parse(&[0x7f]).is_none());
         match parse(&[B_DGRAM, 7, 0, 0, 0, b'h', b'i']) {
             Some(Msg::Dgram { tag: 7, payload }) => assert_eq!(payload, b"hi"),
             _ => panic!("not a dgram"),
         }
+    }
+
+    #[test]
+    fn parses_the_brains_quic_wire() {
+        // The same bytes as trunk/pipectl msg_test.go TestGolden's QUIC wire.
+        let m = unhex(H3_WIRE_GOLDEN);
+        match parse(&m) {
+            Some(Msg::Wire { id: 6, form: FORM_H3DGRAM, glue_us: 1000, glue_max: 1200, dead_ms: 300, key, h3: Some(h) }) => {
+                assert_eq!(key[1], 1);
+                assert_eq!((h.members, h.usage, h.ports, h.exit), (4, USAGE_DESTINATION, (20000, 32767), "127.0.0.1:4445".parse().unwrap()));
+                assert_eq!((h.sni, h.cronet, h.roots), ("hk.example", "/opt/libcronet.so", "PEM"));
+            }
+            _ => panic!("not a QUIC wire"),
+        }
+        assert!(parse(&m[..m.len() - 5]).is_none(), "a torn path");
+        let mut bad = m.clone();
+        bad[44] = 2;
+        assert!(parse(&bad).is_none(), "usage 2 is neither destination nor proxy");
     }
 
     #[test]

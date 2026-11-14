@@ -24,12 +24,14 @@
 //! ticks to it), timers.rs (members' hello, pings and deaths), data.rs
 //! (clients → wires → clients), tcp.rs and death.rs (streams), session.rs
 //! (the exit's drain: sessions), generation.rs (the pipe's own reload),
-//! pool.rs (the brain's client ports of streams and pools).
+//! pool.rs (the brain's client ports of streams and pools), h3.rs (the
+//! Chromium QUIC wire's members: tunnels from the book's ports).
 
 mod brain;
 mod data;
 mod death;
 mod generation;
+mod h3;
 mod pool;
 mod session;
 mod tcp;
@@ -119,6 +121,11 @@ pub struct Alone {
     /// The stream members by Chromium's CONNECT to the exit's relay at
     /// tcp_exit instead of plain TCP, on this engine (None: plain).
     pub tcp_chromium: Option<hikkari_cronet::Engine>,
+    /// The wire is the Chromium QUIC wire to the exit's QUIC port at `exit`
+    /// instead of the bare UDP wire: its certificate's domain, the PEM roots
+    /// it is checked by (None: the system's), how the members use their
+    /// sessions. Their source ports come from `ports`.
+    pub h3: Option<(String, Option<String>, hikkari_cronet::Usage)>,
 }
 
 pub struct Pipe {
@@ -140,6 +147,8 @@ pub struct Pipe {
     flow_idle_ns: u64,
     listens: Vec<Listen>,
     wires: Vec<Wire>,
+    /// The Chromium QUIC wires' engines and books, by wire id (h3.rs).
+    h3s: Vec<h3::H3>,
     /// The wire of each class, by class (CLASS_BULK, CLASS_VOICE).
     route: [u8; 2],
     flows: Flows,
@@ -203,6 +212,7 @@ impl Pipe {
             flow_idle_ns: FLOW_IDLE_NS,
             listens: Vec::new(),
             wires: Vec::new(),
+            h3s: Vec::new(),
             route: [ANY_WIRE, ANY_WIRE],
             flows: Flows::new(),
             tcp_listens: Vec::new(),
@@ -257,13 +267,24 @@ impl Pipe {
         sys::tune(&sock, gro)?;
         p.listens.push(Listen { id: 0, sock, class: CLASS_VOICE, to: a.to, copies: a.copies, down: SendBatch::new() });
         if a.members > 0 {
-            let key = udpwire::key(&a.key);
+            let key = match &a.h3 {
+                Some(_) => hikkari_trunk::h3dgram::token(&a.key),
+                None => udpwire::key(&a.key),
+            };
             let mut w = Wire::new(a.wire, key, health::STALL);
             w.glue_ns = a.glue_ns;
             w.glue_max = a.glue_max;
             w.exit = Some(a.exit);
+            if let Some((sni, roots, usage)) = &a.h3 {
+                let f = h3::Form { exit: a.exit, sni: sni.clone(), roots: roots.clone(), usage: *usage, ports: a.ports, token: key };
+                p.h3s.push(h3::H3::new(a.wire, f).map_err(io::Error::other)?);
+                w.h3 = true;
+                w.glue_max = a.glue_max.min(h3::frames_max(*usage));
+            }
             for _ in 0..a.members {
-                w.members.push(Member::new(Some(member_to(a.exit)?), &key));
+                let fmax = a.h3.as_ref().map_or(0, |h| h3::frames_max(h.2));
+                let m = if w.h3 { Member::plain(&key, fmax) } else { Member::new(Some(member_to(a.exit)?), &key) };
+                w.members.push(m);
             }
             p.wires.push(w);
             p.route = [a.wire, a.wire];
@@ -459,8 +480,9 @@ impl Pipe {
         );
         for w in &self.wires {
             let dgrams = w.members.iter().map(|m| m.dgrams).sum::<u64>();
+            let dropped = w.t.dropped + w.members.iter().map(|m| m.send.dropped + m.too_big).sum::<u64>();
             s += &format!(
-                " | wire {} up={}/{} in={} out={} dgrams={} frames/dgram={:.2}",
+                " | wire {} up={}/{} in={} out={} dgrams={} frames/dgram={:.2} dropped={dropped}",
                 w.id,
                 w.up(),
                 w.members.len(),
@@ -469,6 +491,9 @@ impl Pipe {
                 dgrams,
                 w.t.up_pkts as f64 / dgrams.max(1) as f64
             );
+            if let Some(h) = self.h3s.iter().find(|h| h.id == w.id).filter(|_| w.h3 && w.sess == self.cur) {
+                s += &h.stats();
+            }
         }
         if self.has_tcp() {
             s += &tcp::stats(&self.streams, &self.swires, &self.ports);

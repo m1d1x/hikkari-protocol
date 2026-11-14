@@ -208,10 +208,21 @@ token carries nothing of the trunk. Capsules on the request stream are read and 
 
 An HTTP Datagram is the request stream's quarter stream id (varint), context id 0 (varint) and the frames of one write as
 they are, not sealed: QUIC's TLS already keeps them, and the token proved the trunk key. A datagram with another context id,
-or one for a stream that is no member, is dropped. The frames of one datagram are what one QUIC DATAGRAM frame holds on the
-connection's path (about 1200 B with Chromium's packets): a write over it is dropped, as udpwire drops one over its
-datagram. Live datagrams of clients (voice, games) fit; a client's own QUIC packets (1250–1350 B) do not and go on a wire
-that carries them.
+or one for a stream that is no member, is dropped. The frames of one datagram are at most what Chromium guarantees one HTTP
+Datagram of the member holds, whatever its packet number's length (R6.3): 1194 B in packets of 1250 B (`destination`),
+1294 B in packets of 1350 B (`proxy`), that is the packet less a long header with the version, the exit's 16-byte and
+Chromium's 8-byte connection ids, a 2-byte length and a 4-byte packet number, the 16-byte tag, the DATAGRAM frame's type
+and the HTTP Datagram's 2-byte head. Chromium resets the request stream (and with it the member) on a datagram over the
+room it has now, so the entry never writes one over that limit: a frame alone over it is dropped and counted, as udpwire
+drops one over its datagram. Live datagrams of clients (voice, games) fit; a client's own QUIC packets (1250–1350 B) do
+not and go on a wire that carries them.
+
+The entry opens its members itself, not the brain (R6.3): one Chromium engine per wire, a CONNECT-UDP tunnel per member,
+each in a network partition of its own, so no two members share a QUIC connection. A member's UDP socket is the entry's,
+as a pool member's TCP socket is: bound from a port of the wire's book of source ports, connected to the exit and given
+to the engine's UDP dialer, which refuses every other socket Chromium asks for; a dead member's port rests in the book
+as a stream member's does. A tunnel closed under the member is its death (gone), as a closed socket is; a member dead by
+its health closes its tunnel. Either way the entry opens a new member within the spread.
 
 The member's end is its connection's: the request stream ending, the connection closing or the member dying by its health
 closes both, and the entry opens a new member with a new connection. The exit's QUIC connection ids are random, 16 bytes.

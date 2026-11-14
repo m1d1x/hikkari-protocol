@@ -71,11 +71,11 @@ impl Pipe {
                     let slot = wrecv.slot;
                     let len = wrecv.len[i];
                     let d = &mut wrecv.buf[i * slot..i * slot + len];
-                    let Some(pn) = m.seal.open(d) else {
+                    let Some((at, pn)) = m.open(d) else {
                         *bad += 1;
                         continue;
                     };
-                    let p = &d[12..12 + pn];
+                    let p = &d[at..at + pn];
                     let mut at = 0;
                     while let Some((fr, nx)) = frame::next_frame(p, at) {
                         match fr {

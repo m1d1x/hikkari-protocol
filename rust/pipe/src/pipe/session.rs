@@ -69,7 +69,7 @@ impl Sess {
 pub(super) fn counted(w: &Wire) -> WireTick {
     let mut t = w.t;
     t.dgrams = w.members.iter().map(|m| m.dgrams).sum();
-    t.dropped += w.members.iter().map(|m| m.send.dropped).sum::<u64>();
+    t.dropped += w.members.iter().map(|m| m.send.dropped + m.too_big).sum::<u64>();
     t
 }
 
@@ -154,8 +154,11 @@ impl Pipe {
             nw.glue_ns = w.glue_ns;
             nw.glue_max = w.glue_max;
             nw.exit = w.exit;
+            nw.h3 = w.h3;
             for _ in 0..w.members.len() {
-                nw.members.push(Member::new(w.exit.and_then(|e| member_to(e).ok()), &w.key));
+                // The QUIC wire's members open their tunnels (h3.rs).
+                let m = if w.h3 { Member::plain(&w.key, w.members.first().map_or(0, |m| m.frames_max)) } else { Member::new(w.exit.and_then(|e| member_to(e).ok()), &w.key) };
+                nw.members.push(m);
             }
             add.push(nw);
         }
@@ -233,10 +236,18 @@ impl Pipe {
     /// counted goes on in `gone`. A StreamWire's slot is kept for the next
     /// session: streams owe by its index.
     pub(super) fn close_session(&mut self, s: u8) {
-        let gone = &mut self.gone;
+        let (gone, h3s) = (&mut self.gone, &mut self.h3s);
+        let now = sys::now_ns();
         self.wires.retain(|w| {
             if w.sess != s {
                 return true;
+            }
+            // Its tunnels go with its members (member.rs, Drop); their
+            // ports go back to the book.
+            if let Some(h) = h3s.iter_mut().find(|h| h.id == w.id && w.h3) {
+                for m in &w.members {
+                    h.give_back(m.port, false, now);
+                }
             }
             let t = counted(w);
             match gone.iter_mut().find(|g| g.id == w.id) {

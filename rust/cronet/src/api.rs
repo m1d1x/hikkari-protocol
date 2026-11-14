@@ -89,11 +89,23 @@ pub const SESSION_PROXY: c_int = 1;
 /// Cronet_UdpTunnelCallback, called on cronet's network thread.
 pub type TunnelCallback = unsafe extern "C" fn(ctx: Ptr, event: c_int, net_error: c_int);
 
-/// The CONNECT-UDP tunnel's calls, in a patched libcronet only.
+/// Cronet_UdpDialerFunc: a ready UDP socket's descriptor and its local
+/// address and port written out, or a negative net error. A socket id of 0
+/// asks for no close callback.
+pub type UdpDialerFn =
+    unsafe extern "C" fn(ctx: Ptr, address: *const c_char, port: u16, out_local: *mut c_char, out_port: *mut u16, out_id: *mut u64) -> isize;
+
+/// Cronet_UdpSocketCloseFunc.
+pub type UdpCloseFn = unsafe extern "C" fn(socket_id: u64);
+
+/// The CONNECT-UDP tunnel's calls, in a patched libcronet only, with the
+/// engine's UDP dialer (sagernet's, cronet_c.h) the tunnels' sockets come
+/// from.
 pub struct TunnelApi {
     pub create: unsafe extern "C" fn(Ptr, *const TunnelParams, TunnelCallback, Ptr) -> Ptr,
     pub destroy: unsafe extern "C" fn(Ptr),
     pub stats: unsafe extern "C" fn(Ptr) -> TunnelStats,
+    pub set_udp_dialer: unsafe extern "C" fn(Ptr, Option<UdpDialerFn>, Ptr, Option<UdpCloseFn>),
 }
 
 pub struct Api {
@@ -207,8 +219,9 @@ fn resolve(h: Ptr) -> Result<Api, String> {
                 sym(h, "Cronet_UdpTunnel_Create"),
                 sym(h, "Cronet_UdpTunnel_Destroy"),
                 sym(h, "Cronet_UdpTunnel_GetStats"),
+                sym(h, "Cronet_Engine_SetUdpDialer"),
             ) {
-                (Ok(create), Ok(destroy), Ok(stats)) => Some(TunnelApi { create, destroy, stats }),
+                (Ok(create), Ok(destroy), Ok(stats), Ok(set_udp_dialer)) => Some(TunnelApi { create, destroy, stats, set_udp_dialer }),
                 _ => None,
             },
         })

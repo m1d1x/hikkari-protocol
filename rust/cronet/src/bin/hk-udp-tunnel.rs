@@ -89,7 +89,7 @@ mod probe {
     pub fn run() -> Result<(), String> {
         let a = args()?;
         hikkari_cronet::load(a.cronet.as_deref())?;
-        let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.proxy, roots: a.roots.clone() })?;
+        let engine = TunnelEngine::start(Proxy { sni: a.sni.clone(), addr: a.proxy, roots: a.roots.clone() }, false)?;
         let t0 = sys::now_ns();
         let tunnel = Tunnel::open(&engine, (&a.target.0, a.target.1), &[("proxy-authorization", &a.auth)], None, a.usage)?;
         loop {

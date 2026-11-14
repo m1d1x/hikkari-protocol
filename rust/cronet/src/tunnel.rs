@@ -15,11 +15,11 @@
 //! Opening an engine and destroying a tunnel or an engine wait for cronet's
 //! network thread; whoever calls them is not the pipe's loop.
 
-use std::ffi::{c_int, CString};
+use std::ffi::{c_char, c_int, CStr, CString};
 use std::net::SocketAddrV4;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering::*};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use hikkari_sys as sys;
 
@@ -48,6 +48,9 @@ pub struct Proxy {
 pub struct TunnelEngine {
     engine: Ptr,
     proxy: Proxy,
+    /// Where its sessions' UDP sockets come from (None: Chromium binds its
+    /// own, from a port of the kernel's).
+    hand: Option<Arc<UdpHand>>,
 }
 
 // SAFETY: the engine is a cronet object whose calls are thread-safe
@@ -57,18 +60,24 @@ unsafe impl Sync for TunnelEngine {}
 
 impl TunnelEngine {
     /// Starts an engine for tunnels to `proxy`. Blocks until its network
-    /// thread is up.
-    pub fn start(proxy: Proxy) -> Result<Arc<TunnelEngine>, String> {
+    /// thread is up. With `own_sockets` every QUIC session of the engine
+    /// takes the UDP socket its tunnel's opener put in `hand()`.
+    pub fn start(proxy: Proxy, own_sockets: bool) -> Result<Arc<TunnelEngine>, String> {
         let a = api::api().ok_or("cronet: libcronet is not loaded")?;
-        if a.tunnel.is_none() {
+        let Some(t) = a.tunnel.as_ref() else {
             return Err("cronet: this libcronet has no CONNECT-UDP tunnel (not our patched build)".into());
-        }
+        };
         let opts = options(&proxy);
-        // SAFETY: made and set up in the order cronet_c.h asks (dialer and
-        // verifier before the start); the dialer needs no context.
+        let hand = own_sockets.then(|| Arc::new(UdpHand::new(proxy.addr)));
+        // SAFETY: made and set up in the order cronet_c.h asks (dialers and
+        // verifier before the start); the TCP dialer needs no context, the
+        // UDP one the hand, which the engine holds until it is shut down.
         unsafe {
             let e = (a.engine_create)();
             (a.engine_set_dialer)(e, Some(refuse), std::ptr::null_mut());
+            if let Some(h) = &hand {
+                (t.set_udp_dialer)(e, Some(dial_udp), Arc::as_ptr(h) as Ptr, None);
+            }
             if let Some(pem) = &proxy.roots {
                 let pem = CString::new(pem.as_str()).map_err(|_| "cronet: the roots have a NUL")?;
                 let v = (a.verifier_with_roots)(pem.as_ptr());
@@ -88,13 +97,102 @@ impl TunnelEngine {
                 (a.engine_destroy)(e);
                 return Err(format!("cronet: the tunnel engine did not start: {r}"));
             }
-            Ok(Arc::new(TunnelEngine { engine: e, proxy }))
+            Ok(Arc::new(TunnelEngine { engine: e, proxy, hand }))
         }
+    }
+
+    /// Starts one on the keeper's thread (the pipe's loop must not wait for
+    /// a network thread); `Starting::ready` has it once it is up.
+    pub fn start_off_loop(proxy: Proxy, own_sockets: bool) -> Starting {
+        let s = Starting(Arc::new(Mutex::new(None)));
+        let done = s.0.clone();
+        crate::keeper::off_loop(move || {
+            let r = TunnelEngine::start(proxy, own_sockets);
+            *done.lock().expect("the start's lock") = Some(r);
+        });
+        s
     }
 
     pub fn proxy(&self) -> &Proxy {
         &self.proxy
     }
+
+    /// The hand its sessions take their sockets from, if it was started
+    /// with own sockets.
+    pub fn hand(&self) -> Option<&UdpHand> {
+        self.hand.as_deref()
+    }
+}
+
+/// What a start off the loop came to: the engine or why it did not start.
+type Started = Option<Result<Arc<TunnelEngine>, String>>;
+
+/// A tunnel engine starting off the loop.
+pub struct Starting(Arc<Mutex<Started>>);
+
+impl Starting {
+    /// The engine or why it did not start, once; None while it starts.
+    pub fn ready(&self) -> Option<Result<Arc<TunnelEngine>, String>> {
+        self.0.lock().expect("the start's lock").take()
+    }
+}
+
+/// The UDP socket a tunnel's QUIC session gets (Cronet_Engine_SetUdpDialer),
+/// as the pool's members get their TCP sockets (engine.rs): the opener binds
+/// it from a port of its own book, connects it to the proxy and puts it
+/// here, then opens the tunnel; the engine's dial for that tunnel's new
+/// session takes it. The opener opens no other tunnel until the socket is
+/// taken, so a socket goes to the session it was bound for. A dial that
+/// finds nothing here, or one to another address (a DNS server; a port
+/// migration's new path), is refused: Chromium binds no socket of its own.
+pub struct UdpHand {
+    proxy_ip: CString,
+    proxy_port: u16,
+    slot: Mutex<Option<(OwnedFd, SocketAddrV4)>>,
+}
+
+impl UdpHand {
+    fn new(proxy: SocketAddrV4) -> UdpHand {
+        let proxy_ip = CString::new(proxy.ip().to_string()).expect("an address has no NUL");
+        UdpHand { proxy_ip, proxy_port: proxy.port(), slot: Mutex::new(None) }
+    }
+
+    /// Puts a connected UDP socket and its local address for the next dial;
+    /// one left there is given back.
+    pub fn put(&self, fd: OwnedFd, local: SocketAddrV4) -> Option<OwnedFd> {
+        self.slot.lock().expect("the hand's lock").replace((fd, local)).map(|(f, _)| f)
+    }
+
+    /// Whether the socket put last was taken.
+    pub fn taken(&self) -> bool {
+        self.slot.lock().expect("the hand's lock").is_none()
+    }
+
+    /// The socket put last, if no dial took it.
+    pub fn take_back(&self) -> Option<OwnedFd> {
+        self.slot.lock().expect("the hand's lock").take().map(|(f, _)| f)
+    }
+}
+
+/// Cronet's UDP dialer: the socket in the hand, for the proxy only.
+///
+/// SAFETY (cronet): ctx is the UdpHand the engine holds until it is shut
+/// down; address is a C string or null; out_local has room for 46 bytes
+/// (INET6_ADDRSTRLEN, cronet_c.h), out_port and out_id are writable.
+unsafe extern "C" fn dial_udp(ctx: Ptr, address: *const c_char, port: u16, out_local: *mut c_char, out_port: *mut u16, out_id: *mut u64) -> isize {
+    let h = &*(ctx as *const UdpHand);
+    if address.is_null() || CStr::from_ptr(address) != h.proxy_ip.as_c_str() || port != h.proxy_port {
+        return ERR_CONNECTION_FAILED;
+    }
+    let Some((fd, local)) = h.slot.lock().expect("the hand's lock").take() else {
+        return ERR_CONNECTION_FAILED;
+    };
+    let ip = local.ip().to_string();
+    std::ptr::copy_nonoverlapping(ip.as_ptr() as *const c_char, out_local, ip.len());
+    *out_local.add(ip.len()) = 0;
+    *out_port = local.port();
+    *out_id = 0;
+    sys::into_raw(fd) as isize
 }
 
 impl Drop for TunnelEngine {

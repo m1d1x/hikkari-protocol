@@ -17,7 +17,7 @@ const HELLO_EVERY: u64 = 250_000_000;
 /// member's pongs at once, a few datagrams apart; judged between the first
 /// and the last of them, the others would be buried by the first one's
 /// proof.
-const CLOCK: u64 = 25_000_000;
+pub(super) const CLOCK: u64 = 25_000_000;
 /// Members that die together come back spread over this (trunk's
 /// replaceSpread), not as one burst of new peers from one box.
 pub(super) const SPREAD: u64 = 1_000_000_000;
@@ -34,10 +34,10 @@ impl Pipe {
         if clock {
             self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
         }
-        let mut next = self.step_sessions(now).min(self.clock_at);
+        let mut next = self.step_sessions(now).min(self.clock_at).min(self.h3_members(now));
         let alone = self.ctl.is_none();
         let (cur, taker) = (self.cur, self.taker());
-        let Pipe { wires, judge, tok, events, sessions, dirty, .. } = self;
+        let Pipe { wires, judge, tok, events, sessions, dirty, h3s, .. } = self;
         for w in wires.iter_mut() {
             // The brain hears and renews the current session's members; the
             // members of one coming up are the pipe's own (session.rs), and
@@ -45,7 +45,10 @@ impl Pipe {
             let (brains, replaces) = (!alone && w.sess == cur, taker == Some(w.sess));
             for (mi, m) in w.members.iter_mut().enumerate() {
                 if m.renew_at != 0 {
-                    if now >= m.renew_at {
+                    if now >= m.renew_at && w.h3 {
+                        // The QUIC wire's member opens its tunnel (h3.rs).
+                        m.renew_at = 0;
+                    } else if now >= m.renew_at {
                         // Alone the pipe dials its own: a new socket is a
                         // new peer to the exit, joined by its hello.
                         let sock = w.exit.and_then(|exit| member_to(exit).ok());
@@ -59,13 +62,15 @@ impl Pipe {
                     continue;
                 }
                 if !m.h.up {
+                    if !m.can_send() {
+                        // A tunnel opening: its hello waits for it (h3.rs).
+                        continue;
+                    }
                     if now >= m.hello_at {
                         let mut h = [0u8; 64];
                         let n = frame::hello_t2(&mut h[12..], &sessions[w.sess as usize].id, w.id);
-                        let n = m.seal.seal(&mut h, n);
-                        if let Some(s) = &m.sock {
-                            let _ = s.send(&h[..n]);
-                        }
+                        let (at, n) = m.seal_in(&mut h, n);
+                        sys::send_nowait(m.fd, &h[at..at + n]);
                         m.hello_at = now + HELLO_EVERY;
                     }
                     next = next.min(m.hello_at);
@@ -85,9 +90,19 @@ impl Pipe {
                             // Its socket goes now: what comes on it is no
                             // member's. The brain answers the event with a
                             // new one; alone the pipe dials it within SPREAD.
-                            m.set_sock(None);
+                            // The QUIC wire's member closes its tunnel, its
+                            // port rests, and the pipe opens a new one
+                            // whatever the brain (h3.rs).
+                            if w.h3 {
+                                if let Some(h) = h3s.iter_mut().find(|h| h.id == w.id) {
+                                    h.give_back(m.port, true, now);
+                                }
+                                m.set_tunnel(None, 0);
+                            } else {
+                                m.set_sock(None);
+                            }
                             *dirty = true;
-                            if replaces && !brains {
+                            if replaces && (w.h3 || !brains) {
                                 let mut r = [0u8; 8];
                                 sys::urandom(&mut r);
                                 m.renew_at = now + 1 + u64::from_le_bytes(r) % SPREAD;

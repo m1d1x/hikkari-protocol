@@ -16,6 +16,7 @@ const (
 	poolPlainGolden    = "0d0001202c01204eff7f7f000001de4f"
 	poolChromiumGolden = "0d0002042c01204eff7f7f000001bb010a686b2e6578616d706c651a676f6c64656e2d746573742d6b65792d3031323334353637383911002f6f70742f6c696263726f6e65742e736f50454d"
 	tcpListenGolden    = "0c01fb20"
+	h3WireGolden       = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d"
 	tickGolden         = "82ffffffff020000003905000007000000080000000000000009000000000000000a000000000000000b0000000000000003010500000001020302fa00000064000000b80b0000010000000000000002000000000000000300000000000000040000000000000005000000000000000600000000000000"
 )
 
@@ -66,6 +67,15 @@ func TestGolden(t *testing.T) {
 		Chromium: &ChromiumForm{SNI: "hk.example", Key: "golden-test-key-0123456789", Cronet: "/opt/libcronet.so", Roots: "PEM"}})
 	if err != nil || hex.EncodeToString(pc) != poolChromiumGolden {
 		t.Fatalf("Chromium pool %x %v, want %s", pc, err, poolChromiumGolden)
+	}
+	// rust/pipe/src/ctl.rs parses_the_brains_quic_wire.
+	h3, err := putH3(6, time.Millisecond, 1200, 300*time.Millisecond, key, 4, netip.MustParseAddrPort("127.0.0.1:4445"),
+		H3Form{SNI: "hk.example", Cronet: "/opt/libcronet.so", Roots: "PEM", Ports: [2]uint16{20000, 32767}})
+	if err != nil || hex.EncodeToString(h3) != h3WireGolden {
+		t.Fatalf("QUIC wire %x %v, want %s", h3, err, h3WireGolden)
+	}
+	if _, err := putH3(6, 0, 0, 0, key, 4, netip.MustParseAddrPort("127.0.0.1:4445"), H3Form{Usage: "kProxy"}); err == nil {
+		t.Fatal("a usage that is neither destination nor proxy taken")
 	}
 	if got := hex.EncodeToString(putTCPListen(1, 8443)); got != tcpListenGolden {
 		t.Fatalf("tcp listen %s, want %s", got, tcpListenGolden)
