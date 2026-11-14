@@ -67,6 +67,19 @@ pub struct TunnelParams {
     pub isolation_key: *const c_char,
     pub fd: c_int,
     pub session_usage: c_int,
+    pub live: *mut Live,
+}
+
+/// Cronet_UdpTunnelLive: each field a word the network thread stores
+/// atomically (AtomicU64 has u64's layout), read here without a wait.
+#[repr(C)]
+#[derive(Default)]
+pub struct Live {
+    pub bytes_sent: std::sync::atomic::AtomicU64,
+    pub packets_sent: std::sync::atomic::AtomicU64,
+    pub packets_lost: std::sync::atomic::AtomicU64,
+    pub srtt_us: std::sync::atomic::AtomicU64,
+    pub up_dropped: std::sync::atomic::AtomicU64,
 }
 
 /// Cronet_UdpTunnelStats.

@@ -1,7 +1,7 @@
-//! The scheduler of a Chromium QUIC member's connection down (spec/trunk.md,
-//! `h3dgram`, "How the exit sends down"; Go wire/datagram sendqueue.go, the
-//! reference): the frames bound for the member wait here, not in QUIC's
-//! queue, so that while the guard holds the connection to a rate they age
+//! The scheduler of a Chromium QUIC member's connection (spec/trunk.md,
+//! `h3dgram`, "How each end sends"; Go wire/datagram sendqueue.go, the
+//! reference), at both ends: the exit's down, the entry's up. The frames
+//! bound for the member wait here, not in QUIC's queue, so that while the guard holds the connection to a rate they age
 //! here and the freshest of live traffic is what goes. The member's own
 //! frames go first; the flows' by deficit round robin over BUCKETS buckets
 //! by stream id, QUANTUM bytes a turn; a frame that waited over STALE_NS is
@@ -27,7 +27,7 @@ pub const BUCKETS: usize = 32;
 /// 426 frames a second of one bucket, more than any call or game sends; a
 /// flood is what it holds back.
 const DEPTH: usize = 64;
-/// The largest frame (a QUIC DATAGRAM frame's worth, h3wire DGRAM).
+/// The largest frame (a QUIC DATAGRAM frame's worth, the exit's h3wire DGRAM).
 pub const FRAME: usize = 1400;
 /// The member's own bucket, after the flows'.
 const OWN: usize = BUCKETS;

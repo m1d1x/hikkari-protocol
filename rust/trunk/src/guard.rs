@@ -1,16 +1,17 @@
-//! The guard of a Chromium QUIC member's connection down (spec/trunk.md,
-//! `h3dgram`, "How the exit sends down"; spec/v1.md, "The sender: a guard";
-//! Go wire/datagram guard.go guardSender, the reference, with its thresholds).
+//! The guard of a Chromium QUIC member's connection (spec/trunk.md,
+//! `h3dgram`, "How each end sends"; spec/v1.md, "The sender: a guard"; Go
+//! wire/datagram guard.go guardSender, the reference, with its thresholds),
+//! at both ends: the exit's down over quiche, the entry's up over Chromium.
 //! While the path loses nothing it holds nothing back; more than a tenth of
 //! a half second's bytes lost turns a rate limit on, at 70 % of what the path
-//! delivered then, and the connection's scheduler keeps to it.
+//! delivered then, and the member's scheduler keeps to it.
 //!
-//! quiche gives no callback per packet, so each half second is judged from
-//! the connection's counters (Snap: bytes sent, lost and acknowledged,
-//! packets sent), read when the half second is over; the round trip is
-//! quiche's smoothed one where the Go guard takes the latest (it only tells
-//! whether the line's queue has drained, which the smoothed one tells a few
-//! round trips later).
+//! Neither QUIC stack gives a callback per packet, so each half second is
+//! judged from the connection's counters (Snap: bytes sent, lost and
+//! acknowledged, packets sent), read when the half second is over; the round
+//! trip is the stack's smoothed one where the Go guard takes the latest (it
+//! only tells whether the line's queue has drained, which the smoothed one
+//! tells a few round trips later).
 
 /// A half second of sending is judged at a time (guardJudge).
 pub const JUDGE_NS: u64 = 500_000_000;

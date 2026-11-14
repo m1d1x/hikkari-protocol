@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use hikkari_sys as sys;
 
-use crate::api::{self, Ptr, TunnelHeader, TunnelParams, TunnelStats, SESSION_DESTINATION, SESSION_PROXY, TUNNEL_CLOSED, TUNNEL_UP};
+use crate::api::{self, Live, Ptr, TunnelHeader, TunnelParams, TunnelStats, SESSION_DESTINATION, SESSION_PROXY, TUNNEL_CLOSED, TUNNEL_UP};
 
 // Chromium's net error for a dial the engine must not make
 // (net/base/net_error_list.h).
@@ -266,12 +266,27 @@ impl Usage {
     }
 }
 
-/// What the network thread tells the loop.
+/// What the network thread tells the loop: the state, and the QUIC
+/// connection's counts it copies as they move (cronet_c.h
+/// Cronet_UdpTunnelLive), for the embedder's own sender.
 struct Shared {
     wake: sys::Wake,
     /// 0 opening, 1 up, 2 closed.
     state: AtomicI32,
     net_error: AtomicI32,
+    live: Live,
+}
+
+/// The tunnel's QUIC connection as last copied (`Tunnel::counts`): bytes and
+/// packets sent, packets lost, the smoothed round trip, datagrams the
+/// connection would not take.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub bytes_sent: u64,
+    pub packets_sent: u64,
+    pub packets_lost: u64,
+    pub srtt_ns: u64,
+    pub up_dropped: u64,
 }
 
 /// One CONNECT-UDP tunnel: its end of the datagram pair, its wake-up.
@@ -314,6 +329,7 @@ impl Tunnel {
             wake: sys::Wake::new().map_err(|e| format!("cronet: wake-up: {e}"))?,
             state: AtomicI32::new(0),
             net_error: AtomicI32::new(0),
+            live: Live::default(),
         });
         let params = TunnelParams {
             proxy_host: proxy_host.as_ptr(),
@@ -325,6 +341,8 @@ impl Tunnel {
             isolation_key: key.as_ref().map_or(std::ptr::null(), |k| k.as_ptr()),
             fd: theirs.as_raw_fd(),
             session_usage: usage.c(),
+            // Shared outlives the tunnel in the library (ctx below).
+            live: &shared.live as *const Live as *mut Live,
         };
         let ctx = Arc::into_raw(shared.clone()) as Ptr;
         // SAFETY: params and the strings it points to live through the call,
@@ -361,6 +379,20 @@ impl Tunnel {
             0 => State::Opening,
             1 => State::Up,
             _ => State::Closed(self.shared.net_error.load(Acquire)),
+        }
+    }
+
+    /// The QUIC connection's counts as the network thread last copied them;
+    /// no wait, nothing allocated.
+    #[inline]
+    pub fn counts(&self) -> Counts {
+        let l = &self.shared.live;
+        Counts {
+            bytes_sent: l.bytes_sent.load(Relaxed),
+            packets_sent: l.packets_sent.load(Relaxed),
+            packets_lost: l.packets_lost.load(Relaxed),
+            srtt_ns: l.srtt_us.load(Relaxed) * 1000,
+            up_dropped: l.up_dropped.load(Relaxed),
         }
     }
 

@@ -23,8 +23,8 @@ use hikkari_sys::{self as sys, sockaddr_in, SendBatch, BATCH};
 use hikkari_trunk::h3dgram::{self, HEAD_MAX, TOKEN};
 use quiche::h3;
 
-use crate::guard::{Guard, Snap};
-use crate::sched::{self, Class, Sched};
+use hikkari_trunk::guard::{Guard, Snap};
+use hikkari_trunk::sched::{self, Class, Sched};
 
 /// The exit's connection ids: random, this long.
 pub const CID: usize = 16;

@@ -8,9 +8,11 @@
 pub mod buf;
 pub mod flow;
 pub mod frame;
+pub mod guard;
 pub mod h3dgram;
 pub mod health;
 pub mod naive;
 pub mod ports;
+pub mod sched;
 pub mod stream;
 pub mod udpwire;

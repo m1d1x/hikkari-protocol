@@ -4,6 +4,7 @@
 
 use hikkari_sys as sys;
 use hikkari_trunk::frame;
+use hikkari_trunk::sched::Class;
 use hikkari_trunk::health::Verdict;
 
 use super::{Event, Pipe};
@@ -78,9 +79,8 @@ impl Pipe {
                     match m.h.tick(judge, w.stall_ns, now, tok) {
                         Verdict::Fine => {}
                         Verdict::Ping(t) => {
-                            m.glue_frame(9, w.glue_max, now, |b| frame::put_ping(b, frame::F_PING, t));
-                            m.seal_glue();
-                            m.flush_out();
+                            m.frame(Class::Own, 9, w.glue_max, now, |b| frame::put_ping(b, frame::F_PING, t));
+                            m.send_now(now);
                         }
                         Verdict::Dead { quiet } => {
                             let why = if quiet { ctl::WHY_QUIET } else { ctl::WHY_SILENT };
@@ -114,6 +114,11 @@ impl Pipe {
                 }
                 if m.glue_since != 0 {
                     next = next.min(m.glue_since + w.glue_ns);
+                }
+                // What the QUIC wire's guard holds back goes when its budget
+                // lets it, or ages out (seal_due drains it each turn).
+                if m.queued() > 0 {
+                    next = next.min(m.guard.next_at().max(now + 1_000_000));
                 }
             }
         }

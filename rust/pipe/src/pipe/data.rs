@@ -4,6 +4,7 @@ use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, now_ns, BATCH};
 use hikkari_trunk::frame::{self, Frame};
+use hikkari_trunk::sched::Class;
 
 use hikkari_sys::SeqPacket;
 
@@ -97,7 +98,7 @@ impl Pipe {
                             // once per session, on the turn after (session.rs).
                             Frame::Drain => *drains |= 1u32 << sess,
                             Frame::Ping(t) => {
-                                m.glue_frame(9, glue_max, now, |b| frame::put_ping(b, frame::F_PONG, t));
+                                m.frame(Class::Own, 9, glue_max, now, |b| frame::put_ping(b, frame::F_PONG, t));
                             }
                             Frame::Pong(t) => {
                                 if m.h.pong(judge, t, now) {
@@ -124,9 +125,8 @@ impl Pipe {
                     break;
                 }
             }
-            if m.glue_n > 0 {
-                m.seal_glue(); // pongs go at once
-                m.flush_out();
+            if m.glue_n > 0 || m.queued() > 0 {
+                m.send_now(now_ns()); // pongs go at once
             }
         }
         self.send_events();

@@ -2,7 +2,9 @@
 //! health (hikkari_trunk::health) and its glue, the frames of one tick
 //! sealed into one datagram. A member of the Chromium QUIC wire (h3.rs) has
 //! its tunnel's end for a socket, and its datagrams are the frames as they
-//! are (spec/trunk.md, `h3dgram`: QUIC's TLS keeps them).
+//! are (spec/trunk.md, `h3dgram`: QUIC's TLS keeps them); its frames wait in
+//! its scheduler and go under its connection's guard (hikkari_trunk::sched,
+//! guard; "How each end sends"), judged from Chromium's own counts.
 
 use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
@@ -10,6 +12,8 @@ use std::os::fd::AsRawFd;
 
 use hikkari_cronet::Tunnel;
 use hikkari_sys::{self as sys, SendBatch, BATCH};
+use hikkari_trunk::guard::{Guard, Snap};
+use hikkari_trunk::sched::{Class, Sched};
 use hikkari_trunk::health::Health;
 use hikkari_trunk::udpwire::{Seal, OVERHEAD};
 
@@ -17,6 +21,10 @@ use crate::ctl::WireTick;
 
 /// A wire datagram's slot: a sealed datagram of at most this.
 pub const SLOT: usize = 2048;
+/// What a QUIC wire's datagram adds in its packet, for the guard's budget:
+/// Chromium's short header with the exit's 16-byte id, a packet number,
+/// AEAD's tag, the DATAGRAM frame's and the HTTP Datagram's heads.
+const PACKET_OVER: usize = 1 + 16 + 4 + 16 + 3 + 2;
 
 pub struct Member {
     pub sock: Option<UdpSocket>,
@@ -44,6 +52,10 @@ pub struct Member {
     pub plain: bool,
     pub frames_max: usize,
     pub too_big: u64,
+    /// The QUIC wire's: frames waiting for its datagrams, and the guard of
+    /// its connection (a new one per tunnel).
+    pub sched: Option<Box<Sched>>,
+    pub guard: Guard,
     /// The QUIC wire's: its CONNECT-UDP tunnel, whose end is fd, and the
     /// source port of its QUIC connection, from the wire's book (h3.rs).
     pub tun: Option<Tunnel>,
@@ -70,6 +82,8 @@ impl Member {
             plain: false,
             frames_max: 0,
             too_big: 0,
+            sched: None,
+            guard: Guard::default(),
             tun: None,
             port: 0,
             dgrams: 0,
@@ -82,6 +96,7 @@ impl Member {
         let mut m = Member::new(None, key);
         m.plain = true;
         m.frames_max = frames_max;
+        m.sched = Some(Box::new(Sched::new()));
         m
     }
 
@@ -94,6 +109,69 @@ impl Member {
         }
         self.fd = self.tun.as_ref().map_or(-1, |t| t.fd());
         self.port = port;
+        self.guard = Guard::default();
+    }
+
+    /// One frame of class c (written by `put` at most `need` bytes): on the
+    /// QUIC wire into the scheduler, a frame over frames_max dropped and
+    /// counted; on the bare UDP wire into the glue.
+    #[inline]
+    pub fn frame(&mut self, c: Class, need: usize, max: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) {
+        let fits = need <= self.frames_max;
+        match &mut self.sched {
+            Some(s) if fits => s.put(c, need, now, put),
+            Some(_) => self.too_big += 1,
+            None => self.glue_frame(need, max, now, put),
+        }
+    }
+
+    /// Sends what waits now: the QUIC wire's scheduler drained under its
+    /// guard, the bare UDP wire's glue sealed; then the batch.
+    #[inline]
+    pub fn send_now(&mut self, now: u64) {
+        if self.sched.is_some() {
+            self.drain(now);
+        } else {
+            self.seal_glue();
+        }
+        self.flush_out();
+    }
+
+    /// Frames waiting in the QUIC wire's scheduler.
+    #[inline]
+    pub fn queued(&self) -> usize {
+        self.sched.as_ref().map_or(0, |s| s.queued())
+    }
+
+    /// The QUIC wire's datagrams of what waits, each begun only while the
+    /// guard lets one go, into the out slots; the guard judges the half
+    /// second gone first, from the tunnel's counts (Chromium's: bytes and
+    /// packets sent, packets lost, the smoothed round trip).
+    pub fn drain(&mut self, now: u64) {
+        let Member { sched, guard, tun, out, out_n, send, fd, dgrams, glue, frames_max, .. } = self;
+        let Some(sched) = sched else { return };
+        if guard.due(now) {
+            if let Some(t) = tun {
+                let c = t.counts();
+                guard.judge(now, snap(&c), c.srtt_ns);
+            }
+        }
+        if sched.queued() == 0 || *fd < 0 {
+            return;
+        }
+        let fd = *fd;
+        sched.drain(now, *frames_max, &mut glue[..], 0, guard, PACKET_OVER, |b, at, len| {
+            if *out_n == BATCH {
+                send.flush(fd);
+                *out_n = 0;
+            }
+            let slot = &mut out[*out_n * SLOT..(*out_n + 1) * SLOT];
+            slot[..len].copy_from_slice(&b[at..at + len]);
+            send.push(slot.as_ptr(), len, None);
+            *out_n += 1;
+            *dgrams += 1;
+            true
+        });
     }
 
     /// Whether the member may say its hello: its socket is there and, on the
@@ -152,8 +230,8 @@ impl Member {
         }
         let slot = &mut self.out[self.out_n * SLOT..(self.out_n + 1) * SLOT];
         slot[12..12 + self.glue_n].copy_from_slice(&self.glue[12..12 + self.glue_n]);
-        let (at, n) = if self.plain { (12, self.glue_n) } else { (0, self.seal.seal(slot, self.glue_n)) };
-        let ptr = slot[at..].as_ptr();
+        let n = self.seal.seal(slot, self.glue_n);
+        let ptr = slot.as_ptr();
         self.send.push(ptr, n, None);
         self.out_n += 1;
         self.glue_n = 0;
@@ -169,16 +247,10 @@ impl Member {
     }
 
     /// Puts one frame (written by `put` into the glue) in, sealing first
-    /// when it would not fit; a frame alone over the limit goes alone, but
-    /// on the QUIC wire one over frames_max is dropped.
+    /// when it would not fit; a frame alone over the limit goes alone.
     #[inline]
     pub fn glue_frame(&mut self, need: usize, max: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) {
-        let over = if self.plain { 0 } else { OVERHEAD };
-        if self.plain && need > self.frames_max {
-            self.too_big += 1;
-            return;
-        }
-        if self.glue_n > 0 && over + self.glue_n + need > max {
+        if self.glue_n > 0 && OVERHEAD + self.glue_n + need > max {
             self.seal_glue();
         }
         let n = put(&mut self.glue[12 + self.glue_n..]);
@@ -187,6 +259,14 @@ impl Member {
             self.glue_since = now;
         }
     }
+}
+
+/// Chromium's counts as the guard reads them: lost bytes are its lost
+/// packets at the connection's mean packet (Chromium counts packets lost,
+/// not bytes), and what was not lost was delivered.
+fn snap(c: &hikkari_cronet::Counts) -> Snap {
+    let lost_bytes = if c.packets_sent == 0 { 0 } else { (c.packets_lost as u128 * c.bytes_sent as u128 / c.packets_sent as u128) as u64 };
+    Snap { sent_bytes: c.bytes_sent, lost_bytes, acked_bytes: c.bytes_sent - lost_bytes.min(c.bytes_sent), sent: c.packets_sent }
 }
 
 impl Drop for Member {
@@ -264,32 +344,37 @@ pub fn member_to(exit: SocketAddrV4) -> io::Result<UdpSocket> {
 mod tests {
     use super::*;
 
-    /// The QUIC wire's member (spec/trunk.md, `h3dgram`): frames glue up to
-    /// its room with no seal's overhead, go out as they are, and one alone
-    /// over the room is dropped and counted (Chromium would reset the
-    /// member's stream on it).
+    /// The QUIC wire's member (spec/trunk.md, `h3dgram`, "How each end
+    /// sends"): frames wait in its scheduler and go as one datagram of the
+    /// frames as they are, up to its room; one alone over the room is
+    /// dropped and counted (Chromium would reset the member's stream on it).
     #[test]
-    fn a_quic_members_frame_over_its_room_is_dropped_not_sent() {
+    fn a_quic_members_frames_go_unsealed_up_to_its_room() {
+        use std::os::fd::AsRawFd;
+        let (ours, theirs) = sys::dgram_pair(1 << 16).unwrap();
         let mut m = Member::plain(&[7; 32], 1194);
-        m.glue_frame(600, 1194, 1, |b| {
+        m.fd = ours.as_raw_fd();
+        m.frame(Class::Flow(1), 600, 1194, 1, |b| {
             b[..600].fill(1);
             600
         });
-        m.glue_frame(594, 1194, 2, |b| {
+        m.frame(Class::Flow(2), 594, 1194, 2, |b| {
             b[..594].fill(2);
             594
         });
-        assert_eq!((m.glue_n, m.send.n), (1194, 0), "two frames of 1194 B in one datagram, no seal around them");
-        m.glue_frame(1195, 1194, 3, |_| unreachable!("a frame over the room is not written"));
-        assert_eq!((m.too_big, m.glue_n), (1, 1194));
-        m.seal_glue();
-        assert_eq!((m.send.n, m.dgrams, m.glue_n), (1, 1, 0));
+        m.frame(Class::Flow(3), 1195, 1194, 3, |_| unreachable!("a frame over the room is not written"));
+        assert_eq!((m.queued(), m.too_big, m.glue_n), (2, 1, 0), "two frames wait, nothing in the glue");
+        m.send_now(4);
+        assert_eq!((m.queued(), m.dgrams), (0, 1));
+        let mut b = [0u8; 2048];
+        let n = sys::recv_nowait(theirs.as_raw_fd(), &mut b);
+        assert_eq!(n, 1194, "one datagram of both frames, no seal around them");
+        assert!(b[..600].iter().all(|&x| x == 1) && b[600..1194].iter().all(|&x| x == 2));
         let mut d = [9u8; 40];
         assert_eq!(m.open(&mut d), Some((0, 40)), "what comes down is frames as they are");
         let mut h = [0u8; 64];
         assert_eq!(m.seal_in(&mut h, 30), (12, 30));
         let mut sealed = Member::new(None, &[7; 32]);
-        let (at, n) = sealed.seal_in(&mut h, 30);
-        assert_eq!((at, n), (0, 30 + OVERHEAD), "the bare UDP wire's seal");
+        assert_eq!(sealed.seal_in(&mut h, 30), (0, 30 + OVERHEAD), "the bare UDP wire's seal");
     }
 }

@@ -20,7 +20,7 @@ use hikkari_trunk::health::Health;
 use hikkari_trunk::udpwire::{Seal, OVERHEAD};
 
 use crate::h3wire::H3Wire;
-pub use crate::sched::Class;
+pub use hikkari_trunk::sched::Class;
 
 /// The largest datagram on the wire (udpwire MaxDatagram, the IPv4 UDP
 /// payload limit): a wire's receive and send slots hold one each.

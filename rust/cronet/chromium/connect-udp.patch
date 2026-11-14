@@ -12,7 +12,7 @@ index 90cac672..7adaaeea 100644
      "url_request.cc",
      "url_request.h",
 diff --git a/src/components/cronet/native/include/cronet_c.h b/src/components/cronet/native/include/cronet_c.h
-index 6bdec585..c58959a0 100644
+index 6bdec585..39cb9631 100644
 --- a/src/components/cronet/native/include/cronet_c.h
 +++ b/src/components/cronet/native/include/cronet_c.h
 @@ -5,6 +5,7 @@
@@ -23,7 +23,7 @@ index 6bdec585..c58959a0 100644
  #include <stdint.h>
  
  #include "cronet_export.h"
-@@ -111,6 +112,97 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
+@@ -111,6 +112,118 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(
  // Calls from Cronet's network thread schedule the close asynchronously.
  CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
  
@@ -67,7 +67,28 @@ index 6bdec585..c58959a0 100644
 +  // Cronet_UdpTunnelSessionUsage): the packets and the certificate's fetches
 +  // are those of Chrome's session to a site, or to an IP Protection proxy.
 +  int session_usage;
++  // Where the network thread copies the QUIC connection's counts for the
++  // embedder's own sender (Cronet_UdpTunnelLive), or NULL for none. The
++  // embedder keeps it until Cronet_UdpTunnel_Destroy returns.
++  struct Cronet_UdpTunnelLive* live;
 +} Cronet_UdpTunnelParams;
++
++// The QUIC connection's counts since it came up, as the network thread last
++// copied them: at most every 10 ms, when the embedder writes or a datagram
++// comes. Each field is one 64-bit word the network thread writes atomically
++// and the embedder reads atomically, without a lock or a wait; fields may
++// be a copy apart.
++typedef struct Cronet_UdpTunnelLive {
++  // Bytes and packets sent, retransmissions included (a datagram is never
++  // retransmitted), and packets declared lost.
++  uint64_t bytes_sent;
++  uint64_t packets_sent;
++  uint64_t packets_lost;
++  // The smoothed round trip, microseconds.
++  uint64_t srtt_us;
++  // Datagrams from the embedder the QUIC connection would not take.
++  uint64_t up_dropped;
++} Cronet_UdpTunnelLive;
 +
 +typedef enum Cronet_UdpTunnelSessionUsage {
 +  // As Chrome's session to a site: QUIC packets of 1250 B (IPv4).
@@ -123,10 +144,10 @@ index 6bdec585..c58959a0 100644
  #endif
 diff --git a/src/components/cronet/native/udp_tunnel.cc b/src/components/cronet/native/udp_tunnel.cc
 new file mode 100644
-index 00000000..a9fb5173
+index 00000000..d6799a15
 --- /dev/null
 +++ b/src/components/cronet/native/udp_tunnel.cc
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,476 @@
 +// Copyright 2026 The Hikkari Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -137,6 +158,7 @@ index 00000000..a9fb5173
 +#include <sys/socket.h>
 +#include <unistd.h>
 +
++#include <algorithm>
 +#include <utility>
 +
 +#include "base/compiler_specific.h"
@@ -191,6 +213,15 @@ index 00000000..a9fb5173
 +// Datagrams from the embedder taken in one wake, so that a busy embedder
 +// cannot keep the network thread from its other sockets.
 +constexpr int kUpPerWake = 64;
++
++// How often at most the connection's counts are copied for the embedder.
++constexpr base::TimeDelta kPublishEvery = base::Milliseconds(10);
++
++// One field of the live block, written as the embedder reads it: a whole
++// word, atomically (cronet_c.h Cronet_UdpTunnelLive).
++void Put(uint64_t* field, uint64_t value) {
++  __atomic_store_n(field, value, __ATOMIC_RELAXED);
++}
 +
 +}  // namespace
 +
@@ -412,6 +443,25 @@ index 00000000..a9fb5173
 +      stats_.up_dropped++;
 +    }
 +  }
++  Publish();
++}
++
++void UdpTunnel::Publish() {
++  if (!params_.live || !session_ || closed_) {
++    return;
++  }
++  base::TimeTicks now = base::TimeTicks::Now();
++  if (now - published_ < kPublishEvery) {
++    return;
++  }
++  published_ = now;
++  const quic::QuicConnectionStats s = session_->GetConnectionStats();
++  Cronet_UdpTunnelLive* live = params_.live;
++  Put(&live->bytes_sent, s.bytes_sent);
++  Put(&live->packets_sent, s.packets_sent);
++  Put(&live->packets_lost, s.packets_lost);
++  Put(&live->srtt_us, static_cast<uint64_t>(std::max<int64_t>(0, s.srtt_us)));
++  Put(&live->up_dropped, stats_.up_dropped);
 +}
 +
 +void UdpTunnel::OnFileCanWriteWithoutBlocking(int fd) {}
@@ -448,6 +498,7 @@ index 00000000..a9fb5173
 +    return false;
 +  }
 +  stats_.down_received++;
++  Publish();
 +  for (;;) {
 +    ssize_t n = send(params_.fd, down_buf_->data(), rv, MSG_DONTWAIT);
 +    if (n >= 0) {
@@ -539,6 +590,7 @@ index 00000000..a9fb5173
 +    return nullptr;
 +  }
 +  p.session_usage = params->session_usage;
++  p.live = params->live;
 +  p.fd = params->fd;
 +  p.callback = callback;
 +  p.callback_context = callback_context;
@@ -574,10 +626,10 @@ index 00000000..a9fb5173
 +}
 diff --git a/src/components/cronet/native/udp_tunnel.h b/src/components/cronet/native/udp_tunnel.h
 new file mode 100644
-index 00000000..3d7e917a
+index 00000000..ed7bf186
 --- /dev/null
 +++ b/src/components/cronet/native/udp_tunnel.h
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,110 @@
 +// Copyright 2026 The Hikkari Authors
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -631,6 +683,8 @@ index 00000000..3d7e917a
 +    // A Cronet_UdpTunnelSessionUsage.
 +    int session_usage = Cronet_UdpTunnel_SESSION_DESTINATION;
 +    int fd = -1;
++    // Where the connection's counts go for the embedder; may be null.
++    Cronet_UdpTunnelLive* live = nullptr;
 +    Cronet_UdpTunnelCallback callback = nullptr;
 +    void* callback_context = nullptr;
 +  };
@@ -662,6 +716,9 @@ index 00000000..3d7e917a
 +  bool Deliver(int rv);
 +  // Ends the tunnel with `net_error` and tells the embedder, once.
 +  void Close(int net_error);
++  // Copies the connection's counts to the embedder's live block, at most
++  // every 10 ms.
++  void Publish();
 +
 +  const raw_ptr<CronetContext> context_;
 +  Params params_;
@@ -675,6 +732,7 @@ index 00000000..3d7e917a
 +  scoped_refptr<net::IOBufferWithSize> up_buf_;
 +  scoped_refptr<net::IOBufferWithSize> down_buf_;
 +  Cronet_UdpTunnelStats stats_ = {};
++  base::TimeTicks published_;
 +  bool closed_ = false;
 +  base::WeakPtrFactory<UdpTunnel> weak_factory_{this};
 +};
@@ -682,3 +740,22 @@ index 00000000..3d7e917a
 +}  // namespace cronet
 +
 +#endif  // COMPONENTS_CRONET_NATIVE_UDP_TUNNEL_H_
+diff --git a/src/net/quic/quic_chromium_client_session.h b/src/net/quic/quic_chromium_client_session.h
+index a187bffc..9bd46856 100644
+--- a/src/net/quic/quic_chromium_client_session.h
++++ b/src/net/quic/quic_chromium_client_session.h
+@@ -312,6 +312,14 @@ class NET_EXPORT_PRIVATE QuicChromiumClientSession
+       return session_->connection_migration_mode();
+     }
+ 
++    // The connection's counts, for a CONNECT-UDP tunnel's sender in Cronet
++    // (components/cronet/native/udp_tunnel.cc); empty once the session is
++    // gone.
++    quic::QuicConnectionStats GetConnectionStats() const {
++      return session_ ? session_->connection()->GetStats()
++                      : quic::QuicConnectionStats();
++    }
++
+     // Returns true if the session's connection has sent or received any bytes.
+     bool WasEverUsed() const;
+ 

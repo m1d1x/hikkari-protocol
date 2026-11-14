@@ -457,7 +457,11 @@ impl Pipe {
         let tick = self.tick_ns > 0;
         for w in self.wires.iter_mut() {
             for m in w.members.iter_mut() {
-                if m.glue_since != 0 && (tick || w.glue_ns == 0 || now - m.glue_since >= w.glue_ns) {
+                if m.sched.is_some() {
+                    // The QUIC wire's frames wait under its guard: the tick
+                    // is their glue (spec/trunk.md, "How each end sends").
+                    m.drain(now);
+                } else if m.glue_since != 0 && (tick || w.glue_ns == 0 || now - m.glue_since >= w.glue_ns) {
                     m.seal_glue();
                 }
                 m.flush_out();
@@ -493,6 +497,12 @@ impl Pipe {
             );
             if let Some(h) = self.h3s.iter().find(|h| h.id == w.id).filter(|_| w.h3 && w.sess == self.cur) {
                 s += &h.stats();
+                let now = now_ns();
+                let stale: u64 = w.members.iter().filter_map(|m| m.sched.as_ref()).map(|q| q.n.stale).sum();
+                let wait_max = w.members.iter().filter_map(|m| m.sched.as_ref()).map(|q| q.n.wait_max_ns).max().unwrap_or(0);
+                let limited = w.members.iter().filter(|m| m.guard.rate() > 0.0).count();
+                let guard_ms: u64 = w.members.iter().map(|m| m.guard.limited_ns(now) / 1_000_000).sum();
+                s += &format!(" stale={stale} wait_max_ms={:.1} guard_ms={guard_ms} limited={limited}", wait_max as f64 / 1e6);
             }
         }
         if self.has_tcp() {

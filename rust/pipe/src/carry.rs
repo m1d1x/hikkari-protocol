@@ -3,6 +3,7 @@
 
 use hikkari_trunk::flow::COPIES;
 use hikkari_trunk::frame::{self, DGRAM_HEAD};
+use hikkari_trunk::sched::Class;
 
 use crate::ctl::ANY_WIRE;
 use crate::flow::Flow;
@@ -81,7 +82,7 @@ fn on_packets(wires: &mut [Wire], only: Option<u8>, up: usize, copies: usize, f:
             if rank >= copies {
                 continue;
             }
-            m.glue_frame(DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
+            m.frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
             on_wire = true;
         }
         if on_wire {
@@ -143,7 +144,7 @@ fn on_least(wires: &mut [Wire], swires: &mut [StreamWire], only: Option<u8>, up:
             On::Packet(wi, mi) => {
                 let w = &mut wires[wi];
                 let glue_max = w.glue_max;
-                w.members[mi].glue_frame(DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
+                w.members[mi].frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
                 if counted & (1 << (wi & 31)) == 0 {
                     counted |= 1 << (wi & 31);
                     w.t.up_pkts += 1;
