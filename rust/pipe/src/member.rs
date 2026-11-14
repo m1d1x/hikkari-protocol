@@ -4,7 +4,8 @@
 //! its tunnel's end for a socket, and its datagrams are the frames as they
 //! are (spec/trunk.md, `h3dgram`: QUIC's TLS keeps them); its frames wait in
 //! its scheduler and go under its connection's guard (hikkari_trunk::sched,
-//! guard; "How each end sends"), judged from Chromium's own counts.
+//! guard; "How each end sends"), judged from Chromium's own counts, a full
+//! queue as loss (Guard::over_a_sender).
 
 use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
@@ -97,6 +98,7 @@ impl Member {
         m.plain = true;
         m.frames_max = frames_max;
         m.sched = Some(Box::new(Sched::new()));
+        m.guard = Guard::over_a_sender();
         m
     }
 
@@ -109,7 +111,7 @@ impl Member {
         }
         self.fd = self.tun.as_ref().map_or(-1, |t| t.fd());
         self.port = port;
-        self.guard = Guard::default();
+        self.guard = Guard::over_a_sender();
     }
 
     /// One frame of class c (written by `put` at most `need` bytes): on the

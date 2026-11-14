@@ -6,6 +6,17 @@
 //! a half second's bytes lost turns a rate limit on, at 70 % of what the path
 //! delivered then, and the member's scheduler keeps to it.
 //!
+//! The entry's guard (`Guard::over_a_sender`) also takes a full queue for
+//! loss: a half second whose round trip is 50 ms over the least the
+//! connection has seen. Under it Chromium's own sender keeps loss under the
+//! tenth while the line's queue stays full, and that queue is the trunk's
+//! own (every user's traffic through the members, the owner's choice of
+//! 2026-11-14, hikkari-client plans/research/2026-11-14-rust-pipe-r6-3-
+//! h3dgram-pipe.md). The exit's guard, as v1.05's at the client and the
+//! relay, does not: a user's line is often filled by another's download,
+//! and limiting by its queue starves live traffic (Go
+//! TestLiveTrafficOnABloatedLine: a screen share got 21-54 % of its frames).
+//!
 //! Neither QUIC stack gives a callback per packet, so each half second is
 //! judged from the connection's counters (Snap: bytes sent, lost and
 //! acknowledged, packets sent), read when the half second is over; the round
@@ -31,6 +42,9 @@ const OFF: f64 = 2.0;
 /// The limit grows only while the round trip is within this of the least
 /// seen since it came on (guardProbeRTT).
 const PROBE_RTT_NS: u64 = 50_000_000;
+/// The entry's: a stretch of at least ON_PACKETS whose round trip is this
+/// far over the least the connection has seen is a full queue, as loss is.
+const ON_QUEUE_NS: u64 = 50_000_000;
 /// The least the limit falls to, bytes a second: 1 Mbit/s (guardFloor).
 const FLOOR: f64 = 125_000.0;
 /// How much of the limit may go at once (guardBurst), and at least two
@@ -64,9 +78,19 @@ pub struct Guard {
     /// The time spent limited before the current limit, and when it came on.
     limited_ns: u64,
     since: u64,
+    /// The entry's: a full queue turns the limit on as loss does, judged
+    /// against the least round trip the connection has seen.
+    on_queue: bool,
+    least_ever_ns: u64,
 }
 
 impl Guard {
+    /// The guard of a connection over a sender of its own (the entry's
+    /// Chromium): a full queue limits it as loss does.
+    pub fn over_a_sender() -> Guard {
+        Guard { on_queue: true, ..Guard::default() }
+    }
+
     /// Whether the stretch that began at `start` is over at `now`: then the
     /// caller reads the counters for judge.
     #[inline]
@@ -88,7 +112,11 @@ impl Guard {
         let delivered = s.acked_bytes - self.base.acked_bytes;
         let packets = s.sent - self.base.sent;
         let loss = if sent > 0 { lost as f64 / sent as f64 } else { 0.0 };
-        let lossy = packets >= ON_PACKETS && loss > ON_LOSS;
+        if rtt_ns > 0 && (self.least_ever_ns == 0 || rtt_ns < self.least_ever_ns) {
+            self.least_ever_ns = rtt_ns;
+        }
+        let full = self.on_queue && rtt_ns > self.least_ever_ns + ON_QUEUE_NS;
+        let lossy = packets >= ON_PACKETS && (loss > ON_LOSS || full);
         let delivered = FLOOR.max(SHARE * delivered as f64 / secs);
         if !self.limited && lossy {
             self.limited = true;
@@ -226,6 +254,21 @@ mod tests {
         g.spent(1350);
         g.spent(1350);
         assert!(!g.may_send(2 * S + 2 * S / 1000));
+
+        // Over a sender of its own a full queue limits as loss does: 300 ms
+        // over the least of 20, no byte lost; the exit's guard holds nothing
+        // back on it (v1.05).
+        for (mut q, limits) in [(Guard::over_a_sender(), true), (Guard::default(), false)] {
+            let mut s2 = Snap::default();
+            q.judge(S, s2, 20_000_000);
+            s2 = after(s2, 1000, 0);
+            q.judge(S + S / 2, s2, 20_000_000);
+            assert_eq!(q.rate(), 0.0, "a clean stretch at the least round trip");
+            s2 = after(s2, 1000, 0);
+            q.judge(2 * S, s2, 320_000_000);
+            let want = if limits { 1_400_000.0 } else { 0.0 };
+            assert!((q.rate() - want).abs() < 1.0, "limit {} on a full queue, want {want}", q.rate());
+        }
 
         let few = after(s, 50, 40);
         let mut h = Guard::default();

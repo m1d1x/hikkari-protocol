@@ -239,4 +239,9 @@ the oldest first, and so is the oldest of a bucket holding 64 frames; each is co
 above Chromium's own sender, which it cannot replace: the member's frames wait in the entry's scheduler of the same rules,
 the guard judges each half second from the counts Chromium's network thread copies for it (bytes and packets sent,
 packets lost, the smoothed round trip; lost bytes are the lost packets at the connection's mean packet), and a datagram
-goes into the tunnel only while the guard lets it. The guard is the same at both ends, with the same thresholds.
+goes into the tunnel only while the guard lets it. The guard is the same at both ends, with the same thresholds, but for
+one rule of the entry's alone: a half second of at least 100 packets whose smoothed round trip is 50 ms over the least
+the connection has seen turns the limit on as loss does. Chromium's sender under the entry's guard keeps loss under the
+tenth while the line's queue stays full, and that queue is the trunk's own; on a line a user shares with others, as the
+client's and the relay's, the queue is often another's, and limiting by it starves live traffic (owner's choice of
+2026-11-14).
