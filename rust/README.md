@@ -494,13 +494,19 @@ answered `404`. `exit/h3.rs` makes a member a peer like a `udp` one: its datagra
 member that dies closes its connection. Datagrams sit in quiche's queues in buffers of a fixed size (`Dg`), not one
 allocation each.
 
-Not yet: the brain's message for this wire (the brain hands the `udp` wire only; the certificate and the tokens come with
-R6.3), the queue by time and the guard of С10 down (quiche's own congestion control for now), Retry.
+The brain gives the wire as it gives the `udp` one: `B_WIRE` with form 2 (`ctl.rs` `FORM_H3DGRAM`, `trunk/pipectl`
+`FormH3Dgram`), the wire's bound socket, `h3dgram.Token` of each trunk key in place of `udpwire.Key`, then the paths of
+the certificate chain and key (PEM), which the exit reads. `pipectl.ExitWire{Form, CertFile, KeyFile}`.
+
+Not yet: the queue by time and the guard of С10 down (quiche's own congestion control for now), Retry.
 
 Checks:
 
 - `exit/tests/h3dgram.rs`: a QUIC client of its own (quiche) against `hk-exit`: a member says its hello and hears the
   call back; another token gets `404` (`tests/data` holds a test-only certificate).
+- `bench/go/h3exit` (the bench's Go module, which has quic-go; `trunk` takes no dependency): the Go brain gives
+  `hk-exit` the wire, quic-go's HTTP/3 is the member: another key's token gets `404`, the token's CONNECT-UDP says its
+  hello and hears the call 50 of 50 times, the exit's tick counts the member. `HK_EXIT=<hk-exit> go test ./h3exit/`.
 - `bench/h3dgram.sh [runs] [count]`: the call through Chromium's QUIC (`hk-h3dgram-call`, the patched libcronet) to
   `hk-exit`, every datagram checked; a wrong key gets no member.
 - `bench/h3dgram-cost.sh [members] [pps] [secs] [size]`: the exit's CPU per datagram under calls at once.

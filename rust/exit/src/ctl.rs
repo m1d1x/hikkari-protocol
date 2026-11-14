@@ -9,7 +9,7 @@ pub const VERSION: u16 = 2;
 
 // Brain → exit.
 pub const B_HELLO: u8 = 0x01; // ver u16
-pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; one fd: the wire's bound socket
+pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; on FORM_H3DGRAM then cert_len u16, cert path, key_len u16, key path; one fd: the wire's bound socket
 pub const B_PORTS: u8 = 0x0a; // n u16, port u16 × n
 pub const B_POOL: u8 = 0x0b; // dead_ms u16, quiet_ms u32; one fd: the pool's listening TCP socket
 
@@ -18,8 +18,13 @@ pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
 pub const P_TICK: u8 = 0x82; // see put_tick
 pub const P_ERROR: u8 = 0x85; // text
 
-/// The only wire form so far: the bare UDP wire (trunk/udpwire).
+/// The bare UDP wire (trunk/udpwire): its keys are udpwire.Key of each
+/// trunk key.
 pub const FORM_UDP: u8 = 1;
+/// The Chromium QUIC wire (spec/trunk.md, `h3dgram`): its keys are the
+/// tokens of each trunk key (h3dgram.Token), and the message names the
+/// files of its TLS certificate chain and key (PEM), which the exit reads.
+pub const FORM_H3DGRAM: u8 = 2;
 /// A duration the exit has no value for (no pause yet).
 pub const NONE_MS: u32 = u32::MAX;
 /// Most sockets one message may carry: a wire's one, the pool's one.
@@ -31,8 +36,10 @@ pub const MAX_KEYS: usize = 16;
 pub enum Msg<'a> {
     Hello { ver: u16 },
     /// A wire: its socket comes with the message. `keys` holds `n` wire
-    /// keys (udpwire.Key of each trunk key: the exit never sees a trunk key).
-    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, quiet_ms: u32, keys: &'a [u8] },
+    /// keys (udpwire.Key or h3dgram.Token of each trunk key: the exit never
+    /// sees a trunk key); `cert` and `key` are the QUIC wire's files, empty
+    /// for the UDP wire.
+    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, quiet_ms: u32, keys: &'a [u8], cert: &'a [u8], key: &'a [u8] },
     /// The loopback ports open to the trunk (trunk Local.DialFlow and
     /// DialStream refuse the others); the set replaces the one before.
     Ports { ports: &'a [u8] },
@@ -74,7 +81,19 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
             if n == 0 || n > MAX_KEYS {
                 return None;
             }
-            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys: r.take(32 * n)? }
+            let keys = r.take(32 * n)?;
+            let (cert, key): (&[u8], &[u8]) = if form == FORM_H3DGRAM {
+                let c = r.u16()? as usize;
+                let cert = r.take(c)?;
+                let k = r.u16()? as usize;
+                (cert, r.take(k)?)
+            } else {
+                (&[], &[])
+            };
+            if form == FORM_H3DGRAM && (cert.is_empty() || key.is_empty()) {
+                return None;
+            }
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key }
         }
         B_PORTS => {
             let n = r.u16()? as usize;
@@ -239,6 +258,9 @@ mod tests {
     const WIRE_GOLDEN: &str = "030201e8030000b0042c013075000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const TICK_GOLDEN: &str = "82ffffffff01000000390500000200000004000000030000001300000014000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000000000000150000000000000016000000000000001700000000000000180000000000000019000000000000001a000000000000001b000000000000001c000000000000001d000000000000001e000000000000001f000000000000002000000000000000";
     const POOL_GOLDEN: &str = "0b2c0130750000";
+    /// trunk/pipectl exitmsg_test.go exitH3WireGolden: wire 6, one token
+    /// (0xcc), the files /c.pem and /k.pem.
+    const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c013075000001cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc06002f632e70656d06002f6b2e70656d";
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
@@ -248,13 +270,21 @@ mod tests {
     fn messages_match_the_go_side() {
         let wire = unhex(WIRE_GOLDEN);
         match parse(&wire) {
-            Some(Msg::Wire { id: 2, form: FORM_UDP, glue_us: 1000, glue_max: 1200, dead_ms: 300, quiet_ms: 30000, keys }) => {
+            Some(Msg::Wire { id: 2, form: FORM_UDP, glue_us: 1000, glue_max: 1200, dead_ms: 300, quiet_ms: 30000, keys, cert: b"", key: b"" }) => {
                 assert_eq!(keys.len(), 64);
                 assert_eq!((keys[0], keys[32]), (0xaa, 0xbb));
             }
             _ => panic!("wire"),
         }
         assert!(parse(&wire[..wire.len() - 1]).is_none(), "a key torn short");
+        let h3 = unhex(H3_WIRE_GOLDEN);
+        match parse(&h3) {
+            Some(Msg::Wire { id: 6, form: FORM_H3DGRAM, glue_us: 1000, keys, cert: b"/c.pem", key: b"/k.pem", .. }) => {
+                assert_eq!((keys.len(), keys[0]), (32, 0xcc));
+            }
+            _ => panic!("h3dgram wire"),
+        }
+        assert!(parse(&h3[..h3.len() - 1]).is_none(), "a key file's path torn short");
         let ports = [B_PORTS, 2, 0, 0xfb, 0x20, 0x50, 0x00];
         match parse(&ports) {
             Some(Msg::Ports { ports }) => assert_eq!((port_at(ports, 0), port_at(ports, 1)), (8443, 80)),

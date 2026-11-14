@@ -63,9 +63,13 @@ const (
 	pDrained = 0x86 // a pipe draining carries nothing more
 )
 
-// FormUDP is the bare UDP wire (trunk/udpwire), the only form the pipe
-// carries so far.
+// FormUDP is the bare UDP wire (trunk/udpwire), the only form the entry's
+// pipe carries so far.
 const FormUDP = 1
+
+// FormH3Dgram is the Chromium QUIC wire (spec/trunk.md, h3dgram, trunk/h3dgram):
+// the exit's pipe serves it since R6.2, the entry's pipe not yet (R6.3).
+const FormH3Dgram = 2
 
 // noneMS is a duration the pipe has no value for.
 const noneMS = ^uint32(0)

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/m1d1x/hikkari-protocol/trunk"
+	"github.com/m1d1x/hikkari-protocol/trunk/h3dgram"
 	"github.com/m1d1x/hikkari-protocol/trunk/udpwire"
 )
 
@@ -21,7 +21,7 @@ const ExitVersion = 2
 // Brain → exit.
 const (
 	xHello = 0x01 // ver u16
-	xWire  = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; one socket
+	xWire  = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; on FormH3Dgram then cert_len u16, cert path, key_len u16, key path; one socket
 	xPorts = 0x0a // n u16, port u16 × n
 	xPool  = 0x0b // dead_ms u16, quiet_ms u32; one socket: the pool's listening TCP socket
 )
@@ -36,23 +36,45 @@ const (
 // maxExitKeys is the most trunk keys one exit wire opens under.
 const maxExitKeys = 16
 
-func putExitWire(id trunk.WireID, glue time.Duration, glueMax int, stall, quiet time.Duration, keys []string) ([]byte, error) {
+// putExitWire is the wire message: for FormUDP each trunk key goes as
+// udpwire.Key, for FormH3Dgram as h3dgram.Token, followed by the paths of
+// the wire's certificate chain and key (PEM), which the exit reads.
+func putExitWire(w ExitWire) ([]byte, error) {
+	id, keys := w.ID, w.Keys
 	if len(keys) == 0 || len(keys) > maxExitKeys {
 		return nil, fmt.Errorf("pipectl: exit wire %d: %d trunk keys, want 1 to %d", id, len(keys), maxExitKeys)
 	}
+	derive := udpwire.Key
+	switch w.Form {
+	case FormUDP:
+	case FormH3Dgram:
+		derive = h3dgram.Token
+		if w.CertFile == "" || w.KeyFile == "" || len(w.CertFile) > 0xffff || len(w.KeyFile) > 0xffff {
+			return nil, fmt.Errorf("pipectl: exit wire %d: the QUIC wire needs its certificate's and key's files", id)
+		}
+	default:
+		return nil, fmt.Errorf("pipectl: exit wire %d: form %d is not one the exit carries", id, w.Form)
+	}
 	le := binary.LittleEndian
-	b := []byte{xWire, byte(id), FormUDP}
+	b := []byte{xWire, byte(id), w.Form}
+	glue, glueMax, stall, quiet := w.Glue, w.GlueMax, w.Stall, w.Quiet
 	b = le.AppendUint32(b, uint32(glue/time.Microsecond))
 	b = le.AppendUint16(b, uint16(glueMax))
 	b = le.AppendUint16(b, uint16(stall/time.Millisecond))
 	b = le.AppendUint32(b, uint32(quiet/time.Millisecond))
 	b = append(b, byte(len(keys)))
 	for _, k := range keys {
-		wk, err := udpwire.Key(k)
+		wk, err := derive(k)
 		if err != nil {
 			return nil, err
 		}
 		b = append(b, wk...)
+	}
+	if w.Form == FormH3Dgram {
+		for _, f := range []string{w.CertFile, w.KeyFile} {
+			b = le.AppendUint16(b, uint16(len(f)))
+			b = append(b, f...)
+		}
 	}
 	return b, nil
 }

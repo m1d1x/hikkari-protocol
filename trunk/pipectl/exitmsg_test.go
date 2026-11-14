@@ -15,10 +15,14 @@ const (
 	exitWireGolden = "030201e8030000b0042c013075000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 	exitTickGolden = "82ffffffff01000000390500000200000004000000030000001300000014000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000000000000150000000000000016000000000000001700000000000000180000000000000019000000000000001a000000000000001b000000000000001c000000000000001d000000000000001e000000000000001f000000000000002000000000000000"
 	exitPoolGolden = "0b2c0130750000"
+	// rust/exit/src/ctl.rs H3_WIRE_GOLDEN: wire 6, one token (set to 0xcc
+	// past the derivation), the files /c.pem and /k.pem.
+	exitH3WireGolden = "030602e8030000b0042c013075000001cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc06002f632e70656d06002f6b2e70656d"
 )
 
 func TestExitGolden(t *testing.T) {
-	b, err := putExitWire(2, time.Millisecond, 1200, 300*time.Millisecond, 30*time.Second, []string{"k1-0123456789abcdefghijkl", "k2-0123456789abcdefghijkl"})
+	b, err := putExitWire(ExitWire{ID: 2, Form: FormUDP, Glue: time.Millisecond, GlueMax: 1200, Stall: 300 * time.Millisecond, Quiet: 30 * time.Second,
+		Keys: []string{"k1-0123456789abcdefghijkl", "k2-0123456789abcdefghijkl"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,8 +36,24 @@ func TestExitGolden(t *testing.T) {
 	if got := hex.EncodeToString(b); got != exitWireGolden {
 		t.Fatalf("exit wire %s, want %s", got, exitWireGolden)
 	}
-	if _, err := putExitWire(2, 0, 0, 0, 0, nil); err == nil {
+	if _, err := putExitWire(ExitWire{ID: 2, Form: FormUDP}); err == nil {
 		t.Fatal("a wire with no key taken")
+	}
+	h3 := ExitWire{ID: 6, Form: FormH3Dgram, Glue: time.Millisecond, GlueMax: 1200, Stall: 300 * time.Millisecond, Quiet: 30 * time.Second,
+		Keys: []string{"k1-0123456789abcdefghijkl"}, CertFile: "/c.pem", KeyFile: "/k.pem"}
+	b, err = putExitWire(h3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 32 {
+		b[16+i] = 0xcc
+	}
+	if got := hex.EncodeToString(b); got != exitH3WireGolden {
+		t.Fatalf("exit h3dgram wire %s, want %s", got, exitH3WireGolden)
+	}
+	h3.KeyFile = ""
+	if _, err := putExitWire(h3); err == nil {
+		t.Fatal("a QUIC wire without its key's file taken")
 	}
 	if got := putExitPorts([]uint16{8443, 80}); !reflect.DeepEqual(got, []byte{xPorts, 2, 0, 0xfb, 0x20, 0x50, 0}) {
 		t.Fatalf("ports % x", got)

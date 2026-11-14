@@ -28,9 +28,14 @@ type ExitWire struct {
 	// Conn is the wire's socket, bound by the brain; the pipe gets a copy of
 	// it and the brain keeps it (a reload hands it to the next pipe).
 	Conn *net.UDPConn
+	// Form is the wire's form: FormUDP (when 0) or FormH3Dgram.
+	Form byte
 	// Keys are the trunk keys a member may open under (the pipe gets
-	// udpwire.Key of each).
+	// udpwire.Key of each, or h3dgram.Token on the QUIC wire).
 	Keys []string
+	// CertFile and KeyFile are the QUIC wire's TLS certificate chain and
+	// key (PEM), which the exit reads; the UDP wire has none.
+	CertFile, KeyFile string
 	// Stall is how long a member may owe an answer while another member of
 	// its session proves the entry alive (the pipe adds the ping interval
 	// and raises it to 4 × the member's smoothed RTT); Quiet how long every
@@ -112,7 +117,10 @@ func (x *Exit) SetWire(w ExitWire) error {
 	if w.Quiet == 0 {
 		w.Quiet = trunk.ExitQuiet
 	}
-	m, err := putExitWire(w.ID, w.Glue, w.GlueMax, w.Stall, w.Quiet, w.Keys)
+	if w.Form == 0 {
+		w.Form = FormUDP
+	}
+	m, err := putExitWire(w)
 	if err != nil {
 		return err
 	}

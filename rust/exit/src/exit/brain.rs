@@ -4,6 +4,7 @@ use hikkari_sys as sys;
 
 use super::{Exit, Pool};
 use crate::ctl::{self, Msg};
+use crate::h3wire::H3Wire;
 use crate::peer::Wire;
 
 impl Exit {
@@ -42,8 +43,8 @@ impl Exit {
         match ctl::parse(m).ok_or_else(|| format!("exit: a message it cannot read (type {:#x})", m.first().copied().unwrap_or(0)))? {
             Msg::Hello { ver } if ver == ctl::VERSION => Ok(()),
             Msg::Hello { ver } => Err(format!("exit: the brain speaks version {ver}, the exit {}", ctl::VERSION)),
-            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys } => {
-                if form != ctl::FORM_UDP {
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key } => {
+                if form != ctl::FORM_UDP && form != ctl::FORM_H3DGRAM {
                     return Err(format!("exit: wire {id}: form {form} is not one the exit carries"));
                 }
                 if self.wires.iter().any(|w| w.id == id) {
@@ -55,7 +56,14 @@ impl Exit {
                 let sock = sys::udp_from_fd(fds.remove(0)).map_err(|e| format!("exit: wire {id}: {e}"))?;
                 sys::tune(&sock, false).map_err(|e| format!("exit: wire {id}: {e}"))?;
                 let keys = keys.chunks(32).map(|k| k.try_into().expect("32")).collect();
-                let w = Wire::udp(id, sock, keys, dead_ms as u64 * 1_000_000, quiet_ms as u64 * 1_000_000, glue_us as u64 * 1000, glue_max as usize);
+                let (stall, quiet, glue) = (dead_ms as u64 * 1_000_000, quiet_ms as u64 * 1_000_000, glue_us as u64 * 1000);
+                let w = if form == ctl::FORM_UDP {
+                    Wire::udp(id, sock, keys, stall, quiet, glue, glue_max as usize)
+                } else {
+                    let path = |b: &[u8]| std::str::from_utf8(b).map(str::to_owned).map_err(|_| format!("exit: wire {id}: a file's path is not UTF-8"));
+                    let h = H3Wire::new(sock, &path(cert)?, &path(key)?, keys).map_err(|e| format!("exit: wire {id}: {e}"))?;
+                    Wire::h3dgram(id, h, stall, quiet, glue, glue_max as usize)
+                };
                 self.wires.push(w);
                 self.dirty = true;
                 Ok(())
