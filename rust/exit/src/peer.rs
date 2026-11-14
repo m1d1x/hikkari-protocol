@@ -8,7 +8,9 @@
 //! datagram, which the Go exit does not do (trunk session.go writePackets:
 //! every frame in a datagram of its own). The entry's packet members read a
 //! frame sequence per datagram, so the glue changes nothing for them but
-//! the count of datagrams.
+//! the count of datagrams. On the QUIC wire a member's frames go into its
+//! connection's scheduler instead (h3wire.rs, sched.rs), which glues them
+//! into datagrams as the guard lets them go.
 
 use std::net::UdpSocket;
 use std::os::fd::AsRawFd;
@@ -18,6 +20,7 @@ use hikkari_trunk::health::Health;
 use hikkari_trunk::udpwire::{Seal, OVERHEAD};
 
 use crate::h3wire::H3Wire;
+pub use crate::sched::Class;
 
 /// The largest datagram on the wire (udpwire MaxDatagram, the IPv4 UDP
 /// payload limit): a wire's receive and send slots hold one each.
@@ -56,8 +59,9 @@ pub struct Wire {
     pub glue_ns: u64,
     pub glue_max: usize,
     /// Frames glued and datagrams sent since the wire came: frames per
-    /// datagram is the glue down. Dropped: frames no datagram of the
-    /// member held, and datagrams its connection did not take.
+    /// datagram is the glue down (the QUIC wire's datagrams are its
+    /// connections', sent()). Dropped: frames no datagram of the member
+    /// held.
     pub frames: u64,
     pub dgrams: u64,
     pub dropped: u64,
@@ -97,6 +101,15 @@ impl Wire {
         }
     }
 
+    /// Datagrams sent down since the wire came (on the QUIC wire, those its
+    /// connections took).
+    pub fn sent(&self) -> u64 {
+        match &self.form {
+            Form::Udp(_) => self.dgrams,
+            Form::H3(h) => h.n.dgrams,
+        }
+    }
+
     /// Datagrams the socket refused (a full buffer) and sendmmsg calls.
     pub fn socket_counts(&self) -> (u64, u64) {
         let s = match &self.form {
@@ -120,13 +133,19 @@ impl Wire {
         }
     }
 
-    /// p's glued frames into one datagram: sealed into the next out slot to
-    /// its address, or an HTTP Datagram of its request on its connection.
-    pub fn seal(&mut self, p: &mut Peer) {
-        if p.glue_n == 0 {
+    /// p's glued frames into one datagram sealed into the next out slot to
+    /// its address; on the QUIC wire, what waits in its scheduler goes as
+    /// HTTP Datagrams of its request.
+    pub fn seal(&mut self, p: &mut Peer, now: u64) {
+        if p.glue_since == 0 {
             return;
         }
         let sent = match &mut self.form {
+            Form::H3(h) => {
+                h.drain(p.conn, p.stream, now);
+                p.glue_since = 0;
+                return;
+            }
             Form::Udp(u) => {
                 if u.out_n == BATCH {
                     u.send.flush(u.sock.as_raw_fd());
@@ -139,7 +158,6 @@ impl Wire {
                 u.out_n += 1;
                 true
             }
-            Form::H3(h) => h.send_dgram(p.conn, p.stream, &mut p.glue, 12, 12 + p.glue_n),
         };
         if sent {
             self.dgrams += 1;
@@ -163,19 +181,28 @@ impl Wire {
         }
     }
 
-    /// Puts one frame of `need` bytes (written by `put`) into p's glue,
-    /// sealing first what is there when it would not fit; a frame alone
-    /// over the window's size goes alone. False for a frame no datagram
-    /// holds: dropped, as udpwire drops a write over MaxDatagram.
+    /// Puts one frame of `need` bytes of class c (written by `put`) into p's
+    /// glue, sealing first what is there when it would not fit; a frame
+    /// alone over the window's size goes alone. On the QUIC wire it goes
+    /// into p's scheduler. False for a frame no datagram holds: dropped, as
+    /// udpwire drops a write over MaxDatagram.
     #[inline]
-    pub fn glue(&mut self, p: &mut Peer, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
+    pub fn glue(&mut self, p: &mut Peer, c: Class, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
         let (most, window) = self.room(p);
         if need > most {
             self.dropped += 1;
             return false;
         }
+        if let Form::H3(h) = &mut self.form {
+            h.put(p.conn, p.stream, c, need, now, put);
+            self.frames += 1;
+            if p.glue_since == 0 {
+                p.glue_since = now;
+            }
+            return true;
+        }
         if p.glue_n > 0 && p.glue_n + need > window {
-            self.seal(p);
+            self.seal(p, now);
         }
         let n = put(&mut p.glue[12 + p.glue_n..]);
         p.glue_n += n;
@@ -189,9 +216,9 @@ impl Wire {
     /// One frame in a datagram of its own, now: a hello's answer, which the
     /// Go entry reads apart from the frames after it.
     pub fn alone(&mut self, p: &mut Peer, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) {
-        self.seal(p);
-        self.glue(p, need, now, put);
-        self.seal(p);
+        self.seal(p, now);
+        self.glue(p, Class::Alone, need, now, put);
+        self.seal(p, now);
     }
 }
 
@@ -300,16 +327,16 @@ mod tests {
         let mut w = Wire::udp(2, sock, vec![[7; 32]], 0, 0, 0, 100);
         let mut p = Peer::vacant();
         p.take(sys::sockaddr("127.0.0.1:9".parse().unwrap()), 0, &[7; 32], 1);
-        assert!(w.glue(&mut p, 30, 5, |b| {
+        assert!(w.glue(&mut p, Class::Flow(1), 30, 5, |b| {
             b[..30].fill(1);
             30
         }));
-        assert!(w.glue(&mut p, 30, 6, |b| {
+        assert!(w.glue(&mut p, Class::Flow(1), 30, 6, |b| {
             b[..30].fill(2);
             30
         }));
         assert_eq!((p.glue_n, p.glue_since, w.dgrams), (60, 5, 0));
-        assert!(w.glue(&mut p, 30, 7, |b| {
+        assert!(w.glue(&mut p, Class::Flow(1), 30, 7, |b| {
             b[..30].fill(3);
             30
         }));
@@ -319,6 +346,6 @@ mod tests {
         let n = u.openers[0].open(first).unwrap();
         assert_eq!(n, 60);
         assert!(first[12..42].iter().all(|&b| b == 1) && first[42..72].iter().all(|&b| b == 2));
-        assert!(!w.glue(&mut p, SLOT, 8, |_| 0), "a frame no datagram holds");
+        assert!(!w.glue(&mut p, Class::Flow(1), SLOT, 8, |_| 0), "a frame no datagram holds");
     }
 }

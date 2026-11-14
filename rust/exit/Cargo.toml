@@ -10,4 +10,6 @@ publish.workspace = true
 libc.workspace = true
 hikkari-sys.workspace = true
 hikkari-trunk.workspace = true
-quiche.workspace = true
+# The fixed window (spec/trunk.md, h3dgram, "How the exit sends down"):
+# the guard paces the wire, not quiche's congestion control.
+quiche = { workspace = true, features = ["congestion_window_unchecked_available"] }

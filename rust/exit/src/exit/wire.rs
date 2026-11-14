@@ -11,7 +11,7 @@ use hikkari_trunk::frame::{self, Frame, DGRAM_HEAD, F_PONG, KIND_PACKET, KIND_ST
 use hikkari_trunk::health::Health;
 
 use super::Exit;
-use crate::peer::Form;
+use crate::peer::{Class, Form};
 
 impl Exit {
     /// Everything each readable wire has, batch by batch.
@@ -86,7 +86,7 @@ impl Exit {
                 Frame::Ping(t) => {
                     if self.peers[pi].joined() {
                         let w = self.peers[pi].wire;
-                        self.wires[w].glue(&mut self.peers[pi], 9, now, |b| frame::put_ping(b, F_PONG, t));
+                        self.wires[w].glue(&mut self.peers[pi], Class::Own, 9, now, |b| frame::put_ping(b, F_PONG, t));
                     }
                 }
                 Frame::Pong(t) => {
@@ -195,7 +195,7 @@ impl Exit {
         let n = f.carriers(up, sess.of_wire(f.wire), &sess.members, carriers);
         for &(pi, _) in &carriers[..n] {
             let p = &mut peers[pi];
-            wires[p.wire].glue(p, DGRAM_HEAD + payload.len(), now, |b| frame::put_dgram(b, stream, seq, port, payload));
+            wires[p.wire].glue(p, Class::Flow(stream), DGRAM_HEAD + payload.len(), now, |b| frame::put_dgram(b, stream, seq, port, payload));
         }
     }
 }

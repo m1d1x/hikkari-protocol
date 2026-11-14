@@ -9,14 +9,22 @@
 //! here (quiche's own header parse allocates; it reads only a new
 //! connection's Initial). Datagrams are copied into buffers of a fixed size
 //! (Bufs), not allocated one by one. Packets out go in one sendmmsg a turn.
+//!
+//! Down (spec/trunk.md, `h3dgram`, "How the exit sends down"): QUIC's window
+//! is memory's, with no pacing; a member's frames wait in its scheduler
+//! (sched.rs) and its connection's guard (guard.rs) holds it to a rate only
+//! on real loss.
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, sockaddr_in, SendBatch, BATCH};
-use hikkari_trunk::h3dgram::{self, TOKEN};
+use hikkari_trunk::h3dgram::{self, HEAD_MAX, TOKEN};
 use quiche::h3;
+
+use crate::guard::{Guard, Snap};
+use crate::sched::{self, Class, Sched};
 
 /// The exit's connection ids: random, this long.
 pub const CID: usize = 16;
@@ -28,6 +36,12 @@ const SEND_MAX: usize = 1350;
 pub const DGRAM: usize = 1400;
 /// Datagrams each connection queues each way (quiche's queues).
 const DGRAM_QUEUE: usize = 1024;
+/// QUIC's window down: memory's, not the path's (the guard's guardWindow).
+const WINDOW: usize = 64 << 20;
+/// What a datagram's packet adds to its frames, for the guard's budget:
+/// the short header with the exit's id, a packet number, AEAD's tag, the
+/// DATAGRAM frame's and the HTTP Datagram's heads.
+const PACKET_OVER: usize = 1 + CID + 4 + 16 + 3 + HEAD_MAX;
 /// A connection silent this long is closed by QUIC itself; a member pings
 /// every 100 ms, so only a dead one gets there (the exit's Quiet is the
 /// same 30 s).
@@ -108,14 +122,24 @@ pub enum Req {
     Ended(u64),
 }
 
+/// A CONNECT-UDP of a connection that is a member: its request stream,
+/// peer slot and gen, its frames down.
+pub struct Member {
+    pub stream: u64,
+    pub pi: usize,
+    pub gen: u32,
+    sched: Box<Sched>,
+}
+
 /// One QUIC connection from the entry.
 pub struct Conn {
     q: quiche::Connection<Bufs>,
     h3: Option<h3::Connection>,
     /// Its ids in the map: the exit's own and the entry's first one.
     keys: [CidKey; 2],
-    /// Its members: request stream, peer slot and gen.
-    pub members: Vec<(u64, usize, u32)>,
+    pub members: Vec<Member>,
+    /// Its sending down while it loses (guard.rs).
+    guard: Guard,
     /// When QUIC wants on_timeout (monotonic ns; 0: never).
     due: u64,
     dirty: bool,
@@ -132,6 +156,20 @@ pub struct Counts {
     pub stray: u64,
     pub too_big: u64,
     pub full: u64,
+    /// Datagrams down QUIC took.
+    pub dgrams: u64,
+    /// The schedulers' counts and the guards' time limited of connections
+    /// gone (Down::of adds the open ones).
+    pub sched_gone: sched::Counts,
+    pub guard_gone_ns: u64,
+}
+
+/// The wire's sending down, all connections, for the stats line.
+pub struct Down {
+    pub sched: sched::Counts,
+    pub guard_ns: u64,
+    /// Connections held to a rate now.
+    pub limited: usize,
 }
 
 pub struct H3Wire {
@@ -147,6 +185,8 @@ pub struct H3Wire {
     out_n: usize,
     pub send: SendBatch,
     body: Vec<u8>,
+    /// A datagram down being made: its head, then its frames.
+    dg: Vec<u8>,
     pub n: Counts,
 }
 
@@ -170,6 +210,9 @@ impl H3Wire {
         c.set_initial_max_streams_uni(100);
         c.set_disable_active_migration(true);
         c.enable_dgram(true, DGRAM_QUEUE, DGRAM_QUEUE);
+        c.set_cc_algorithm(quiche::CongestionControlAlgorithm::CongestionWindowUnchecked);
+        c.set_unchecked_congestion_window(WINDOW);
+        c.enable_pacing(false);
         let mut h3c = h3::Config::new().map_err(|e| format!("h3dgram: HTTP/3: {e}"))?;
         h3c.enable_extended_connect(true);
         Ok(H3Wire {
@@ -185,6 +228,7 @@ impl H3Wire {
             out_n: 0,
             send: SendBatch::new(),
             body: vec![0; 4096],
+            dg: vec![0; HEAD_MAX + DGRAM],
             n: Counts::default(),
         })
     }
@@ -239,7 +283,8 @@ impl H3Wire {
             self.conns.push(None);
             self.conns.len() - 1
         });
-        self.conns[ci] = Some(Conn { q, h3: None, keys, members: Vec::with_capacity(1), due: 0, dirty: true });
+        let members = Vec::with_capacity(1);
+        self.conns[ci] = Some(Conn { q, h3: None, keys, members, guard: Guard::default(), due: 0, dirty: true });
         for k in keys {
             self.by_cid.insert(k, ci);
         }
@@ -268,7 +313,7 @@ impl H3Wire {
                 // for: read and dropped.
                 Ok((stream, h3::Event::Data)) => while h.recv_body(&mut c.q, stream, &mut self.body).is_ok() {},
                 Ok((stream, h3::Event::Finished)) | Ok((stream, h3::Event::Reset(_))) => {
-                    if c.members.iter().any(|m| m.0 == stream) {
+                    if c.members.iter().any(|m| m.stream == stream) {
                         return Some(Req::Ended(stream));
                     }
                 }
@@ -285,7 +330,7 @@ impl H3Wire {
     /// Peer pi (of gen) is the member of request `stream` on ci.
     pub fn bind(&mut self, ci: usize, stream: u64, pi: usize, gen: u32) {
         if let Some(c) = self.conns[ci].as_mut() {
-            c.members.push((stream, pi, gen));
+            c.members.push(Member { stream, pi, gen, sched: Box::new(Sched::new()) });
         }
     }
 
@@ -295,7 +340,7 @@ impl H3Wire {
         let c = self.conns[ci].as_mut()?;
         loop {
             let n = c.q.dgram_recv(buf).ok()?;
-            let member = h3dgram::read_head(&buf[..n]).and_then(|(s, at)| c.members.iter().find(|m| m.0 == s).map(|m| (m.1, at)));
+            let member = h3dgram::read_head(&buf[..n]).and_then(|(s, at)| c.members.iter().find(|m| m.stream == s).map(|m| (m.pi, at)));
             match member {
                 Some((pi, at)) => return Some((pi, at, n)),
                 None => self.n.stray += 1,
@@ -303,23 +348,20 @@ impl H3Wire {
         }
     }
 
-    /// The frames at `glue[from..end]` as one datagram of request `stream`
-    /// on ci: the head goes into the bytes before them. False when the
-    /// datagram is over what the connection holds or its queue is full.
-    pub fn send_dgram(&mut self, ci: usize, stream: u64, glue: &mut [u8], from: usize, end: usize) -> bool {
-        let Some(c) = self.conns[ci].as_mut() else { return false };
-        let at = h3dgram::put_head(glue, from, stream);
-        c.dirty = true;
-        match c.q.dgram_send(&glue[at..end]) {
-            Ok(()) => true,
-            Err(quiche::Error::Done) => {
-                self.n.full += 1;
-                false
-            }
-            Err(_) => {
-                self.n.too_big += 1;
-                false
-            }
+    /// One frame of `need` bytes of class c for the member of request
+    /// `stream` on ci, written by `put`, into its scheduler at `now`.
+    pub fn put(&mut self, ci: usize, stream: u64, c: Class, need: usize, now: u64, put: impl FnOnce(&mut [u8]) -> usize) {
+        if let Some(m) = self.conns[ci].as_mut().and_then(|c| c.members.iter_mut().find(|m| m.stream == stream)) {
+            m.sched.put(c, need, now, put);
+        }
+    }
+
+    /// The member of request `stream` on ci sends what waits, as far as its
+    /// connection's guard lets it.
+    pub fn drain(&mut self, ci: usize, stream: u64, now: u64) {
+        let Some(c) = self.conns[ci].as_mut() else { return };
+        if let Some(m) = c.members.iter().position(|m| m.stream == stream) {
+            drain_member(c, m, now, &mut self.dg, &mut self.n);
         }
     }
 
@@ -352,6 +394,13 @@ impl H3Wire {
             if c.due != 0 {
                 next = next.min(c.due);
             }
+            // A member held back by the guard goes when its budget has come.
+            if c.members.iter().any(|m| m.sched.queued() > 0) {
+                let at = c.guard.next_at();
+                if at != 0 {
+                    next = next.min(at);
+                }
+            }
         }
         next
     }
@@ -361,6 +410,14 @@ impl H3Wire {
     pub fn flush(&mut self, now: u64) {
         for ci in 0..self.conns.len() {
             let Some(c) = self.conns[ci].as_mut() else { continue };
+            // What the guard held back goes as its budget comes.
+            if c.guard.rate() > 0.0 {
+                for m in 0..c.members.len() {
+                    if c.members[m].sched.queued() > 0 {
+                        drain_member(c, m, now, &mut self.dg, &mut self.n);
+                    }
+                }
+            }
             if !c.dirty {
                 continue;
             }
@@ -414,7 +471,11 @@ impl H3Wire {
                     self.by_cid.remove(&k);
                 }
             }
-            gone.extend(c.members.iter().map(|m| (m.1, m.2)));
+            for m in &c.members {
+                add(&mut self.n.sched_gone, &m.sched.n);
+            }
+            self.n.guard_gone_ns += c.guard.limited_ns(sys::now_ns());
+            gone.extend(c.members.iter().map(|m| (m.pi, m.gen)));
             self.free.push(ci);
         }
     }
@@ -423,6 +484,60 @@ impl H3Wire {
     pub fn open(&self) -> usize {
         self.conns.iter().flatten().count()
     }
+
+    /// The wire's sending down since it came, at `now`.
+    pub fn down(&self, now: u64) -> Down {
+        let mut d = Down { sched: self.n.sched_gone, guard_ns: self.n.guard_gone_ns, limited: 0 };
+        for c in self.conns.iter().flatten() {
+            for m in &c.members {
+                add(&mut d.sched, &m.sched.n);
+            }
+            d.guard_ns += c.guard.limited_ns(now);
+            d.limited += usize::from(c.guard.rate() > 0.0);
+        }
+        d
+    }
+}
+
+fn add(to: &mut sched::Counts, n: &sched::Counts) {
+    to.stale += n.stale;
+    to.sent += n.sent;
+    to.wait_ns += n.wait_ns;
+    to.wait_max_ns = to.wait_max_ns.max(n.wait_max_ns);
+}
+
+/// Member m of connection c sends what waits in its scheduler as datagrams
+/// of its request, each begun only while the guard lets one go; the guard
+/// judges the half second gone first, from QUIC's counters.
+fn drain_member(c: &mut Conn, m: usize, now: u64, dg: &mut [u8], n: &mut Counts) {
+    let Conn { q, guard, members, dirty, .. } = c;
+    if guard.due(now) {
+        let st = q.stats();
+        let rtt = q.path_stats().next().map_or(0, |p| p.rtt.as_nanos() as u64);
+        let snap = Snap { sent_bytes: st.sent_bytes, lost_bytes: st.lost_bytes, acked_bytes: st.acked_bytes, sent: st.sent as u64 };
+        guard.judge(now, snap, rtt);
+    }
+    let Member { stream, sched, .. } = &mut members[m];
+    let stream = *stream;
+    let room = q.dgram_max_writable_len().map_or(0, |r| r.saturating_sub(h3dgram::head_len(stream)));
+    sched.drain(now, room, dg, HEAD_MAX, guard, PACKET_OVER, |b, at, len| {
+        let from = h3dgram::put_head(b, at, stream);
+        match q.dgram_send(&b[from..at + len]) {
+            Ok(()) => {
+                n.dgrams += 1;
+                true
+            }
+            Err(quiche::Error::Done) => {
+                n.full += 1;
+                false
+            }
+            Err(_) => {
+                n.too_big += 1;
+                true
+            }
+        }
+    });
+    *dirty = true;
 }
 
 /// Whether a request is a CONNECT-UDP (RFC 9298) with a known token

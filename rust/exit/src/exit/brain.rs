@@ -112,7 +112,7 @@ impl Exit {
         let n = &self.streams.n;
         (t.streams_opened, t.streams_fin, t.reset_peer, t.reset_local) = (n.opened, n.fin, n.reset_peer, n.reset_local);
         (t.hit, t.resent, t.up, t.down, t.early, t.early_dropped) = (n.deaths, n.resent, n.up, n.down, n.early, n.early_dropped);
-        t.w_out = self.wires.iter().map(|w| w.dgrams).sum();
+        t.w_out = self.wires.iter().map(|w| w.sent()).sum();
         t.frames_out = self.wires.iter().map(|w| w.frames).sum();
         t.dropped = self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum();
         let Some(c) = self.ctl.as_mut() else { return };

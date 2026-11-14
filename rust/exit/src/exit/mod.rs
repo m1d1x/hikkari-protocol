@@ -296,7 +296,7 @@ impl Exit {
             if p.live && p.glue_since != 0 {
                 let w = &mut wires[p.wire];
                 if tick || w.glue_ns == 0 || now - p.glue_since >= w.glue_ns {
-                    w.seal(p);
+                    w.seal(p, now);
                 }
             }
         }
@@ -390,15 +390,21 @@ impl Exit {
         for w in &self.wires {
             if let Form::H3(h) = &w.form {
                 let n = &h.n;
+                let d = h.down(now_ns());
                 eprintln!(
-                    "hk-exit: h3dgram wire {} conns={} accepted={} refused={} stray={} too_big={} full={}",
+                    "hk-exit: h3dgram wire {} conns={} accepted={} refused={} stray={} too_big={} full={} stale={} wait_ms mean={:.2} max={:.1} guard_ms={} limited={}",
                     w.id,
                     h.open(),
                     n.conns,
                     n.refused,
                     n.stray,
                     n.too_big,
-                    n.full
+                    n.full,
+                    d.sched.stale,
+                    d.sched.wait_ns as f64 / d.sched.sent.max(1) as f64 / 1e6,
+                    d.sched.wait_max_ns as f64 / 1e6,
+                    d.guard_ns / 1_000_000,
+                    d.limited
                 );
             }
         }

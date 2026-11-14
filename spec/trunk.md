@@ -215,3 +215,14 @@ that carries them.
 
 The member's end is its connection's: the request stream ending, the connection closing or the member dying by its health
 closes both, and the entry opens a new member with a new connection. The exit's QUIC connection ids are random, 16 bytes.
+
+How the exit sends down a member's connection (R6.2b): as the datagram channel of v1.05 (spec/v1.md, "the datagram channel
+is a pipe"), since the wire carries only live datagrams whose senders run congestion control of their own. QUIC's window is
+fixed by memory (64 MiB in flight, no pacing); the guard of v1.05 with its thresholds judges each half second of the
+connection's sending from QUIC's own counts (bytes sent, lost and acknowledged, packets sent; the smoothed round trip for
+the line's queue) and holds the connection to a rate only on real loss. The frames wait in the connection's scheduler, not
+in QUIC's queue: the member's own frames (pings, pongs, the hello's answer, which goes in a datagram of its own) first,
+then the flows' frames by deficit round robin, 1500 B a turn, over 32 buckets by stream id (a flow shares its bucket with
+the flows of the same stream id modulo 32). Right before a datagram is made, a frame that waited over 150 ms is dropped,
+the oldest first, and so is the oldest of a bucket holding 64 frames; each is counted stale. Up, the entry's Chromium runs
+its own sender: the exit does not choose it.

@@ -9,6 +9,7 @@ use hikkari_trunk::frame::{self, F_PING};
 use hikkari_trunk::health::Verdict;
 
 use super::Exit;
+use crate::peer::Class;
 use crate::session::SESSION_IDLE;
 use crate::streams::{CLOSED_MEMORY, EARLY_FOR};
 
@@ -69,7 +70,7 @@ impl Exit {
             match p.h.tick(&sessions.all[p.session].judge, w.stall_ns, now, tok) {
                 Verdict::Fine => {}
                 Verdict::Ping(k) => {
-                    w.glue(p, 9, now, |b| frame::put_ping(b, F_PING, k));
+                    w.glue(p, Class::Own, 9, now, |b| frame::put_ping(b, F_PING, k));
                 }
                 Verdict::Dead { quiet } => {
                     if quiet {
