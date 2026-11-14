@@ -45,6 +45,7 @@ const (
 	bTCPListen = 0x0c // id u8, to u16; one socket: a listening TCP socket
 	bPool      = 0x0d // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots
 	bClients   = 0x0e // the leg client → entry of the minute, now (answered by pClients)
+	bStats     = 0x0f // the counters of the minute line, now (answered by pStats)
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -62,6 +63,8 @@ const (
 	pDgram   = 0x84 // tag u32, payload
 	pError   = 0x85 // text
 	pDrained = 0x86 // a pipe draining carries nothing more
+	pStats    = 0x89 // see parseStats
+	pObserved = 0x88 // a report of a tester's stream or flow: see parseObserved
 	pClients = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
 )
 
@@ -344,4 +347,89 @@ func parseClients(m []byte) (Clients, error) {
 	}
 	return Clients{Conns: le.Uint32(m[1:]), Closed: le.Uint32(m[5:]), Sending: le.Uint32(m[9:]),
 		Segs: le.Uint64(m[13:]), Retrans: le.Uint64(m[21:]), RTTP50: us(le.Uint32(m[29:])), RTTP90: us(le.Uint32(m[33:]))}, nil
+}
+
+// Observed is the pipe's report of a tester's stream or flow (rust/pipe/src
+// observe.rs; spec/trunk.md, "Observation"), as the Go entry's session
+// reports one (trunk.Report): at the mark the exit sent, and at its end. For a
+// stream, TCP is its client's socket as the kernel saw it at the report.
+type Observed struct {
+	Report  trunk.Report
+	TCP     ClientTCP
+	HaveTCP bool
+}
+
+// ClientTCP is a client's TCP socket (tcp_info): the Go entry's tcpSample
+// (hikkari-control trunkentry observe.go).
+type ClientTCP struct {
+	RTT, RTTVar                               time.Duration
+	Retrans, Lost, Unack, Cwnd, SegsOut, SegsIn int64
+}
+
+// observedLen is a pObserved message's length.
+const observedLen = 116
+
+// observedEnds are the pipe's end codes (observe.rs END_*) as the trunk says
+// them.
+var observedEnds = []string{"", trunk.EndFin, trunk.EndLocal, trunk.EndPeer, trunk.EndEpoch, trunk.EndSession, trunk.EndIdle}
+
+func parseObserved(m []byte) (Observed, error) {
+	if len(m) != observedLen || m[0] != pObserved {
+		return Observed{}, fmt.Errorf("pipectl: observed of %d bytes", len(m))
+	}
+	le := binary.LittleEndian
+	u64 := func(at int) int64 { return int64(le.Uint64(m[at:])) }
+	u32 := func(at int) uint32 { return le.Uint32(m[at:]) }
+	if m[82] >= byte(len(observedEnds)) || m[10] > 1 {
+		return Observed{}, fmt.Errorf("pipectl: observed with phase %d, end %d", m[10], m[82])
+	}
+	phase := trunk.PhaseMark
+	if m[10] == 1 {
+		phase = trunk.PhaseEnd
+	}
+	o := Observed{Report: trunk.Report{
+		ID: le.Uint64(m[1:]), Kind: trunk.ObsKind(m[9]), Phase: phase, Port: le.Uint16(m[11:]),
+		Age: time.Duration(u32(13)) * time.Millisecond,
+		Up: u64(17), Down: u64(25), Chunks: u64(33), Resent: u64(41), Carriers: int(m[49]), Deaths: int(u32(50)),
+		MaxWait:   time.Duration(u32(54)) * time.Millisecond,
+		DgramsOut: u64(58), DgramsIn: u64(66), DgramsCopy: u64(74), End: observedEnds[m[82]],
+	}, HaveTCP: m[83] == 1}
+	if o.HaveTCP {
+		o.TCP = ClientTCP{RTT: time.Duration(u32(84)) * time.Microsecond, RTTVar: time.Duration(u32(88)) * time.Microsecond,
+			Retrans: int64(u32(92)), Lost: int64(u32(96)), Unack: int64(u32(100)), Cwnd: int64(u32(104)),
+			SegsOut: int64(u32(108)), SegsIn: int64(u32(112))}
+	}
+	return o, nil
+}
+
+// Stats are the counters of the brain's minute line the ticks do not carry
+// (rust/pipe/src/ctl.rs Stats), since the pipe started, in the Go entry's
+// words (trunk.Stats): clients' streams opened and reset either way, chunks
+// sent again, client bytes up and down, the pool's dead ports and kills, the
+// pipe's own pauses in all, and the pool's members' round trips at p50, p90
+// and the most (-1: no member up).
+type Stats struct {
+	Opened, Reset, Resent, Up, Down int64
+	DeadPorts, PortKills            int64
+	Paused                          time.Duration
+	RTTP50, RTTP90, RTTMax          time.Duration
+}
+
+const statsLen = 73
+
+func parseStats(m []byte) (Stats, error) {
+	if len(m) != statsLen || m[0] != pStats {
+		return Stats{}, fmt.Errorf("pipectl: stats of %d bytes", len(m))
+	}
+	le := binary.LittleEndian
+	u64 := func(at int) int64 { return int64(le.Uint64(m[at:])) }
+	us := func(at int) time.Duration {
+		if v := le.Uint32(m[at:]); v != noneMS {
+			return time.Duration(v) * time.Microsecond
+		}
+		return -1
+	}
+	return Stats{Opened: u64(1), Reset: u64(9), Resent: u64(17), Up: u64(25), Down: u64(33),
+		DeadPorts: int64(le.Uint32(m[41:])), PortKills: u64(45), Paused: time.Duration(u64(53)) * time.Millisecond,
+		RTTP50: us(61), RTTP90: us(65), RTTMax: us(69)}, nil
 }

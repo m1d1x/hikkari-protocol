@@ -28,6 +28,9 @@ type Config struct {
 	Logf   func(format string, a ...any)
 	// OnMember, when set, hears every member event of the pipe (why: Why*).
 	OnMember func(wire trunk.WireID, index int, up bool, why byte)
+	// OnObserved, when set, hears every report of a tester's stream or flow
+	// (the exit's marks).
+	OnObserved func(Observed)
 	// Spread spreads the dials that replace members the pipe took down
 	// (trunk's replaceSpread): members that die together come back one by
 	// one. Zero is a second, negative none.
@@ -84,10 +87,10 @@ type Pipe struct {
 
 	nextTag atomic.Uint32
 	hello   chan struct{}
-	// clients carries the pipe's answer to Clients; clientsMu keeps one
-	// question out at a time.
-	clients   chan Clients
-	clientsMu sync.Mutex
+	// answers carries the pipe's answer to a question (Clients, Stats);
+	// askMu keeps one question out at a time.
+	answers chan []byte
+	askMu   sync.Mutex
 	// drained is closed once the pipe, draining, says it carries nothing
 	// more.
 	drained     chan struct{}
@@ -124,7 +127,7 @@ func Start(cfg Config) (*Pipe, error) {
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
 		listens: map[byte]*listenConf{}, tcpListens: map[byte]*tcpListenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
-		drained: make(chan struct{}), clients: make(chan Clients, 1)}
+		drained: make(chan struct{}), answers: make(chan []byte, 1)}
 	go func() {
 		p.err = cmd.Wait()
 		close(p.done)
@@ -550,14 +553,18 @@ func (p *Pipe) read() {
 			}
 		case pError:
 			p.cfg.Logf("pipectl: the pipe: %s", m[1:])
-		case pClients:
-			c, err := parseClients(m)
+		case pObserved:
+			o, err := parseObserved(m)
 			if err != nil {
 				p.cfg.Logf("%v", err)
 				continue
 			}
+			if p.cfg.OnObserved != nil {
+				p.cfg.OnObserved(o)
+			}
+		case pClients, pStats:
 			select {
-			case p.clients <- c:
+			case p.answers <- append([]byte(nil), m...):
 			default: // nobody asks any more: the answer came after its wait
 			}
 		case pDrained:
@@ -624,28 +631,51 @@ func (p *Pipe) Run(ctx context.Context, sel *trunk.Selector, wires []trunk.WireI
 	trunk.SteerOn(ctx, p, sel, logf)
 }
 
-// clientsWait is how long Clients waits for the pipe's answer.
-const clientsWait = 2 * time.Second
+// askWait is how long a question waits for the pipe's answer.
+const askWait = 2 * time.Second
+
+// ask sends question q and waits for the pipe's answer of type a.
+func (p *Pipe) ask(q, a byte) ([]byte, error) {
+	p.askMu.Lock()
+	defer p.askMu.Unlock()
+	select {
+	case <-p.answers: // a late answer to an earlier question
+	default:
+	}
+	if err := p.send([]byte{q}); err != nil {
+		return nil, err
+	}
+	timeout := time.After(askWait)
+	for {
+		select {
+		case m := <-p.answers:
+			if m[0] == a {
+				return m, nil
+			}
+		case <-p.done:
+			return nil, errors.New("pipectl: the pipe ended")
+		case <-timeout:
+			return nil, fmt.Errorf("pipectl: no answer %#x from the pipe in %s", a, askWait)
+		}
+	}
+}
 
 // Clients is the leg client → entry since the last call (or the pipe's
 // start): the pipe reads every client's socket now and starts the next
 // minute.
 func (p *Pipe) Clients() (Clients, error) {
-	p.clientsMu.Lock()
-	defer p.clientsMu.Unlock()
-	select {
-	case <-p.clients: // a late answer to an earlier question
-	default:
-	}
-	if err := p.send([]byte{bClients}); err != nil {
+	m, err := p.ask(bClients, pClients)
+	if err != nil {
 		return Clients{}, err
 	}
-	select {
-	case c := <-p.clients:
-		return c, nil
-	case <-p.done:
-		return Clients{}, errors.New("pipectl: the pipe ended")
-	case <-time.After(clientsWait):
-		return Clients{}, errors.New("pipectl: no clients from the pipe in 2 s")
+	return parseClients(m)
+}
+
+// Stats are the pipe's counters for the brain's minute line now.
+func (p *Pipe) Stats() (Stats, error) {
+	m, err := p.ask(bStats, pStats)
+	if err != nil {
+		return Stats{}, err
 	}
+	return parseStats(m)
 }

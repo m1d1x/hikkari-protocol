@@ -107,3 +107,38 @@ func TestClientsGolden(t *testing.T) {
 		t.Fatal("a torn clients read")
 	}
 }
+
+// TestObservedGolden: a tester's report in the bytes the pipe writes
+// (rust/pipe/src/ctl.rs observed_golden).
+func TestObservedGolden(t *testing.T) {
+	m, _ := hex.DecodeString("88efcdab90785634120101fb200f2700000700000000000000080000000000000009000000000000000a000000000000000b0c0000000d000000000000000000000000000000000000000000000000000000010110270000e803000003000000010000000200000040000000c8000000c9000000")
+	o, err := parseObserved(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Observed{Report: trunk.Report{ID: 0x1234567890abcdef, Kind: trunk.ObsStream, Phase: trunk.PhaseEnd, Port: 8443,
+		Age: 9999 * time.Millisecond, Up: 7, Down: 8, Chunks: 9, Resent: 10, Carriers: 11, Deaths: 12, MaxWait: 13 * time.Millisecond,
+		End: trunk.EndFin}, HaveTCP: true, TCP: ClientTCP{RTT: 10 * time.Millisecond, RTTVar: time.Millisecond, Retrans: 3, Lost: 1,
+		Unack: 2, Cwnd: 64, SegsOut: 200, SegsIn: 201}}
+	if !reflect.DeepEqual(o, want) {
+		t.Fatalf("observed %+v, want %+v", o, want)
+	}
+	if _, err := parseObserved(m[:115]); err == nil {
+		t.Fatal("a torn report read")
+	}
+}
+
+// TestStatsGolden: the minute line's counters in the bytes the pipe writes
+// (rust/pipe/src/ctl.rs stats_golden).
+func TestStatsGolden(t *testing.T) {
+	m, _ := hex.DecodeString("8901000000000000000200000000000000030000000000000004000000000000000500000000000000060000000700000000000000080000000000000010270000204e000030750000")
+	s, err := parseStats(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Stats{Opened: 1, Reset: 2, Resent: 3, Up: 4, Down: 5, DeadPorts: 6, PortKills: 7, Paused: 8 * time.Millisecond,
+		RTTP50: 10 * time.Millisecond, RTTP90: 20 * time.Millisecond, RTTMax: 30 * time.Millisecond}
+	if s != want {
+		t.Fatalf("stats %+v, want %+v", s, want)
+	}
+}

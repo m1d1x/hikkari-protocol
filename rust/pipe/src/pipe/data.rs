@@ -53,7 +53,7 @@ impl Pipe {
 
     /// Wires → clients and the brain.
     pub(super) fn read_wires(&mut self) {
-        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, drains, cur, epochs, .. } = self;
+        let Pipe { poll, slots, wires, wrecv, flows, listens, ctl, out, events, moved, bad, judge, drains, cur, epochs, marks, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Member(wi, mi) = *s else { continue };
             if !poll.readable(si) {
@@ -116,6 +116,8 @@ impl Pipe {
                             | Frame::Fin { .. }
                             | Frame::Rst { .. }
                             | Frame::Other => {}
+                            // The exit marked a tester's flow (marks.rs).
+                            Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
                         }
                         at = nx;
                     }
@@ -134,6 +136,7 @@ impl Pipe {
         }
         self.send_events();
         self.saw_epochs();
+        self.observed(now_ns());
     }
 }
 
@@ -155,12 +158,14 @@ pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Optio
         if !echo {
             counts.copies += 1;
         }
+        f.obs.copies += 1;
         return;
     }
     f.used = now;
     if !echo {
         counts.delivered += 1;
     }
+    f.obs.delivered += 1;
     match &f.dest {
         Dest::Client { listen, addr } => {
             let l = &mut listens[*listen as usize];
@@ -220,6 +225,7 @@ pub(super) fn take_client(
         if !f.echo() {
             counts.out += 1;
         }
+        f.obs.out += 1;
         *moved += 1;
         at += step;
     }

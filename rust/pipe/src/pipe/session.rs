@@ -32,6 +32,7 @@ use super::Pipe;
 use crate::ctl::WireTick;
 use crate::link::{StreamWire, NO_SESSION};
 use crate::member::{member_to, Member, Wire};
+use crate::observe::{END_EPOCH, END_SESSION};
 
 /// Sessions open at once, at most: a reload of the exit every two minutes
 /// for the 30 minutes a retired session may live.
@@ -200,10 +201,10 @@ impl Pipe {
         self.cur = n;
         self.next = None;
         if up < all.div_ceil(4) {
-            eprintln!("hk-pipe: the exit drains: the new session has {up} of {all} member(s) after {} s, it takes over anyway", self.take_over_ns / 1_000_000_000);
+            eprintln!("hk-pipe: trunk: exit drains: the new session has {up} of {all} member(s) after {}s, it takes over anyway", self.take_over_ns / 1_000_000_000);
         }
         let (streams, flows) = (self.streams.on(old), self.flows.on(old));
-        eprintln!("hk-pipe: the exit drains: new session, the old one keeps {streams} stream(s) and {flows} flow(s)");
+        eprintln!("hk-pipe: trunk: exit drains: new session, the old one keeps {streams} stream(s) and {flows} flow(s)");
         // The brain's view is the current session's wires: it hears the new
         // one's at once, not on the next second.
         if self.ctl.is_some() {
@@ -227,9 +228,9 @@ impl Pipe {
                 continue;
             }
             if busy {
-                let flows = self.flows.end_session(s, &mut self.freed);
-                let streams = self.cut_streams(s);
-                eprintln!("hk-pipe: retired session closed after {} s with {streams} stream(s) and {flows} flow(s)", self.retire_ns / 1_000_000_000);
+                let flows = self.flows.end_session(s, END_SESSION, &mut self.freed);
+                let streams = self.cut_streams(s, super::Why::Session);
+                eprintln!("hk-pipe: trunk: retired session closed after {}s with {streams} stream(s) and {flows} flow(s)", self.retire_ns / 1_000_000_000);
             }
             self.close_session(s);
         }
@@ -308,9 +309,9 @@ impl Pipe {
                 Some(old) => {
                     ss.epoch = Some(epoch);
                     eprintln!("hk-pipe: trunk: exit epoch {} after {}: streams reset", hex(&epoch), hex(&old));
-                    let flows = self.flows.end_session(s, &mut self.freed);
+                    let flows = self.flows.end_session(s, END_EPOCH, &mut self.freed);
                     self.flows.forget_answers(s);
-                    let streams = self.cut_streams(s);
+                    let streams = self.cut_streams(s, super::Why::Epoch);
                     eprintln!("hk-pipe: the exit lost the session: {streams} stream(s) and {flows} flow(s) ended");
                 }
             }
@@ -318,11 +319,11 @@ impl Pipe {
     }
 
     /// The streams of session s cut: their clients' connections close.
-    fn cut_streams(&mut self, s: u8) -> usize {
+    fn cut_streams(&mut self, s: u8, why: super::Why) -> usize {
         let mut n = 0;
         for slot in 0..self.streams.slots() {
             if self.streams.get(slot).is_some_and(|st| st.sess == s) {
-                self.doomed.push((slot, super::Why::Local));
+                self.doomed.push((slot, why));
                 n += 1;
             }
         }

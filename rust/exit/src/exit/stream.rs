@@ -294,7 +294,7 @@ impl Exit {
             }
             match local.read(l.out.chunk_buf(k)) {
                 Read::Bytes(k) => {
-                    let off = st.send.chunk(&l.out.chunk_buf(k)[..k], carrier(li, l.gen));
+                    let off = st.send.chunk(&l.out.chunk_buf(k)[..k], carrier(li, l.gen), now);
                     l.out.chunk_done(st.id, off, k);
                     l.owe(k, now);
                     streams.n.up += k as u64;
@@ -312,7 +312,7 @@ impl Exit {
                     if !l.out.frame(13, |b| frame::put_fin(b, id, off)) {
                         break;
                     }
-                    st.send.fin(carrier(li, l.gen));
+                    st.send.fin(carrier(li, l.gen), now);
                     l.owe(0, now);
                     st.read_done = true;
                     *moved += 1;

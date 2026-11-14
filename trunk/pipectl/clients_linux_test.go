@@ -68,4 +68,15 @@ func TestThePipeAddsUpItsClientsSocketsOfTheMinute(t *testing.T) {
 	if next.Conns != 1 || next.Closed != 0 || next.Segs != 0 || next.Sending != 0 || next.RTTP50 != -1 {
 		t.Fatalf("an idle minute %+v", next)
 	}
+	// The minute line's counters (Stats): both streams, their bytes, the
+	// pool's members' round trips.
+	var st Stats
+	waitFor(t, 10*time.Second, "the members' round trips", func() bool {
+		st, err = p.Stats()
+		return err == nil && st.RTTP50 > 0
+	})
+	t.Logf("stats: %+v", st)
+	if st.Opened != 2 || st.Up < 1<<20 || st.Down < 1<<20 || st.Reset != 0 || st.RTTP50 <= 0 || st.RTTMax < st.RTTP90 || st.RTTP90 < st.RTTP50 {
+		t.Fatalf("stats %+v: want 2 streams opened, 1 MiB each way, none reset, the members' round trips", st)
+	}
 }

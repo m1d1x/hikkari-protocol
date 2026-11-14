@@ -33,6 +33,10 @@ pub struct Owed {
     pub off: u64,
     pub len: u32,
     pub carrier: u32,
+    /// When it was first sent (ns, the caller's clock): its wait for the
+    /// confirmation is measured from there, sent again or not (trunk
+    /// segment.first).
+    pub at: u64,
 }
 
 /// The bytes of a stream's unconfirmed chunks, from the lowest one owed to
@@ -126,22 +130,22 @@ impl Send {
 
     /// Numbers the chunk `p` on `carrier`, keeping its bytes until they are
     /// confirmed: its offset.
-    pub fn chunk(&mut self, p: &[u8], carrier: u32) -> u64 {
+    pub fn chunk(&mut self, p: &[u8], carrier: u32, now: u64) -> u64 {
         let off = self.sent;
-        self.owed.push_back(Owed { kind: F_DATA, off, len: p.len() as u32, carrier });
+        self.owed.push_back(Owed { kind: F_DATA, off, len: p.len() as u32, carrier, at: now });
         self.kept.push(p);
         self.sent += p.len() as u64;
         off
     }
 
-    pub fn open(&mut self, carrier: u32) {
-        self.owed.push_back(Owed { kind: F_OPEN, off: 0, len: 0, carrier });
+    pub fn open(&mut self, carrier: u32, now: u64) {
+        self.owed.push_back(Owed { kind: F_OPEN, off: 0, len: 0, carrier, at: now });
     }
 
     /// Its end at the offset reached.
-    pub fn fin(&mut self, carrier: u32) -> u64 {
+    pub fn fin(&mut self, carrier: u32, now: u64) -> u64 {
         self.fin_sent = true;
-        self.owed.push_back(Owed { kind: F_FIN, off: self.sent, len: 0, carrier });
+        self.owed.push_back(Owed { kind: F_FIN, off: self.sent, len: 0, carrier, at: now });
         self.sent
     }
 
@@ -289,12 +293,12 @@ mod tests {
     #[test]
     fn an_ack_confirms_the_open_chunks_by_got_or_received_and_the_fin_by_its_flag() {
         let mut s = Send::default();
-        s.open(1);
-        let a = s.chunk(&[1; 100], 1);
-        let b = s.chunk(&[2; 100], 2);
-        let c = s.chunk(&[3; 100], 3);
+        s.open(1, 0);
+        let a = s.chunk(&[1; 100], 1, 0);
+        let b = s.chunk(&[2; 100], 2, 0);
+        let c = s.chunk(&[3; 100], 3, 0);
         assert_eq!((a, b, c, s.room()), (0, 100, 200, WINDOW - 300));
-        s.fin(3);
+        s.fin(3, 0);
         let mut seen = vec![];
         s.acked(0, 0, 0, 200, |o| seen.push((o.kind, o.off)));
         assert_eq!(seen, [(F_OPEN, 0), (F_DATA, 200)], "any ack confirms the open, got the chunk it names");
@@ -314,11 +318,11 @@ mod tests {
     #[test]
     fn a_dead_members_things_go_again_oldest_first_with_their_bytes() {
         let mut s = Send::default();
-        s.open(1);
-        s.chunk(b"aaaa", 1);
-        s.chunk(b"bbbb", 2);
-        s.chunk(b"cccc", 1);
-        s.fin(1);
+        s.open(1, 0);
+        s.chunk(b"aaaa", 1, 0);
+        s.chunk(b"bbbb", 2, 0);
+        s.chunk(b"cccc", 1, 0);
+        s.fin(1, 0);
         assert!(s.strand(1) && !s.strand(9));
         assert_eq!(s.stranded, 4);
         let i = s.next_stranded().unwrap();
@@ -347,7 +351,7 @@ mod tests {
     fn kept_bytes_follow_out_of_order_confirmations() {
         let mut s = Send::default();
         for i in 0..8u8 {
-            s.chunk(&[i; 1000], 1);
+            s.chunk(&[i; 1000], 1, 0);
         }
         s.acked(0, WINDOW, 0, 1000, |_| {});
         assert_eq!(s.kept.len(), 8000, "the lowest chunk is still owed: nothing goes");
@@ -356,7 +360,7 @@ mod tests {
         assert_eq!(s.kept.get(5000, 1000), &[5; 1000][..]);
         s.acked(7000, WINDOW, 0, NO_GOT, |_| {});
         assert_eq!(s.kept.get(7000, 1000), &[7; 1000][..]);
-        s.chunk(&[8; 10], 1);
+        s.chunk(&[8; 10], 1, 0);
         assert_eq!(s.kept.get(7000, 1010)[1000..], [8; 10]);
     }
 

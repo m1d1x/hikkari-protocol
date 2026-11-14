@@ -55,6 +55,8 @@ impl Pipe {
                             l.out.chunk_buf(len).copy_from_slice(st.send.kept.get(o.off, len));
                             l.out.chunk_done(st.id, o.off, len);
                             n.resent += 1;
+                            st.obs.resent += 1;
+                            st.obs.carried(li);
                             *moved += 1;
                             true
                         }
@@ -134,6 +136,7 @@ impl Pipe {
                 stranded.insert(st.id);
                 hit += 1;
                 n.deaths += 1;
+                st.obs.deaths += 1;
             }
         }
         if hit > 0 {

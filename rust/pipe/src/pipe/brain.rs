@@ -87,6 +87,16 @@ impl Pipe {
                 }
                 return Ok(());
             }
+            // The counters of the brain's minute line (ctl::Stats).
+            Some(Msg::Stats) => {
+                let s = self.stats_now();
+                if let Some(c) = &mut self.ctl {
+                    let mut b = [0u8; ctl::STATS_LEN];
+                    let k = ctl::put_stats(&mut b, &s);
+                    c.send(&b[..k]);
+                }
+                return Ok(());
+            }
             Some(Msg::Unwire { id }) => self.unpool(id),
             Some(Msg::Wire { h3: Some(_), .. }) => {
                 // The QUIC wire's strings point into the message buffer.
@@ -212,7 +222,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Clients => unreachable!("taken above"),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Clients | Msg::Stats => unreachable!("taken above"),
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
@@ -258,6 +268,34 @@ impl Pipe {
         }
         if tick {
             self.send_tick(now_ns());
+        }
+    }
+
+    /// The counters of the brain's minute line now (ctl::Stats).
+    fn stats_now(&self) -> ctl::Stats {
+        let n = &self.streams.n;
+        let (dead, kills) = self.ports.dead_now();
+        let mut rtts: Vec<u64> = Vec::new();
+        // The pools are the stream wires (StreamWire): their members up.
+        for w in self.swires.iter().filter(|w| w.sess == self.cur) {
+            rtts.extend(w.links.iter().filter(|l| l.h.up && l.h.rtt > 0).map(|l| l.h.rtt));
+        }
+        rtts.sort_unstable();
+        // The Go entry's rttAt: the q-th percentile is the ceil(len*q/100)-th.
+        let at = |q: usize| {
+            let i = (rtts.len() * q).div_ceil(100).max(1);
+            (rtts[i - 1] / 1000).min(u32::MAX as u64 - 1) as u32
+        };
+        ctl::Stats {
+            opened: n.opened,
+            reset: n.reset_peer + n.reset_local,
+            resent: n.resent,
+            up: n.up,
+            down: n.down,
+            dead_ports: dead as u32,
+            port_kills: kills,
+            paused_ms: self.judge.paused / 1_000_000,
+            rtt_us: (!rtts.is_empty()).then(|| (at(50), at(90), at(100))),
         }
     }
 

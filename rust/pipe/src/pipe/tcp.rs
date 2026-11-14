@@ -14,6 +14,7 @@ use hikkari_trunk::ports::Book;
 use hikkari_trunk::stream::{CHUNK, NO_CARRIER};
 
 use super::data::deliver;
+use crate::observe;
 use super::death::Down;
 use super::{Event, Pipe, Slot};
 use crate::ctl;
@@ -48,6 +49,23 @@ pub(super) enum Why {
     Local,
     /// Both directions are over: no reset, it ends.
     Done,
+    /// Its session closed with it (a retired one at its limit).
+    Session,
+    /// The exit lost it: it restarted under the session (a new epoch).
+    Epoch,
+}
+
+impl Why {
+    /// How a report says it (observe.rs END_*).
+    fn end(self) -> u8 {
+        match self {
+            Why::Peer => observe::END_PEER,
+            Why::Local => observe::END_LOCAL,
+            Why::Done => observe::END_FIN,
+            Why::Session => observe::END_SESSION,
+            Why::Epoch => observe::END_EPOCH,
+        }
+    }
 }
 
 /// The member a stream of session `sess` sends its next frame on (trunk
@@ -139,7 +157,8 @@ impl Pipe {
             if !l.out.frame(7, |b| frame::put_open(b, st.id, st.port)) {
                 continue;
             }
-            st.send.open(carrier(wi, li, l.gen));
+            st.send.open(carrier(wi, li, l.gen), now);
+            st.obs.carried(li);
             l.owe(0, now);
             streams.opened(slot);
         }
@@ -177,12 +196,15 @@ impl Pipe {
                 }
                 match sys::read(&st.client.fd, l.out.chunk_buf(k)) {
                     Io::Done(k) => {
-                        let off = st.send.chunk(&l.out.chunk_buf(k)[..k], carrier(wi, li, l.gen));
+                        let off = st.send.chunk(&l.out.chunk_buf(k)[..k], carrier(wi, li, l.gen), now);
                         l.out.chunk_done(st.id, off, k);
                         l.owe(k, now);
                         w.t.up_pkts += 1;
                         w.t.up_bytes += k as u64;
                         n.up += k as u64;
+                        st.obs.up += k as u64;
+                        st.obs.chunks += 1;
+                        st.obs.carried(li);
                         *moved += 1;
                     }
                     Io::Again => break,
@@ -193,7 +215,7 @@ impl Pipe {
                         if !l.out.frame(13, |b| frame::put_fin(b, st.id, off)) {
                             break;
                         }
-                        st.send.fin(carrier(wi, li, l.gen));
+                        st.send.fin(carrier(wi, li, l.gen), now);
                         l.owe(0, now);
                         st.read_done = true;
                         break;
@@ -237,12 +259,13 @@ impl Pipe {
         }
         self.send_events();
         self.saw_epochs();
+        self.observed(now);
     }
 
     /// The whole frames read on member li of wire wi; false for bytes that
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
-        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, .. } = self;
+        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, marks, .. } = self;
         let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
         let sess = *sess;
         let Link { inb, in_n, out, h, up_at, .. } = &mut links[li];
@@ -281,9 +304,9 @@ impl Pipe {
                     t.down_pkts += 1;
                     t.down_bytes += len as u64;
                     *moved += 1;
-                    stream_frame(fr, inb, out, streams, doomed, released);
+                    stream_frame(fr, inb, out, streams, doomed, released, now);
                 }
-                Frame::Fin { .. } | Frame::Ack { .. } | Frame::Rst { .. } => stream_frame(fr, inb, out, streams, doomed, released),
+                Frame::Fin { .. } | Frame::Ack { .. } | Frame::Rst { .. } => stream_frame(fr, inb, out, streams, doomed, released, now),
                 // A datagram of a flow the route put on this wire: the exit
                 // answers a flow on the wire it came on (trunk flows.go).
                 Frame::Dgram { stream, seq, off, len, .. } => {
@@ -294,6 +317,8 @@ impl Pipe {
                 }
                 // The exit's process is being replaced (session.rs).
                 Frame::Drain => *drains |= 1u32 << sess,
+                // The exit marked a tester's stream or flow (marks.rs).
+                Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
                 Frame::Open { .. } | Frame::Other => {}
             }
             at = next;
@@ -341,6 +366,7 @@ impl Pipe {
 
     /// Ends the streams found done or failed in this pass.
     pub(super) fn end_doomed(&mut self) {
+        let now = sys::now_ns();
         while let Some((slot, why)) = self.doomed.pop() {
             let Pipe { streams, swires, route, dirty, .. } = self;
             let Some((st, n)) = streams.with_counts(slot) else { continue };
@@ -358,7 +384,7 @@ impl Pipe {
             for o in st.send.owed.drain(..) {
                 forget(swires, o.carrier, o.len);
             }
-            streams.end(slot);
+            streams.end(slot, why.end(), now);
             *dirty = true;
         }
     }
@@ -381,6 +407,7 @@ impl Pipe {
                 continue;
             };
             n.down += k as u64;
+            st.obs.down += k as u64;
             if st.recv.wrote(k) {
                 if let Some((wi, li)) = pick(swires, st.sess, route[0], false) {
                     ack(&mut swires[wi].links[li].out, st, NO_GOT);
@@ -502,7 +529,7 @@ impl Pipe {
 /// a chunk is written on to the client and acked, a FIN acked, an ack
 /// confirms what the stream owed (`released`, applied by confirm). A stream
 /// done or failed is left in `doomed`.
-fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doomed: &mut Vec<(usize, Why)>, released: &mut Vec<(u32, u32)>) {
+fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doomed: &mut Vec<(usize, Why)>, released: &mut Vec<(u32, u32)>, now: u64) {
     let id = match fr {
         Frame::Data { stream, .. } | Frame::Fin { stream, .. } | Frame::Ack { stream, .. } | Frame::Rst { stream } => stream,
         _ => return,
@@ -530,6 +557,7 @@ fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doo
                 None => gone = true,
             });
             n.down += wrote as u64;
+            st.obs.down += wrote as u64;
             st.recv.wrote(wrote);
             ack(out, st, got);
             if gone {
@@ -544,7 +572,11 @@ fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doo
             st.shut_if_all_in();
         }
         Frame::Ack { received, credit, flags, got, .. } => {
-            st.send.acked(received, credit, flags, got, |o| released.push((o.carrier, o.len)));
+            let Stream { send, obs, .. } = st;
+            send.acked(received, credit, flags, got, |o| {
+                released.push((o.carrier, o.len));
+                obs.waited(now.saturating_sub(o.at));
+            });
         }
         _ => {
             doomed.push((slot, Why::Peer));
@@ -566,7 +598,7 @@ pub(super) fn ack(out: &mut Out, st: &mut Stream, got: u64) {
 fn count(n: &mut StreamCounts, why: Why) {
     match why {
         Why::Peer => n.reset_peer += 1,
-        Why::Local => n.reset_local += 1,
+        Why::Local | Why::Session | Why::Epoch => n.reset_local += 1,
         Why::Done => {}
     }
 }

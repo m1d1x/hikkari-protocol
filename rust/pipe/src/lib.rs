@@ -22,6 +22,7 @@ mod flow;
 mod link;
 #[cfg(target_os = "linux")]
 mod member;
+pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod pipe;
 #[cfg(target_os = "linux")]

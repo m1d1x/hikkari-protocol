@@ -18,6 +18,7 @@ use hikkari_trunk::buf::Behind;
 use hikkari_trunk::stream::{Recv, Send};
 
 use crate::flow::FxMap;
+use crate::observe::{Report, StreamObs, END_NONE, PHASE_END, PHASE_MARK};
 
 /// A stream's client side: its connection, and what waits for it.
 pub struct Client {
@@ -82,6 +83,8 @@ pub struct Stream {
     /// The client socket's segments out and sent again as last counted in
     /// the leg (Leg).
     leg_seen: (u32, u32),
+    /// What it did, for its reports if the exit marks it (observe.rs).
+    pub obs: StreamObs,
 }
 
 impl Stream {
@@ -131,6 +134,9 @@ pub struct Streams {
     pub n: StreamCounts,
     /// The leg client → entry of the minute (Leg).
     pub leg: Leg,
+    /// Reports of observed streams for the brain (observe.rs), sent after
+    /// the turn that made them.
+    pub reports: Vec<Report>,
 }
 
 impl Streams {
@@ -144,6 +150,7 @@ impl Streams {
             open: 0,
             n: StreamCounts::default(),
             leg: Leg::default(),
+            reports: Vec::new(),
         }
     }
 
@@ -162,6 +169,7 @@ impl Streams {
             sess,
             write_done: false,
             leg_seen: (0, 0),
+            obs: StreamObs::new(sys::now_ns()),
         };
         let slot = match self.free.pop() {
             Some(s) => {
@@ -217,16 +225,37 @@ impl Streams {
     }
 
     /// The streams session `sess` carries.
+    /// The exit marked stream `id` with observation `token` (observe.rs):
+    /// its report at the mark; a stream ended or already marked is not
+    /// marked again.
+    pub fn mark(&mut self, id: u32, token: u64, now: u64) {
+        let Some(slot) = self.slot_of(id) else { return };
+        let Some(st) = self.list[slot].as_mut() else { return };
+        if st.obs.id != 0 || token == 0 {
+            return;
+        }
+        st.obs.id = token;
+        let tcp = sys::tcp_info(st.client.fd.as_raw_fd());
+        self.reports.push(Report::stream(&st.obs, st.port, PHASE_MARK, END_NONE, tcp, now));
+    }
+
     pub fn on(&self, sess: u8) -> usize {
         self.list.iter().flatten().filter(|st| st.sess == sess).count()
     }
 
-    /// Ends the stream in `slot`: its client connection closes, read once
-    /// more for the leg.
-    pub fn end(&mut self, slot: usize) {
+    /// Ends the stream in `slot` (`end`: observe.rs END_*): its client
+    /// connection closes, read once more for the leg and, if the exit
+    /// marked it, for its last report.
+    pub fn end(&mut self, slot: usize, end: u8, now: u64) {
         if let Some(mut st) = self.list[slot].take() {
-            self.leg.read(&mut st);
+            let tcp = sys::tcp_info(st.client.fd.as_raw_fd());
+            if let Some(i) = tcp {
+                self.leg.add(&mut st, i);
+            }
             self.leg.closed += 1;
+            if st.obs.id != 0 {
+                self.reports.push(Report::stream(&st.obs, st.port, PHASE_END, end, tcp, now));
+            }
             self.by_id.remove(&st.id);
             if !st.opened {
                 self.unopened -= 1;

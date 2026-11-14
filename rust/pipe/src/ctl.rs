@@ -20,6 +20,7 @@ pub const B_MEMBER: u8 = 0x09; // wire u8, index u8; one fd: the member's new so
 pub const B_DRAIN: u8 = 0x0a; // one fd: the old end of a handoff socket (handoff.rs); the pipe takes no new client
 pub const B_ADOPT: u8 = 0x0b; // one fd: the new end of a handoff socket; a pipe draining sends on its other end
 pub const B_TCP_LISTEN: u8 = 0x0c; // id u8, to u16; one fd: a listening TCP socket, a client port of streams
+pub const B_STATS: u8 = 0x0f; // the counters of the brain's minute line, now (answered by P_STATS)
 pub const B_CLIENTS: u8 = 0x0e; // the leg client → entry of the minute, now (answered by P_CLIENTS)
 pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots (rest)
 
@@ -30,6 +31,8 @@ pub const P_MEMBER: u8 = 0x83; // wire u8, index u8, up u8, why u8
 pub const P_DGRAM: u8 = 0x84; // tag u32, payload
 pub const P_ERROR: u8 = 0x85; // text
 pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no client's flow, no stream
+pub const P_OBSERVED: u8 = 0x88; // a report of a tester's stream or flow: see put_observed
+pub const P_STATS: u8 = 0x89; // see put_stats
 pub const P_CLIENTS: u8 = 0x87; // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (NONE_MS: none)
 
 /// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
@@ -77,6 +80,7 @@ pub enum Msg<'a> {
     TcpListen { id: u8, to: u16 },
     Pool(Pool<'a>),
     Clients,
+    Stats,
 }
 
 /// A wire of stream members (B_POOL): its members, their stall and source
@@ -166,6 +170,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_TCP_LISTEN => Msg::TcpListen { id: r.u8()?, to: r.u16()? },
         B_POOL => Msg::Pool(pool(&mut r)?),
         B_CLIENTS if m.len() == 1 => Msg::Clients,
+        B_STATS if m.len() == 1 => Msg::Stats,
         _ => return None,
     })
 }
@@ -309,6 +314,81 @@ pub fn put_member(out: &mut [u8], wire: u8, index: u8, up: bool, why: u8) -> usi
     5
 }
 
+/// The counters of the brain's minute line that ticks do not carry
+/// (P_STATS), in the Go entry's words (trunk Stats, hikkari-control
+/// trunkentry statsLine), since the pipe started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Clients' streams opened, reset either way, chunks sent again after
+    /// their member died, client bytes up and down.
+    pub opened: u64,
+    pub reset: u64,
+    pub resent: u64,
+    pub up: u64,
+    pub down: u64,
+    /// The pool's book: ports resting dead now, and kills since the start.
+    pub dead_ports: u32,
+    pub port_kills: u64,
+    /// The pipe's own pauses in all (ms).
+    pub paused_ms: u64,
+    /// The pool's members up: their round trips (each one's latest ping,
+    /// as the ticks say a wire's) at p50, p90 and
+    /// the most (µs), as the Go entry's rttAt picks them; None: none up.
+    pub rtt_us: Option<(u32, u32, u32)>,
+}
+
+/// A P_STATS message's length.
+pub const STATS_LEN: usize = 73;
+
+pub fn put_stats(out: &mut [u8], s: &Stats) -> usize {
+    out[0] = P_STATS;
+    for (i, v) in [s.opened, s.reset, s.resent, s.up, s.down].into_iter().enumerate() {
+        out[1 + 8 * i..9 + 8 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    out[41..45].copy_from_slice(&s.dead_ports.to_le_bytes());
+    out[45..53].copy_from_slice(&s.port_kills.to_le_bytes());
+    out[53..61].copy_from_slice(&s.paused_ms.to_le_bytes());
+    let (p50, p90, max) = s.rtt_us.unwrap_or((NONE_MS, NONE_MS, NONE_MS));
+    out[61..65].copy_from_slice(&p50.to_le_bytes());
+    out[65..69].copy_from_slice(&p90.to_le_bytes());
+    out[69..73].copy_from_slice(&max.to_le_bytes());
+    STATS_LEN
+}
+
+/// A P_OBSERVED message's length.
+pub const OBSERVED_LEN: usize = 116;
+
+/// A report of a tester's stream or flow (P_OBSERVED, crate::observe): id
+/// u64, kind u8, phase u8, port u16, age_ms u32, up u64, down u64, chunks
+/// u64, resent u64, carriers u8, deaths u32, max_wait_ms u32, dgrams_out
+/// u64, dgrams_in u64, copies u64, end u8, has_tcp u8, then the client's TCP
+/// (zeros without it): rtt_us, rttvar_us, retrans, lost, unacked, cwnd,
+/// segs_out, segs_in, each u32.
+pub fn put_observed(out: &mut [u8], r: &crate::observe::Report) -> usize {
+    out[0] = P_OBSERVED;
+    out[1..9].copy_from_slice(&r.id.to_le_bytes());
+    out[9] = r.kind;
+    out[10] = r.phase;
+    out[11..13].copy_from_slice(&r.port.to_le_bytes());
+    out[13..17].copy_from_slice(&r.age_ms.to_le_bytes());
+    for (i, v) in [r.up, r.down, r.chunks, r.resent].into_iter().enumerate() {
+        out[17 + 8 * i..25 + 8 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    out[49] = r.carriers;
+    out[50..54].copy_from_slice(&r.deaths.to_le_bytes());
+    out[54..58].copy_from_slice(&r.max_wait_ms.to_le_bytes());
+    for (i, v) in [r.dgrams_out, r.dgrams_in, r.copies].into_iter().enumerate() {
+        out[58 + 8 * i..66 + 8 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    out[82] = r.end;
+    out[83] = r.tcp.is_some() as u8;
+    let t = r.tcp.unwrap_or_default();
+    for (i, v) in [t.rtt_us, t.rttvar_us, t.total_retrans, t.lost, t.unacked, t.cwnd, t.segs_out, t.segs_in].into_iter().enumerate() {
+        out[84 + 4 * i..88 + 4 * i].copy_from_slice(&v.to_le_bytes());
+    }
+    OBSERVED_LEN
+}
+
 /// The leg client → entry of the minute (P_CLIENTS).
 pub fn put_clients(out: &mut [u8], m: &crate::streams::LegMinute) -> usize {
     out[0] = P_CLIENTS;
@@ -345,6 +425,8 @@ mod tests {
     const POOL_PLAIN_GOLDEN: &str = "0d0001202c01204eff7f7f000001de4f";
     const POOL_CHROMIUM_GOLDEN: &str = "0d0002042c01204eff7f7f000001bb010a686b2e6578616d706c651a676f6c64656e2d746573742d6b65792d3031323334353637383911002f6f70742f6c696263726f6e65742e736f50454d";
     const TCP_LISTEN_GOLDEN: &str = "0c01fb20";
+    const STATS_GOLDEN: &str = "8901000000000000000200000000000000030000000000000004000000000000000500000000000000060000000700000000000000080000000000000010270000204e000030750000";
+    const OBSERVED_GOLDEN: &str = "88efcdab90785634120101fb200f2700000700000000000000080000000000000009000000000000000a000000000000000b0c0000000d000000000000000000000000000000000000000000000000000000010110270000e803000003000000010000000200000040000000c8000000c9000000";
     const CLIENTS_GOLDEN: &str = "870c00000003000000090000005abc000000000000250000000000000060470000e8ee0000";
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
@@ -465,5 +547,39 @@ mod tests {
         assert_eq!(&b[29..n], &[0xff; 8]);
         assert!(matches!(parse(&[B_CLIENTS]), Some(Msg::Clients)));
         assert!(parse(&[B_CLIENTS, 0]).is_none());
+    }
+
+    #[test]
+    fn observed_golden() {
+        let tcp = hikkari_sys::TcpInfo { rtt_us: 10000, rttvar_us: 1000, total_retrans: 3, lost: 1, unacked: 2, cwnd: 64, segs_out: 200, segs_in: 201 };
+        let r = crate::observe::Report {
+            id: 0x1234567890abcdef,
+            kind: 1,
+            phase: 1,
+            port: 8443,
+            age_ms: 9999,
+            up: 7,
+            down: 8,
+            chunks: 9,
+            resent: 10,
+            carriers: 11,
+            deaths: 12,
+            max_wait_ms: 13,
+            end: 1,
+            tcp: Some(tcp),
+            ..Default::default()
+        };
+        let mut b = [0u8; OBSERVED_LEN];
+        assert_eq!(put_observed(&mut b, &r), OBSERVED_LEN);
+        assert_eq!(b[..], unhex(OBSERVED_GOLDEN)[..]);
+    }
+
+    #[test]
+    fn stats_golden() {
+        let s = Stats { opened: 1, reset: 2, resent: 3, up: 4, down: 5, dead_ports: 6, port_kills: 7, paused_ms: 8, rtt_us: Some((10000, 20000, 30000)) };
+        let mut b = [0u8; STATS_LEN];
+        assert_eq!(put_stats(&mut b, &s), STATS_LEN);
+        assert_eq!(b[..], unhex(STATS_GOLDEN)[..]);
+        assert!(matches!(parse(&[B_STATS]), Some(Msg::Stats)));
     }
 }

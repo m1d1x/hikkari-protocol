@@ -32,6 +32,7 @@ mod data;
 mod death;
 mod generation;
 mod h3;
+mod marks;
 mod pool;
 mod session;
 mod tcp;
@@ -141,6 +142,9 @@ pub struct Pipe {
     /// The exits' epochs the members' hellos said this turn, by session
     /// (session.rs saw_epochs).
     epochs: Vec<(u8, [u8; 8])>,
+    /// The exit's marks of testers' streams and flows this turn: kind,
+    /// stream id, observation (marks.rs).
+    marks: Vec<(u8, u32, u64)>,
     gone: Vec<WireTick>,
     take_over_ns: u64,
     retire_ns: u64,
@@ -208,6 +212,7 @@ impl Pipe {
             next: None,
             drains: 0,
             epochs: Vec::new(),
+            marks: Vec::new(),
             gone: Vec::new(),
             take_over_ns: session::TAKE_OVER_NS,
             retire_ns: session::RETIRE_NS,

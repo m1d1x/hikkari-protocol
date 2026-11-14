@@ -12,6 +12,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use hikkari_sys::sockaddr_in;
 use hikkari_trunk::flow::{Replay, ECHO_PORT};
 
+use crate::observe::{FlowObs, Report, END_IDLE, END_LOCAL, END_NONE, PHASE_END, PHASE_MARK};
+
 pub const CLASS_BULK: u8 = 0;
 pub const CLASS_VOICE: u8 = 1;
 
@@ -49,6 +51,8 @@ pub struct Flow {
     /// The session it goes on (the pipe's session.rs): the one that took
     /// everything new when it opened. A client's flow stays there to its end.
     pub sess: u8,
+    /// What it did, for its reports if the exit marks it (observe.rs).
+    pub obs: FlowObs,
     id: u32,
     /// A client's key in by_addr, to forget it at the end.
     key: u64,
@@ -56,7 +60,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn new(dest: Dest, class: u8, pin: u8, port: u16, copies: u8, now: u64) -> Flow {
-        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), used: now, sess: 0, id: 0, key: 0 }
+        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
     }
 
     /// The trunk's own call, not a client's: neither end counts it among its
@@ -91,6 +95,9 @@ pub struct Flows {
     /// Flows open, the trunk's own calls left out (trunk Stats.Flows).
     pub clients: u32,
     pub n: Counts,
+    /// Reports of observed flows for the brain (observe.rs), sent after the
+    /// turn that made them.
+    pub reports: Vec<Report>,
 }
 
 impl Flows {
@@ -102,6 +109,7 @@ impl Flows {
             by_tag: HashMap::with_capacity_and_hasher(64, Default::default()),
             clients: 0,
             n: Counts::default(),
+            reports: Vec::new(),
         }
     }
 
@@ -137,8 +145,20 @@ impl Flows {
     /// Ends the brain's flow `tag`.
     pub fn close(&mut self, tag: u32) {
         if let Some(id) = self.by_tag.remove(&tag) {
-            self.end(id);
+            self.end(id, END_LOCAL, hikkari_sys::now_ns());
         }
+    }
+
+    /// The exit marked flow `id` with observation `token` (observe.rs): its
+    /// report at the mark; one ended or already marked is not marked again.
+    pub fn mark(&mut self, id: u32, token: u64, now: u64) {
+        let Some((f, _)) = self.with_counts(id) else { return };
+        if f.obs.id != 0 || token == 0 {
+            return;
+        }
+        f.obs.id = token;
+        let r = Report::flow(&f.obs, f.port, PHASE_MARK, END_NONE, now);
+        self.reports.push(r);
     }
 
     /// The open flow of trunk stream `id` and the counts, to count its
@@ -172,7 +192,7 @@ impl Flows {
             if matches!(f.dest, Dest::Client { .. }) && now.saturating_sub(f.used) > idle_ns {
                 let (id, key) = (f.id, f.key);
                 self.by_addr.remove(&key);
-                self.end(id);
+                self.end(id, END_IDLE, now);
                 self.n.idle += 1;
                 ended.push(key);
             }
@@ -207,16 +227,18 @@ impl Flows {
         }
     }
 
-    /// Ends every client's flow on session `sess` (it closed with them);
-    /// their keys go to `ended`. How many there were.
-    pub fn end_session(&mut self, sess: u8, ended: &mut Vec<u64>) -> usize {
+    /// Ends every client's flow on session `sess` (it closed with them, or
+    /// the exit lost them: `end`, observe.rs END_*); their keys go to
+    /// `ended`. How many there were.
+    pub fn end_session(&mut self, sess: u8, end: u8, ended: &mut Vec<u64>) -> usize {
+        let now = hikkari_sys::now_ns();
         let mut n = 0;
         for i in 0..self.list.len() {
             let f = &self.list[i];
             if f.sess == sess && matches!(f.dest, Dest::Client { .. }) {
                 let (id, key) = (f.id, f.key);
                 self.by_addr.remove(&key);
-                self.end(id);
+                self.end(id, end, now);
                 ended.push(key);
                 n += 1;
             }
@@ -250,9 +272,12 @@ impl Flows {
         Some(id)
     }
 
-    fn end(&mut self, id: u32) {
+    fn end(&mut self, id: u32, end: u8, now: u64) {
         let slot = (id & SLOT_MASK) - 1;
         let f = &mut self.list[slot as usize];
+        if f.obs.id != 0 {
+            self.reports.push(Report::flow(&f.obs, f.port, PHASE_END, end, now));
+        }
         f.dest = Dest::Gone;
         if !f.echo() {
             self.clients -= 1;

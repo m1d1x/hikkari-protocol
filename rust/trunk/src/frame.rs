@@ -13,6 +13,14 @@ pub const F_PONG: u8 = 9;
 pub const F_DRAIN: u8 = 10;
 pub const F_OBSERVE: u8 = 11;
 
+/// The entry's capabilities, the first byte of the epoch its hello sends
+/// (spec/trunk.md, "Frames": hello; trunk capObserve): it reads observe
+/// frames, so the exit sends it the marks of testers' streams and flows.
+pub const CAP_OBSERVE: u8 = 1;
+/// An observe frame's kinds (trunk ObsStream, ObsFlow).
+pub const OBS_STREAM: u8 = 1;
+pub const OBS_FLOW: u8 = 2;
+
 /// A dgram frame's head: type, stream u32, seq u32, port u16, n u16.
 pub const DGRAM_HEAD: usize = 13;
 /// A data frame's head: type, stream u32, offset u64, n u16.
@@ -25,12 +33,14 @@ pub const ACK_FIN: u8 = 1;
 pub const NO_GOT: u64 = u64::MAX;
 
 /// A t1 hello (a pool member's: it carries everything), the entry's: its
-/// session id and a zero epoch whose first byte is its capabilities (none).
+/// session id and a zero epoch whose first byte is its capabilities: it
+/// reads observe frames.
 pub fn hello_t1(out: &mut [u8], session: &[u8; 16]) -> usize {
     out[0] = F_HELLO;
     out[1..5].copy_from_slice(b"HKT1");
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0);
+    out[21] = CAP_OBSERVE;
     29
 }
 
@@ -81,7 +91,8 @@ pub fn hello_t2(out: &mut [u8], session: &[u8; 16], wire: u8) -> usize {
     out[0] = F_HELLO;
     out[1..5].copy_from_slice(b"HKT2");
     out[5..21].copy_from_slice(session);
-    out[21..29].fill(0); // the entry has no epoch; byte 0 is its capabilities (none)
+    out[21..29].fill(0); // the entry has no epoch; byte 0 is its capabilities
+    out[21] = CAP_OBSERVE;
     out[29] = wire;
     out[30] = KIND_PACKET;
     31
@@ -166,6 +177,9 @@ pub enum Frame {
     Ack { stream: u32, received: u64, credit: u64, flags: u8, got: u64 },
     Fin { stream: u32, off: u64 },
     Rst { stream: u32 },
+    /// The exit marked a stream or flow of the entry's (OBS_STREAM,
+    /// OBS_FLOW) for both ends to report under observation id `token`.
+    Observe { kind: u8, stream: u32, token: u64 },
     Other,
 }
 
@@ -218,7 +232,10 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
             let next = fixed(4)?;
             Some((Frame::Rst { stream: be32(b) }, next))
         }
-        F_OBSERVE => Some((Frame::Other, fixed(13)?)),
+        F_OBSERVE => {
+            let next = fixed(13)?;
+            Some((Frame::Observe { kind: p[b], stream: be32(b + 1), token: be64(b + 5) }, next))
+        }
         F_DATA => {
             if rest < 14 {
                 return None;
@@ -265,7 +282,7 @@ mod tests {
         let (f, next) = next_frame(&b[..n], 0).unwrap();
         assert!(matches!(f, Frame::Hello) && next == n);
         let h = read_hello(&b[..n], 0).unwrap();
-        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [0; 8], Some((2, KIND_PACKET))));
+        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [CAP_OBSERVE, 0, 0, 0, 0, 0, 0, 0], Some((2, KIND_PACKET))), "the entry reads observe frames");
         let m = put_hello(&mut b, &h.session, &[9; 8], h.t2);
         let go = [&[1u8][..], b"HKT2", &[7; 16], &[9; 8], &[2, 2]].concat();
         assert_eq!(&b[..m], &go[..]);
