@@ -555,3 +555,12 @@ pub fn dgram_pair(buf: usize) -> io::Result<(std::os::fd::OwnedFd, std::os::fd::
     }
     Ok((a, b))
 }
+
+/// Whether descriptors a and b are the same open socket (one passed again
+/// by SCM_RIGHTS is another descriptor of it): same device and inode.
+pub fn same_socket(a: i32, b: i32) -> bool {
+    // SAFETY: fstat writes the struct it is given and nothing else.
+    let (mut sa, mut sb): (libc::stat, libc::stat) = unsafe { (zeroed(), zeroed()) };
+    let ok = unsafe { libc::fstat(a, &mut sa) == 0 && libc::fstat(b, &mut sb) == 0 };
+    ok && sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino
+}

@@ -286,7 +286,10 @@ func (p *Pipe) Handoff(next *Pipe) error {
 
 // SetWire gives the pipe a wire, or new members and settings of one it has:
 // the brain dials the members (connected UDP sockets to w.Exit). A flow on
-// the wire is not reset: its next datagram goes on the new members.
+// the wire is not reset: its next datagram goes on the new members. The same
+// wire to the same exit with another count of members keeps the members it
+// has (their sockets go again, and the pipe knows them): only the members
+// added are dialed, the ones beyond the new count close.
 func (p *Pipe) SetWire(w Wire) error {
 	if w.Glue == 0 {
 		w.Glue = time.Millisecond
@@ -308,22 +311,40 @@ func (p *Pipe) SetWire(w Wire) error {
 	if err != nil {
 		return err
 	}
+	p.mu.Lock()
+	var kept []*net.UDPConn
+	if old := p.wires[w.ID]; old != nil && old.w.H3 == nil && old.w.Exit == w.Exit && old.w.Key == w.Key {
+		kept = old.members
+	}
+	p.mu.Unlock()
 	members := make([]*net.UDPConn, 0, w.Members)
+	var dialed []*net.UDPConn
 	for i := 0; i < w.Members; i++ {
+		if i < len(kept) && kept[i] != nil {
+			members = append(members, kept[i])
+			continue
+		}
 		c, err := dialMember(w.Exit)
 		if err != nil {
-			closeAll(members)
+			closeAll(dialed)
 			return err
 		}
 		members = append(members, c)
+		dialed = append(dialed, c)
 	}
 	if err := p.send(msg, members...); err != nil {
-		closeAll(members)
+		closeAll(dialed)
 		return err
 	}
 	p.mu.Lock()
 	if old := p.wires[w.ID]; old != nil {
-		closeAll(old.members)
+		for i, c := range old.members {
+			if i >= len(kept) || i >= w.Members || c != kept[i] {
+				if c != nil {
+					c.Close()
+				}
+			}
+		}
 	}
 	p.wires[w.ID] = &wireConf{w: w, members: members}
 	p.mu.Unlock()

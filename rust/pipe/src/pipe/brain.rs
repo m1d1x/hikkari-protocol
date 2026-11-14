@@ -2,6 +2,7 @@
 //! events at once, a tick of every wire a second.
 
 use std::io;
+use std::os::fd::AsRawFd;
 
 use hikkari_sys::{self as sys, now_ns, SendBatch};
 use hikkari_trunk::health;
@@ -165,12 +166,15 @@ impl Pipe {
                 w.glue_max = (glue_max as usize).clamp(64, SLOT - OVERHEAD);
                 w.stall_ns = dead_ms.max(1) as u64 * 1_000_000;
                 // New sockets (or a new key) start the members over; a member
-                // keeps its counters.
+                // keeps its counters. A member given its own socket again
+                // (the brain changed the wire's count, not its members) goes
+                // on as it was: up, glued, nothing to say again.
                 let rekey = w.key != key;
                 w.key = key;
                 w.members.truncate(socks.len());
                 for (i, s) in socks.into_iter().enumerate() {
                     match w.members.get_mut(i) {
+                        Some(m) if !rekey && m.fd >= 0 && sys::same_socket(m.fd, s.as_raw_fd()) => {}
                         Some(m) => {
                             m.set_sock(Some(s));
                             if rekey {
