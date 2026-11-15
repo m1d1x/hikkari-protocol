@@ -440,7 +440,14 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 
 func (s *Selector) betterLocked(class Class, a, b WireID, now time.Time) bool {
 	if class == ClassVoice {
-		return s.voiceLocked(s.wires[a], now).better(s.voiceLocked(s.wires[b], now))
+		va, vb := s.voiceLocked(s.wires[a], now), s.voiceLocked(s.wires[b], now)
+		// Datagrams not inside TCP (owner, 10.11): of two wires as good for
+		// a call, the one of datagrams; a wire of streams is voice's
+		// fallback.
+		if as, bs := s.wires[a].w.Streams, s.wires[b].w.Streams; as != bs && va.known && vb.known && va.bad == vb.bad {
+			return !as
+		}
+		return va.better(vb)
 	}
 	return s.bulkLocked(s.wires[a], now).better(s.bulkLocked(s.wires[b], now))
 }
@@ -449,6 +456,14 @@ func (s *Selector) betterLocked(class Class, a, b WireID, now time.Time) bool {
 func (s *Selector) byMarginLocked(class Class, a, b WireID, now time.Time) bool {
 	if class == ClassVoice {
 		va, vb := s.voiceLocked(s.wires[a], now), s.voiceLocked(s.wires[b], now)
+		// Voice on a wire of streams (the pool, where a red wire left it)
+		// goes back to one of datagrams that is no worse, after Hold, with
+		// no margin: the fallback is not kept for a night of equal wires
+		// (14.11 21:50 UTC: udp red at a reload of the exit, voice on the
+		// pool until morning).
+		if s.wires[b].w.Streams && !s.wires[a].w.Streams {
+			return va.known && (!vb.known || va.bad <= vb.bad)
+		}
 		return va.known && (!vb.known || va.bad+s.cfg.VoiceMargin <= vb.bad)
 	}
 	ba, bb := s.bulkLocked(s.wires[a], now), s.bulkLocked(s.wires[b], now)

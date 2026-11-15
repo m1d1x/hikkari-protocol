@@ -831,3 +831,37 @@ func TestExitDrainWaitsForThePool(t *testing.T) {
 	c2.Close()
 	waitFor(t, func() bool { return h.entry.Retired() == 0 })
 }
+
+// TestTheEntryResetsAStreamItForgot: the exit carries a stream the entry no
+// longer has, past closedMemory (14.11 at aezamsk1: streams of an exit
+// session the entry reset on a flip of epochs, while the edge's generations
+// handed over). The relay writes down it; the entry answers the chunk with a
+// reset, the exit ends the stream, and no member is buried for owing it.
+// Unanswered, the exit sent it again on every member and buried each by its
+// stall, 15-19 thousand an hour.
+func TestTheEntryResetsAStreamItForgot(t *testing.T) {
+	write := make(chan struct{})
+	h := newHarness(t, Config{}, 4, nil, func(c net.Conn) {
+		defer c.Close()
+		<-write
+		_, _ = c.Write(bytes.Repeat([]byte("y"), 4096))
+		<-make(chan struct{})
+	})
+	c := h.carry()
+	defer c.Close()
+	_, _ = c.Write([]byte("x"))
+	waitFor(t, func() bool { _, x := h.exit.Stats(); return x.Streams == 1 })
+	s := h.entry.Session()
+	s.mu.Lock()
+	for id := range s.streams {
+		delete(s.streams, id) // gone with no word to the exit, its id forgotten
+		delete(s.closed, id)
+	}
+	s.mu.Unlock()
+	close(write)
+	waitFor(t, func() bool { _, x := h.exit.Stats(); return x.Streams == 0 })
+	time.Sleep(time.Second)
+	if _, x := h.exit.Stats(); x.MembersStall != 0 || x.Members != 4 {
+		t.Fatalf("the exit buried %d members over a stream the entry forgot, %d left", x.MembersStall, x.Members)
+	}
+}

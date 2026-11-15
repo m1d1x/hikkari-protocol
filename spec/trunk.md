@@ -97,7 +97,9 @@ the window, 2 MiB), `got` the offset of the chunk this ack answers (all ones for
 confirmed and written; `rst` ends it at once.
 
 The exit holds chunks and FINs of a stream whose open has not arrived (it left on a member that died) and takes them when it
-comes. Late frames of an ended stream get `rst`.
+comes. Late frames of an ended stream get `rst`. The entry opens every stream, so a chunk or FIN of a stream it does not
+have is always late, however long ago it ended: it answers `rst` (an exit left holding a stream the entry reset, as at a
+flip of epochs, would otherwise send its chunks again on every member and bury each for owing them).
 
 ## Members' health
 
@@ -176,8 +178,10 @@ late): a box that was not run buries and owes on every wire, and which one comes
 wire is held; while it has no member up, its traffic goes on any member that can carry it. Otherwise the
 rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
 its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
-carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Bulk goes only on wires
-that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
+carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Datagrams do not go
+inside TCP: of two wires as good for a call, voice takes the one of datagrams, and voice on a wire of streams (where a red
+wire left it) goes back to a wire of datagrams that is no worse after the 5 minutes, with no margin. Bulk goes only on
+wires that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
 
 The numbers are from the stand's night (11.11, 01:00–05:46 UTC, nekko-spb → unl1, the four candidate wires and the pool's
 own call side by side), to be checked against the stand's full day and the peak:

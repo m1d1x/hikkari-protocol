@@ -60,6 +60,57 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 	}
 }
 
+// TestSelectorBringsVoiceBackOffThePool: a red wire of datagrams left voice
+// on the pool; once it is green and its call no worse than the pool's, voice
+// goes back to it after Hold, with no margin to beat (14.11 21:50 UTC: udp
+// red at a reload of the exit, then voice inside TCP all night on calls as
+// clean as each other). Of two wires as good, the first choice is the one of
+// datagrams, and a wire worse than the pool does not take voice from it.
+func TestSelectorBringsVoiceBackOffThePool(t *testing.T) {
+	now := time.Now()
+	sel := NewSelector(SelectorConfig{}, selPool, selUDP)
+	for i := 0; i < 10; i++ {
+		at := now.Add(-time.Duration(i) * time.Minute)
+		sel.Call(testUDP, calm(at, 50*time.Millisecond))
+		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
+	}
+	if c := sel.Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Voice != testUDP {
+		t.Fatalf("of two calls as clean, voice went on %d, not the datagrams' wire", c.Route.Voice)
+	}
+	t1 := now.Add(time.Second)
+	live := liveAll(t1, PoolWire, testUDP)
+	live[testUDP] = WireState{ID: testUDP, Members: 2, Proof: now, Owed: 600 * time.Millisecond}
+	if c := sel.Choose(t1, live); c.Route.Voice != PoolWire {
+		t.Fatalf("voice stayed on a red wire: %+v", c)
+	}
+	// Green again, as clean as the pool: back after Hold, not before.
+	t2 := t1.Add(time.Second)
+	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != PoolWire {
+		t.Fatalf("voice back before Hold: %+v", c)
+	}
+	t3 := t2.Add(DefaultHold)
+	for i := 0; i < 5; i++ {
+		at := t3.Add(-time.Duration(i) * time.Minute)
+		sel.Call(testUDP, calm(at, 50*time.Millisecond))
+		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
+	}
+	c := sel.Choose(t3, liveAll(t3, PoolWire, testUDP))
+	if c.Route.Voice != testUDP || c.Why != "voice: udp better than pool for 5m0s" {
+		t.Fatalf("voice not back on the datagrams' wire after Hold: %+v", c)
+	}
+	// A wire of datagrams that is worse than the pool does not take voice.
+	sel = NewSelector(SelectorConfig{}, selPool, selUDP)
+	for i := 0; i < 10; i++ {
+		at := now.Add(-time.Duration(i) * time.Minute)
+		sel.Call(testUDP, rough(at))
+		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
+	}
+	sel.Choose(now, liveAll(now, PoolWire, testUDP))
+	if c := sel.Choose(now.Add(DefaultHold+time.Second), liveAll(now.Add(DefaultHold+time.Second), PoolWire, testUDP)); c.Route.Voice != PoolWire {
+		t.Fatalf("a rough wire of datagrams took voice from a clean pool: %+v", c)
+	}
+}
+
 // TestSelectorPauseRedsNobody: every wire owes at once (this box was not
 // run, or the whole path is cut): no wire is to blame, nothing moves.
 func TestSelectorPauseRedsNobody(t *testing.T) {
