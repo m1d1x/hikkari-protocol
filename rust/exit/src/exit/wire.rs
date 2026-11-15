@@ -226,7 +226,15 @@ impl Exit {
         }
         f.used = now;
         if f.echo() {
-            self.answer(fi, payload, now);
+            // The exit's stamp and map in the answer (hikkari_trunk::echo),
+            // written in a buffer of the exit's: the payload is the batch's.
+            let mut b = std::mem::take(&mut self.echo_buf);
+            b.clear();
+            b.extend_from_slice(payload);
+            let wall = now.wrapping_add_signed(self.wall_off);
+            self.flows.all[fi].echoed.stamp(&mut b, wall);
+            self.answer(fi, &b, now);
+            self.echo_buf = b;
             return;
         }
         self.t.dgrams_in += 1;

@@ -112,7 +112,7 @@ func TestAQuicWireUnderTheBrainCarriesCallsAndRenewsADeadMemberFromTheBook(t *te
 		t.Fatal(err)
 	}
 	sel := trunk.NewSelector(trunk.SelectorConfig{}, trunk.Wire{ID: 6, Name: "h3dgram", Shape: "browser"})
-	go p.Run(ctx, sel, []trunk.WireID{6}, nil, t.Logf)
+	go p.Run(ctx, sel, []trunk.WireID{6}, nil, nil, nil, t.Logf)
 
 	up := waitFor(t, 10*time.Second, "the QUIC wire's four members up", func() bool { return wireUp(p, 6, 4) })
 	t.Logf("four members up after %v", up.Round(time.Millisecond))

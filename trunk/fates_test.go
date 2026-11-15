@@ -19,19 +19,19 @@ import (
 // one copy lost 19%); the pool loses none. What counts is what a listener
 // hears.
 
-// heard is what a listener heard of a call: frames sent and the first copy
+// listened is what a listener heard of a call: frames sent and the first copy
 // of each back.
-type heard struct {
+type listened struct {
 	mu      sync.Mutex
 	born    []time.Time
 	arrived []time.Time
 }
 
-func newHeard(frames int) *heard {
-	return &heard{born: make([]time.Time, frames), arrived: make([]time.Time, frames)}
+func newListened(frames int) *listened {
+	return &listened{born: make([]time.Time, frames), arrived: make([]time.Time, frames)}
 }
 
-func (c *heard) deliver(p []byte) {
+func (c *listened) deliver(p []byte) {
 	if len(p) < 4 {
 		return
 	}
@@ -46,7 +46,7 @@ func (c *heard) deliver(p []byte) {
 // holes are frames not back by the play time: the best round trip of the
 // call plus buffer. runs2 are holes of 2+ frames in a row, what PLC cannot
 // hide.
-func (c *heard) holes(buffer time.Duration) (holes, runs2 int) {
+func (c *listened) holes(buffer time.Duration) (holes, runs2 int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	best := time.Duration(1 << 62)
@@ -75,7 +75,7 @@ func (c *heard) holes(buffer time.Duration) (holes, runs2 int) {
 
 // call sends frames 160 B datagrams on f, every gap, and waits for the last
 // answers.
-func (c *heard) call(f *Flow, gap time.Duration) {
+func (c *listened) call(f *Flow, gap time.Duration) {
 	for seq := range c.born {
 		p := make([]byte, 160)
 		binary.BigEndian.PutUint32(p, uint32(seq))
@@ -99,7 +99,7 @@ func TestVoiceRidesTwoFates(t *testing.T) {
 	udp.gilbert.p, udp.gilbert.r = 0.147, 0.67
 	udp.gilbert.Unlock()
 	h.entry.SetRoute(Route{Voice: testUDP, Bulk: PoolWire})
-	c := newHeard(1500)
+	c := newListened(1500)
 	f := h.entry.Session().OpenFlowWith(4000, FlowOptions{Copies: 1, Class: ClassVoice, Pin: AnyWire}, c.deliver, nil)
 	defer f.Close()
 	u0, p0 := udp.out.Load(), h.wires[PoolWire].out.Load()

@@ -5,6 +5,7 @@
 //! past their memory, sessions left without members past SessionIdle, the
 //! brain's tick, the stats line.
 
+use hikkari_sys as sys;
 use hikkari_trunk::frame::{self, F_PING};
 use hikkari_trunk::health::Verdict;
 use hikkari_trunk::observe::{END_IDLE, END_SESSION};
@@ -30,6 +31,7 @@ impl Exit {
     pub(super) fn timers(&mut self, now: u64) -> u64 {
         if now >= self.clock_at {
             self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
+            self.wall_off = sys::wall_ns() as i64 - now as i64;
             self.members_clock(now);
             self.link_clock(now);
             self.end_doomed(now);

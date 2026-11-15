@@ -59,7 +59,7 @@ func TestAClientsQuicPacketCrossesTheQuicWireCutAndComesBackWhole(t *testing.T) 
 		t.Fatal(err)
 	}
 	sel := trunk.NewSelector(trunk.SelectorConfig{}, trunk.Wire{ID: 6, Name: "h3dgram", Shape: "browser"})
-	go p.Run(ctx, sel, []trunk.WireID{6}, nil, t.Logf)
+	go p.Run(ctx, sel, []trunk.WireID{6}, nil, nil, nil, t.Logf)
 	waitFor(t, 10*time.Second, "the QUIC wire's four members up", func() bool { return wireUp(p, 6, 4) })
 	waitFor(t, 5*time.Second, "voice routed on the QUIC wire", func() bool { return p.Route().Voice == 6 })
 

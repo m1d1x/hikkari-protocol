@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
 
+use hikkari_trunk::echo::EchoMap;
 use hikkari_trunk::flow::{Replay, ANSWER_NS, COPIES, ECHO_PORT, MAX_CARRIES};
 use hikkari_trunk::observe::FlowObs;
 
@@ -56,6 +57,8 @@ pub struct Flow {
     /// and its relay socket's port, which the brain knows it by.
     pub obs: FlowObs,
     pub local_port: u16,
+    /// The trunk's call: the frames the exit has had (hikkari_trunk::echo).
+    pub echoed: EchoMap,
 }
 
 impl Flow {
@@ -74,6 +77,7 @@ impl Flow {
             used: 0,
             obs: FlowObs::default(),
             local_port: 0,
+            echoed: EchoMap::default(),
         }
     }
 

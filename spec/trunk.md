@@ -140,11 +140,36 @@ TCP socket of its own; the entry's Chromium sets it on the pool's sockets, and t
 accepts them on Go's TCP, which sets it on every socket.
 
 A flow to port 0 is the trunk's own call (`call.go`): the exit sends every datagram straight back, with no socket, as it
-came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, a datagram every 20 ms, both of
-the voice class on its set (Wires), and reports each minute of the wall clock: sent, answered within 2 s, round trips, and the pauses between answers a call hears
-(over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with their time). Neither end counts the call
-among its clients' flows and datagrams, and it never keeps a retired session open. An exit older than this answers nothing on
-port 0: the call reports every datagram lost.
+came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, both of the voice class on
+its set (Wires), and one held to each wire, a datagram every 20 ms, and reports each minute of the wall clock: sent, answered within 2 s, round trips,
+and the pauses between answers a call hears (over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with
+their time). Neither end counts the call among its clients' flows and datagrams, and it never keeps a retired session open.
+An exit older than this answers nothing on port 0: the call reports every datagram lost.
+
+A call's datagram is its frame number (u64, big endian), then 8 bytes of the exit's stamp and 8 of its map, sent as zeros,
+then padding to 64 bytes. Before it answers (`echo.go`), the exit writes into them its wall clock when the datagram arrived
+(unix ns, u64) and which of the flow's last 64 frame numbers it has had (u64: bit i is frame n-i, n this datagram's; a frame
+64 or more older than the newest one had is had alone). A datagram on port 0 shorter than 24 bytes, or whose stamp and map
+are not zeros (another user of the echo), goes back as it came. The calls the entry keeps side by side tick together and number
+their frames as one: frame n leaves on every wire at the same moment. An exit older than the stamp answers the zeros back,
+and the entry hears no direction from it.
+
+### What a listener hears
+
+The entry hears each minute as a listener with a jitter buffer would (`hearing.go`, hikkari-client
+`plans/2026-11-15-live-udp-two-fates.md`, раздел 4). A listener plays frame n at the best one-way delay of the minute plus
+its buffer; a frame that came later, or never, is a hole. Up is a listener at the exit: the delay is the exit's stamp less
+the entry's send, a frame the exit's map says it had but whose answer was lost counts in time (its delay is not known), a
+frame no answer told of is lost. Down is a listener at the entry, over the frames the exit had: the delay is the answer's
+arrival less the exit's stamp. The two clocks are apart: taking the minute's best delay off every frame's takes their offset
+with it. Each direction is heard with three buffers at once, 40, 60 and 100 ms (an application's own is not known and moves
+by itself): holes (their share of the frames judged), runs of 2 holes or more (a syllable swallowed: one frame of 20 ms is
+hidden by the codec), and bad seconds (3 holes or more and at least 6% of the second's frames: a robot voice).
+
+A set of wires (the voice class over two fates) is heard from the calls held to its wires, with no datagram more: a frame is
+in time if it came in time on one of them, against the best delay of the set. The set is the one at the moment each frame
+left. For each other wire of the set the entry also reports how much later its copy came than the copy on the set's first
+(the pool's behind the datagrams'), up and down, at p50, p95 and the most, over the frames both brought.
 
 ## Observation
 

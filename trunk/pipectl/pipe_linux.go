@@ -608,16 +608,23 @@ func (p *Pipe) renew(id trunk.WireID, index int) {
 
 // Run steers the pipe with sel and runs a call on each of wires through it,
 // until ctx ends: the brain's whole loop over a pipe, as trunkentry's
-// measure is over the entry's session.
-func (p *Pipe) Run(ctx context.Context, sel *trunk.Selector, wires []trunk.WireID, call func(trunk.WireID, trunk.CallWindow), logf func(string, ...any)) {
+// measure is over the entry's session. The calls tick with one frame number
+// (trunk.RunCalls), and each of sets is heard from those of its wires; call
+// and set take their windows, either may be nil.
+func (p *Pipe) Run(ctx context.Context, sel *trunk.Selector, wires []trunk.WireID, call func(trunk.WireID, trunk.CallWindow), sets []trunk.CallSet, set func(trunk.CallSetWindow), logf func(string, ...any)) {
+	legs := make([]trunk.CallConfig, 0, len(wires))
 	for _, id := range wires {
-		go trunk.RunCallOn(ctx, func() trunk.CallCarrier { return p }, trunk.CallConfig{Copies: 1, OnWire: true, Wire: id}, func(cw trunk.CallWindow) {
-			sel.Call(id, cw)
-			if call != nil {
-				call(id, cw)
-			}
-		})
+		legs = append(legs, trunk.CallConfig{Copies: 1, OnWire: true, Wire: id})
 	}
+	go trunk.RunCalls(ctx, func() trunk.CallCarrier { return p }, legs, sets, trunk.CallReports{
+		Leg: func(i int, cw trunk.CallWindow) {
+			sel.Call(wires[i], cw)
+			if call != nil {
+				call(wires[i], cw)
+			}
+		},
+		Set: set,
+	})
 	trunk.SteerOn(ctx, p, sel, logf)
 }
 
