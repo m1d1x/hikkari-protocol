@@ -13,7 +13,7 @@ use hikkari_trunk::health::Health;
 use hikkari_trunk::observe::END_LOCAL;
 
 use super::Exit;
-use crate::flow::{link_slot, Seen, LINK_SEEN};
+use crate::flow::{link_slot, Heard, Seen, LINK_SEEN};
 use crate::peer::{Class, Form};
 
 /// A peer's key among the exit's: its wire's index and its address.
@@ -217,7 +217,7 @@ impl Exit {
             }
         };
         let f = &mut self.flows.all[fi];
-        if f.arrived(m, wire_id, seq) {
+        if f.arrived(m, wire_id, seq, now) {
             if !f.echo() {
                 self.t.dgrams_copy += 1;
                 f.obs.copies += 1;
@@ -238,10 +238,10 @@ impl Exit {
     }
 
     /// One answer of flow fi down to the entry: the flow's next seq, glued
-    /// for the members that carry it (flow::Flow::carriers). A flow that
-    /// came on the pool's members, or whose session has no packet member up,
-    /// is answered on its stream members (trunk dgramLocked: the Go exit
-    /// answers a datagram on whatever member it has).
+    /// for the members of every wire it goes on (flow::Flow::answer_on,
+    /// Heard::carriers), a wire of stream members (the pool) as any other.
+    /// A set that has no member up goes on any member up of the session,
+    /// packet members first (trunk sendDgramLocked on the exit).
     pub(super) fn answer(&mut self, fi: usize, payload: &[u8], now: u64) {
         let Exit { flows, sessions, peers, wires, carriers, links, .. } = self;
         let f = &mut flows.all[fi];
@@ -249,22 +249,25 @@ impl Exit {
         f.obs.out += 1;
         let (stream, seq, port, s) = (f.stream, f.seq, f.port, f.session);
         let sess = &sessions.all[s];
-        let link_up = |li: usize, gen: u32| links.all.get(li).is_some_and(|l| l.live && l.gen as u32 == gen && l.session == s && l.h.up);
+        let la = &links.all;
+        let link_up = move |li: usize, gen: u32| la.get(li).is_some_and(|l| l.live && l.gen as u32 == gen && l.session == s && l.h.up);
         let up = |m: Seen| match link_slot(m) {
             Some(li) => link_up(li, m.1),
             None => peers.get(m.0).is_some_and(|p| p.live && p.gen == m.1 && p.session == s),
         };
-        let mut n = f.carriers(up, sess.of_wire(f.wire), &sess.members, carriers);
-        let want = (f.copies as usize).clamp(1, 2);
-        for &(li, _) in &sess.links {
-            if n >= want {
-                break;
-            }
-            let m = (li | LINK_SEEN, links.all[li].gen as u32);
-            if link_up(li, m.1) && !carriers[..n].contains(&m) {
-                carriers[n] = m;
-                n += 1;
-            }
+        // A wire's stream members up (any wire's for None), as Seen.
+        let links_of = |wire: Option<u8>| {
+            sess.links
+                .iter()
+                .filter(move |&&(li, w)| wire.is_none_or(|x| x == w) && link_up(li, la[li].gen as u32))
+                .map(move |&(li, _)| (li | LINK_SEEN, la[li].gen as u32))
+        };
+        let mut n = 0;
+        for h in f.answer_on(now) {
+            n = h.carriers(up, sess.of_wire(h.wire).iter().copied().chain(links_of(Some(h.wire))), carriers, n);
+        }
+        if n == 0 {
+            n = Heard { copies: 1, ..Heard::FREE }.carriers(up, sess.members.iter().copied().chain(links_of(None)), carriers, 0);
         }
         let len = DGRAM_HEAD + payload.len();
         for &m in &carriers[..n] {

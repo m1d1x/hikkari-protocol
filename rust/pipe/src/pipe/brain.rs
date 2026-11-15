@@ -13,7 +13,7 @@ use crate::link::NO_SESSION;
 use super::{ms, Listen, Pipe};
 use crate::carry::carry;
 use crate::ctl::{self, Msg, PipeTick, WireTick, ANY_WIRE, NONE_MS};
-use crate::flow::{Dest, Flow, CLASS_BULK, CLASS_VOICE};
+use crate::flow::{Dest, Flow};
 use crate::member::{Member, Wire, SLOT};
 
 impl Pipe {
@@ -111,7 +111,7 @@ impl Pipe {
             _ => {}
         }
         let (cur, taker) = (self.cur, self.taker());
-        let Pipe { msg, fds, wires, swires, flows, route, listens, dirty, gro, moved, gone, h3s, .. } = self;
+        let Pipe { msg, fds, wires, swires, flows, route, later, listens, dirty, gro, moved, gone, h3s, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
         };
@@ -202,10 +202,7 @@ impl Pipe {
                 gone.retain(|g| g.id != id);
                 *dirty = true;
             }
-            Msg::Route { voice, bulk } => {
-                route[CLASS_BULK as usize] = bulk;
-                route[CLASS_VOICE as usize] = voice;
-            }
+            Msg::Route(r) => *route = *r,
             Msg::Open { tag, class, pin, port, copies } => {
                 let mut f = Flow::new(Dest::Brain { tag }, class, pin, port, copies, now);
                 f.sess = cur;
@@ -215,7 +212,7 @@ impl Pipe {
                 let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
                     return Ok(()); // closed under it
                 };
-                carry(wires, swires, *route, f, id, payload, now);
+                carry(wires, swires, route, later, f, id, payload, now);
                 if !f.echo() {
                     n.out += 1;
                 }

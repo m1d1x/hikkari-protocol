@@ -15,6 +15,15 @@ pub const COPIES: u8 = 2;
 /// among its clients' flows and datagrams.
 pub const ECHO_PORT: u16 = 0;
 
+/// How many wires a flow's set holds (trunk MaxCarries): a datagram goes on
+/// every wire of its set at once, of different fates.
+pub const MAX_CARRIES: usize = 4;
+
+/// How long after a datagram of a flow came on a wire the exit still answers
+/// the flow on that wire (trunk answerWindow): the entry's set, as the exit
+/// hears it.
+pub const ANSWER_NS: u64 = 1_000_000_000;
+
 /// The replay window's size in sequence numbers.
 const WINDOW: u32 = 1024;
 

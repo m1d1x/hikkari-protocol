@@ -327,6 +327,9 @@ pub struct Wire {
     /// The Chromium QUIC wire: its members are tunnels the pipe opens
     /// itself (h3.rs), never the brain's sockets.
     pub h3: bool,
+    /// The member the wire last sent a datagram on: the next goes on the
+    /// next one up (carry.rs).
+    pub rr: usize,
     pub t: WireTick,
 }
 
@@ -343,6 +346,7 @@ impl Wire {
             exit: None,
             proof: 0,
             h3: false,
+            rr: 0,
             t: WireTick { id, ..Default::default() },
         }
     }

@@ -42,7 +42,7 @@ use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
 
 use hikkari_sys::{self as sys, now_ns, Epoll, Poll, RecvBatch, SeqPacket};
-use hikkari_trunk::flow::FLOW_IDLE_NS;
+use hikkari_trunk::flow::{FLOW_IDLE_NS, MAX_CARRIES};
 use hikkari_trunk::health::Judge;
 use hikkari_trunk::udpwire;
 
@@ -123,7 +123,7 @@ pub struct Exit {
     /// A QUIC datagram read (h3.rs), and the members of closed connections.
     dgram_buf: Vec<u8>,
     gone: Vec<(usize, u32)>,
-    carriers: [Seen; 2],
+    carriers: [Seen; 2 * MAX_CARRIES],
     msg: Vec<u8>,
     fds: Vec<i32>,
     tok: u64,
@@ -172,7 +172,7 @@ impl Exit {
             relay_buf: vec![0; 65535],
             dgram_buf: vec![0; crate::h3wire::DGRAM],
             gone: Vec::with_capacity(16),
-            carriers: [(NONE, 0); 2],
+            carriers: [(NONE, 0); 2 * MAX_CARRIES],
             msg: vec![0; 65536],
             fds: Vec::with_capacity(ctl::MAX_FDS),
             tok: 0,

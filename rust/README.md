@@ -35,9 +35,12 @@ plan and its steps: hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-eco
 - Datagrams are spec/trunk.md, "Datagrams", as the Go session carries them (trunk flows.go): each on as many members as
   its port's copies (1 for a port whose sender copies itself, 2 otherwise, 0 is the trunk's 2), never sent again; the
   answers' copies dropped by seq in a window of 1024 (`trunk/src/flow.rs`, `Replay`); a client's flow ended after 2
-  minutes unused, and the address's next datagram opens a new one (`--flow-idle-ms` for tests). A flow takes the
-  members of its pin, else of its class's route; a route's wire with no member up is passed over for any member up of
-  any wire, a pinned flow's datagram is dropped. A flow keeps to the same members while they are up. Stream ids are a
+  minutes unused, and the address's next datagram opens a new one (`--flow-idle-ms` for tests). A flow goes on its
+  pin, else on its class's wires (`carry.rs`, trunk fates.go): voice on a set of wires of different fates at once (the
+  main wire with the port's copies and one copy on the best wire of the other fate, or the route's whole set; TCP never
+  carries voice alone while a wire of fate udp is up), video and bulk on one wire. A wire of the set with no member up
+  gives its place to the best wire of its fate up, a set that carried nothing goes on any member up, a pinned flow's
+  datagram is dropped. A wire's members take the copies in turn; a copy with a delay waits in a queue the loop sends. Stream ids are a
   slot and its generation: an ended flow's slot is used again under a new id, so the exit's late answers to it find
   nothing. The brain's flows end when it closes them. Like trunk Stats, the counts leave out the trunk's own call
   (port 0).
@@ -158,8 +161,9 @@ open):
 - A flow is a stream id of a session (trunk flows.go on the exit): its first datagram opens a UDP socket of its own to
   127.0.0.1:port, if the brain opened the port to the trunk (the edge's trunkLocal.DialFlow), watched by epoll; port 0
   is the trunk's call, answered straight back with no socket. Copies are dropped by the entry's seq in a window of 1024
-  (`trunk/src/flow.rs`). The answers go as the entry sends: on one member until a copy arrives, then on 2, on the
-  members the flow last came on while they are up, else on the session's members of the flow's wire, else any. A socket
+  (`trunk/src/flow.rs`). The answers go as the entry sends (trunk fates.go): on every wire the flow came on in the
+  last second (none: the latest), on each one member until a copy comes on that wire, then 2; on the members the flow
+  last came on there while they are up, else on the session's members of that wire; a set with none up, on any. A socket
   that fails ends its flow; a flow unused 2 minutes ends.
 - Every frame bound for one member in a tick (answers, pongs, pings) is glued into one sealed datagram of up to about
   1200 bytes, as the entry glues its way up; the Go exit sends a datagram per frame (`writePackets`). The entry's packet
@@ -251,10 +255,10 @@ Brain → pipe:
 | Message | What |
 | --- | --- |
 | `hello` | version |
-| `listen` | a client port (one socket): id, class (bulk, voice), the exit's loopback port, copies |
+| `listen` | a client port (one socket): id, class (bulk, voice, video), the exit's loopback port, copies |
 | `wire` | a wire and its members: id, form, glue window and size, its members' stall (dead_ms: Stall, the pipe adds the rest of the rule), the wire's own key (the pipe never sees the trunk key). Form `udp`: one connected socket per member, the key udpwire.Key. Form `h3dgram` (R6.3): no sockets, the pipe opens its members itself (CONNECT-UDP tunnels over Chromium's QUIC from ports of the wire's book) and renews dead ones; the key is h3dgram.Token, then members, session usage (`destination`, `proxy`), the book's range, the exit's QUIC port, its domain, libcronet's path and PEM roots (empty: the system's). A new form brings the wire up anew |
 | `unwire` | a wire taken away; its flows go on by the route |
-| `route` | the wire of each class; the pipe moves the next datagram, nothing to migrate: the exit answers a flow on the wire the entry last sent it on |
+| `route` | voice's main wire, bulk's, video's, voice's whole set (wire, copies, delay) when the brain gives one, and the fate of each wire the brain gave one (`route.rs`); the pipe moves the next datagram, nothing to migrate: the exit answers a flow on every wire the entry sent it on in the last second. The brain sends it again when a wire's fate changes |
 | `open`, `dgram`, `close` | a flow of the brain's own (its call on a wire, pinned: dropped while the wire has no member up) and its datagrams |
 | `member` | a member's new socket (one), after the pipe took it down: as a Go member is dialed anew, the exit sees a new peer; never for an `h3dgram` wire |
 | `drain` | the old end of a reload's handoff socket (one): the pipe takes no new client (below, «Generations») |

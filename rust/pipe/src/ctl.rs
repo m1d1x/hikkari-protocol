@@ -5,14 +5,16 @@
 //! same golden bytes in their tests. The socket itself is hikkari_sys::SeqPacket;
 //! here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 6;
+use crate::route::Route;
+
+pub const VERSION: u16 = 7;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
 pub const B_LISTEN: u8 = 0x02; // id u8, class u8, to u16, copies u8; one fd: a bound UDP socket
 pub const B_WIRE: u8 = 0x03; // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; FORM_UDP: one fd per member; FORM_H3DGRAM: see H3
 pub const B_UNWIRE: u8 = 0x04; // id u8
-pub const B_ROUTE: u8 = 0x05; // voice u8, bulk u8
+pub const B_ROUTE: u8 = 0x05; // voice u8, bulk u8, video u8, n u8 + n × (wire u8, copies u8, after_ms u16), m u8 + m × (wire u8, fate u8): route.rs
 pub const B_OPEN: u8 = 0x06; // tag u32, class u8, pin u8, port u16, copies u8
 pub const B_DGRAM: u8 = 0x07; // tag u32, payload
 pub const B_CLOSE: u8 = 0x08; // tag u32
@@ -70,7 +72,8 @@ pub enum Msg<'a> {
     Listen { id: u8, class: u8, to: u16, copies: u8 },
     Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, key: [u8; 32], h3: Option<H3<'a>> },
     Unwire { id: u8 },
-    Route { voice: u8, bulk: u8 },
+    /// Boxed: the fates make it the largest message, and it is a rare one.
+    Route(Box<Route>),
     Open { tag: u32, class: u8, pin: u8, port: u16, copies: u8 },
     Dgram { tag: u32, payload: &'a [u8] },
     Close { tag: u32 },
@@ -160,7 +163,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
             Msg::Wire { id, form, glue_us, glue_max, dead_ms, key, h3 }
         }
         B_UNWIRE => Msg::Unwire { id: r.u8()? },
-        B_ROUTE => Msg::Route { voice: r.u8()?, bulk: r.u8()? },
+        B_ROUTE => Msg::Route(Box::new(Route::parse(r.rest())?)),
         B_OPEN => Msg::Open { tag: r.u32()?, class: r.u8()?, pin: r.u8()?, port: r.u16()?, copies: r.u8()? },
         B_DGRAM => Msg::Dgram { tag: r.u32()?, payload: r.rest() },
         B_CLOSE => Msg::Close { tag: r.u32()? },

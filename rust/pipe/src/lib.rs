@@ -4,6 +4,7 @@
 //! what makes it the entry: client ports, flows, wires, routes, the loop.
 //!
 //! - ctl: the brain ↔ pipe messages
+//! - route: which wires each class goes on, and their fates
 //! - flow: flows by stream id, client address and the brain's tag
 //! - member: wires and their members, each member's glue and seal
 //! - link: stream members, each over a TCP connection of its own
@@ -13,6 +14,7 @@
 //! - pipe: the loop (brain, timers, data)
 
 pub mod ctl;
+pub mod route;
 pub use hikkari_trunk::handoff;
 #[cfg(target_os = "linux")]
 mod carry;

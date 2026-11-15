@@ -20,13 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 6
+const Version = 7
 
 // Brain → pipe.
 const (
@@ -34,7 +35,7 @@ const (
 	bListen = 0x02 // id u8, class u8, to u16, copies u8; one socket
 	bWire   = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, key [32]; FormUDP: a socket per member; FormH3Dgram: see putH3
 	bUnwire = 0x04 // id u8
-	bRoute  = 0x05 // voice u8, bulk u8
+	bRoute  = 0x05 // voice u8, bulk u8, video u8, n u8 + n × (wire u8, copies u8, after_ms u16), m u8 + m × (wire u8, fate u8): putRoute
 	bOpen   = 0x06 // tag u32, class u8, pin u8, port u16, copies u8
 	bDgram  = 0x07 // tag u32, payload
 	bClose  = 0x08 // tag u32
@@ -57,15 +58,15 @@ const (
 
 // Pipe → brain.
 const (
-	pHello   = 0x81 // ver u16, pid u32
-	pTick    = 0x82
-	pMember  = 0x83 // wire u8, index u8, up u8, why u8
-	pDgram   = 0x84 // tag u32, payload
-	pError   = 0x85 // text
-	pDrained = 0x86 // a pipe draining carries nothing more
+	pHello    = 0x81 // ver u16, pid u32
+	pTick     = 0x82
+	pMember   = 0x83 // wire u8, index u8, up u8, why u8
+	pDgram    = 0x84 // tag u32, payload
+	pError    = 0x85 // text
+	pDrained  = 0x86 // a pipe draining carries nothing more
 	pStats    = 0x89 // see parseStats
 	pObserved = 0x88 // a report of a tester's stream or flow: see parseObserved
-	pClients = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
+	pClients  = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
 )
 
 // FormUDP is the bare UDP wire (trunk/udpwire): the brain dials its members.
@@ -174,6 +175,9 @@ type Pool struct {
 	// Chromium, when set, is the pool's form: Chromium's CONNECT to the
 	// relay (trunk/chromium); nil is plain TCP (tests, the bench).
 	Chromium *ChromiumForm
+	// Fate is what must break on the path for the pool to lose a frame
+	// (trunk Wire.Fate); empty is tcp, as for any pool.
+	Fate trunk.Fate
 }
 
 // ChromiumForm is what a Chromium member's CONNECT needs: the relay's
@@ -218,7 +222,50 @@ func putPool(w Pool) ([]byte, error) {
 	return b, nil
 }
 
-func putRoute(r trunk.Route) []byte { return []byte{bRoute, byte(r.Voice), byte(r.Bulk)} }
+// The pipe's numbers of the fates (rust/pipe/src/route.rs): it only compares
+// them. 0 is a wire the route says nothing of; any fate past these two gets
+// a number from fateOther up, in the order of its name.
+const (
+	fateUDP   = 1
+	fateTCP   = 2
+	fateOther = 3
+)
+
+// putRoute is the route and the wires' fates (trunk fates.go): voice's main
+// wire, bulk's, video's, voice's whole set when the route has one, and the
+// fate of each wire the brain gave a fate. A set's delay goes in whole
+// milliseconds, at most 65535.
+func putRoute(r trunk.Route, fates map[trunk.WireID]trunk.Fate) []byte {
+	b := []byte{bRoute, byte(r.Voice), byte(r.Bulk), byte(r.Video()), byte(r.VoiceSet.Len())}
+	for i := 0; i < r.VoiceSet.Len(); i++ {
+		c := r.VoiceSet.At(i)
+		b = append(b, byte(c.Wire), byte(c.Copies))
+		b = binary.LittleEndian.AppendUint16(b, uint16(min(c.After/time.Millisecond, 65535)))
+	}
+	ids := make([]trunk.WireID, 0, len(fates))
+	var others []trunk.Fate
+	for id, f := range fates {
+		ids = append(ids, id)
+		if f != trunk.FateUDP && f != trunk.FateTCP && !slices.Contains(others, f) {
+			others = append(others, f)
+		}
+	}
+	slices.Sort(ids)
+	slices.Sort(others)
+	b = append(b, byte(len(ids)))
+	for _, id := range ids {
+		code := byte(fateUDP)
+		switch f := fates[id]; f {
+		case trunk.FateUDP:
+		case trunk.FateTCP:
+			code = fateTCP
+		default:
+			code = byte(fateOther + slices.Index(others, f))
+		}
+		b = append(b, byte(id), code)
+	}
+	return b
+}
 
 func putOpen(tag uint32, o trunk.FlowOptions, port uint16) []byte {
 	b := binary.LittleEndian.AppendUint32([]byte{bOpen}, tag)
@@ -362,7 +409,7 @@ type Observed struct {
 // ClientTCP is a client's TCP socket (tcp_info): the Go entry's tcpSample
 // (hikkari-control trunkentry observe.go).
 type ClientTCP struct {
-	RTT, RTTVar                               time.Duration
+	RTT, RTTVar                                 time.Duration
 	Retrans, Lost, Unack, Cwnd, SegsOut, SegsIn int64
 }
 
@@ -390,7 +437,7 @@ func parseObserved(m []byte) (Observed, error) {
 	o := Observed{Report: trunk.Report{
 		ID: le.Uint64(m[1:]), Kind: trunk.ObsKind(m[9]), Phase: phase, Port: le.Uint16(m[11:]),
 		Age: time.Duration(u32(13)) * time.Millisecond,
-		Up: u64(17), Down: u64(25), Chunks: u64(33), Resent: u64(41), Carriers: int(m[49]), Deaths: int(u32(50)),
+		Up:  u64(17), Down: u64(25), Chunks: u64(33), Resent: u64(41), Carriers: int(m[49]), Deaths: int(u32(50)),
 		MaxWait:   time.Duration(u32(54)) * time.Millisecond,
 		DgramsOut: u64(58), DgramsIn: u64(66), DgramsCopy: u64(74), End: observedEnds[m[82]],
 	}, HaveTCP: m[83] == 1}

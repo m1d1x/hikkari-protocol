@@ -14,8 +14,12 @@ use hikkari_trunk::flow::{Replay, ECHO_PORT};
 
 use crate::observe::{FlowObs, Report, END_IDLE, END_LOCAL, END_NONE, PHASE_END, PHASE_MARK};
 
-pub const CLASS_BULK: u8 = 0;
+/// A flow's class (trunk Class) is the brain's byte: 0 is bulk, the class
+/// of any byte the pipe does not know too (carry.rs).
 pub const CLASS_VOICE: u8 = 1;
+/// A client's video and screen: live, too big to copy, on one wire (trunk
+/// ClassVideo).
+pub const CLASS_VIDEO: u8 = 2;
 
 /// A stream id is a slot and its generation: the low SLOT_BITS are the
 /// slot plus one (an id is never 0), the rest count the slot's reuses. An

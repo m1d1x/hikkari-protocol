@@ -39,7 +39,7 @@ impl Pipe {
             let mut done = true;
             while let Some(i) = st.send.next_stranded() {
                 let o = st.send.owed[i];
-                let Some((wi, li)) = pick(swires, st.sess, route[0], o.kind == frame::F_DATA) else {
+                let Some((wi, li)) = pick(swires, st.sess, route.bulk, o.kind == frame::F_DATA) else {
                     done = false;
                     break;
                 };
@@ -148,7 +148,7 @@ impl Pipe {
             if !st.opened || st.sess != sess {
                 continue;
             }
-            let Some((wi, li)) = pick(swires, sess, route[0], false) else { break };
+            let Some((wi, li)) = pick(swires, sess, route.bulk, false) else { break };
             ack(&mut swires[wi].links[li].out, st, NO_GOT);
         }
     }

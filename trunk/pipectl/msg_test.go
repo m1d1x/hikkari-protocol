@@ -80,8 +80,24 @@ func TestGolden(t *testing.T) {
 	if got := hex.EncodeToString(putTCPListen(1, 8443)); got != tcpListenGolden {
 		t.Fatalf("tcp listen %s, want %s", got, tcpListenGolden)
 	}
-	if got := putRoute(trunk.Route{Voice: 2, Bulk: trunk.AnyWire}); !reflect.DeepEqual(got, []byte{bRoute, 2, 255}) {
+	if got := putRoute(trunk.Route{Voice: 2, Bulk: trunk.AnyWire}, nil); !reflect.DeepEqual(got, []byte{bRoute, 2, 255, 2, 0, 0}) {
 		t.Fatalf("route % x", got)
+	}
+}
+
+// TestRouteBytes: voice's main wire, bulk's, video's, voice's set and the
+// wires' fates in the bytes the pipe reads (rust/pipe/src/route.rs
+// ROUTE_GOLDEN). A fate past udp and tcp gets a number of its own.
+func TestRouteBytes(t *testing.T) {
+	set := trunk.SetOf(trunk.Carry{Wire: 2}, trunk.Carry{Wire: 1, Copies: 1, After: 10 * time.Millisecond})
+	r := trunk.Route{Voice: 1, VoiceSet: set, Bulk: 0}.WithVideo(3)
+	got := hex.EncodeToString(putRoute(r, map[trunk.WireID]trunk.Fate{1: trunk.FateUDP, 0: trunk.FateTCP}))
+	if got != "05010003020200000001010a000200020101" {
+		t.Fatalf("route %s", got)
+	}
+	got = hex.EncodeToString(putRoute(trunk.Route{Voice: 1, Bulk: 1}, map[trunk.WireID]trunk.Fate{4: "border-b", 5: "border-a", 1: trunk.FateUDP}))
+	if got != "050101010003010104040503" {
+		t.Fatalf("route with fates of its own %s", got)
 	}
 }
 

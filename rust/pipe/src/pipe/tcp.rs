@@ -152,7 +152,7 @@ impl Pipe {
             if st.opened {
                 continue;
             }
-            let Some((wi, li)) = pick(swires, st.sess, route[0], false) else { continue };
+            let Some((wi, li)) = pick(swires, st.sess, route.bulk, false) else { continue };
             let l = &mut swires[wi].links[li];
             if !l.out.frame(7, |b| frame::put_open(b, st.id, st.port)) {
                 continue;
@@ -172,7 +172,7 @@ impl Pipe {
         // a session with things waiting reads no client of its own.
         let waits = self.resend(now);
         let Pipe { poll, slots, streams, swires, route, moved, doomed, .. } = self;
-        let bulk = route[0];
+        let bulk = route.bulk;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Client(slot) = *s else { continue };
             if !poll.readable(si) {
@@ -374,7 +374,7 @@ impl Pipe {
                 count(n, why);
                 if !matches!(why, Why::Peer) && st.opened {
                     for _ in 0..RST_COPIES {
-                        let Some((wi, li)) = pick(swires, st.sess, route[0], false) else { break };
+                        let Some((wi, li)) = pick(swires, st.sess, route.bulk, false) else { break };
                         swires[wi].links[li].out.frame(5, |b| frame::put_rst(b, st.id));
                     }
                 }
@@ -409,7 +409,7 @@ impl Pipe {
             n.down += k as u64;
             st.obs.down += k as u64;
             if st.recv.wrote(k) {
-                if let Some((wi, li)) = pick(swires, st.sess, route[0], false) {
+                if let Some((wi, li)) = pick(swires, st.sess, route.bulk, false) {
                     ack(&mut swires[wi].links[li].out, st, NO_GOT);
                 }
             }
@@ -457,7 +457,7 @@ impl Pipe {
         }
         let mut chunk = 0u32;
         for (s, ss) in self.sessions.iter().enumerate() {
-            if ss.live && waits & (1 << s) == 0 && pick(&self.swires, s as u8, self.route[0], true).is_some() {
+            if ss.live && waits & (1 << s) == 0 && pick(&self.swires, s as u8, self.route.bulk, true).is_some() {
                 chunk |= 1 << s;
             }
         }

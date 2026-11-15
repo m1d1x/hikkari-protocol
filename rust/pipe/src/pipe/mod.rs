@@ -53,7 +53,9 @@ use hikkari_trunk::health::{self, Judge};
 use hikkari_trunk::ports::{self, Book};
 use hikkari_trunk::udpwire;
 
+use crate::carry::Later;
 use crate::ctl::{self, WireTick, ANY_WIRE};
+use crate::route::{Carry, Route, Set};
 use crate::flow::{Flows, FxMap, CLASS_VOICE};
 use crate::link::{Reach, StreamWire};
 use crate::member::{member_to, Member, Wire, SLOT};
@@ -156,8 +158,10 @@ pub struct Pipe {
     wires: Vec<Wire>,
     /// The Chromium QUIC wires' engines and books, by wire id (h3.rs).
     h3s: Vec<h3::H3>,
-    /// The wire of each class, by class (CLASS_BULK, CLASS_VOICE).
-    route: [u8; 2],
+    /// The wires of each class and their fates (route.rs).
+    route: Route,
+    /// The copies that leave after their carry's delay (carry.rs).
+    later: Later,
     flows: Flows,
     tcp_listens: Vec<TcpListen>,
     swires: Vec<StreamWire>,
@@ -222,7 +226,8 @@ impl Pipe {
             listens: Vec::new(),
             wires: Vec::new(),
             h3s: Vec::new(),
-            route: [ANY_WIRE, ANY_WIRE],
+            route: Route::one(ANY_WIRE),
+            later: Later::new(),
             flows: Flows::new(),
             tcp_listens: Vec::new(),
             swires: Vec::new(),
@@ -296,10 +301,12 @@ impl Pipe {
                 w.members.push(m);
             }
             p.wires.push(w);
-            p.route = [a.wire, a.wire];
+            // Voice on its one wire, as the bench has always measured it: no copy
+            // on the pool's other fate.
+            p.route = Route { voice_set: Set::of(&[Carry { wire: a.wire, copies: 0, after_ns: 0 }]), ..Route::one(a.wire) };
         } else {
             // No packet members: the datagrams ride the pool's wire.
-            p.route = [POOL_WIRE, POOL_WIRE];
+            p.route = Route::one(POOL_WIRE);
         }
         if let Some(addr) = a.tcp_listen {
             p.tcp_listens.push(TcpListen { id: 0, fd: sys::tcp_listen(addr)?, to: a.tcp_to });
@@ -343,7 +350,7 @@ impl Pipe {
             // pause of the pipe's own.
             self.judge.turn(prev, now);
             prev = now;
-            let next = self.timers(now);
+            let next = self.timers(now).min(self.later.next_due());
             if self.dirty {
                 self.rebuild_poll();
             }
@@ -389,6 +396,7 @@ impl Pipe {
             }
             let now = now_ns();
             self.read_clients();
+            self.later.send_due(&mut self.wires, &mut self.swires, now_ns());
             self.accept_clients();
             self.open_streams(now);
             self.read_streams(now);
@@ -480,14 +488,16 @@ impl Pipe {
 
     fn log_stats(&self) {
         let mut s = format!(
-            "hk-pipe: flows={} idle={} dgrams={}/{} copies={} route=bulk:{},voice:{} pauses={} bad={}",
+            "hk-pipe: flows={} idle={} dgrams={}/{} copies={} route=bulk:{},voice:{}+{} later_dropped={} pauses={} bad={}",
             self.flows.clients,
             self.flows.n.idle,
             self.flows.n.out,
             self.flows.n.delivered,
             self.flows.n.copies,
-            self.route[0],
-            self.route[1],
+            self.route.bulk,
+            self.route.voice,
+            self.route.voice_set.len(),
+            self.later.dropped,
             self.judge.pauses,
             self.bad
         );

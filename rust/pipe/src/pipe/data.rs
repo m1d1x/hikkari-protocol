@@ -11,7 +11,8 @@ use hikkari_sys::SeqPacket;
 
 use super::generation::{forward, owner_key};
 use super::{Event, Listen, Pipe, Slot};
-use crate::carry::carry;
+use crate::carry::{carry, Later};
+use crate::route::Route;
 use crate::ctl::{self, ANY_WIRE};
 use crate::flow::{Dest, Flow, Flows};
 
@@ -19,7 +20,7 @@ impl Pipe {
     /// Clients → wires; a datagram from an address whose flow an older
     /// generation keeps goes to it (generation.rs).
     pub(super) fn read_clients(&mut self) {
-        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, moved, older, owners, msg, cur, .. } = self;
+        let Pipe { poll, slots, listens, crecv, flows, wires, swires, route, later, moved, older, owners, msg, cur, .. } = self;
         for (si, s) in slots.iter().enumerate() {
             let Slot::Listen(li) = *s else { continue };
             if !poll.readable(si) {
@@ -43,7 +44,7 @@ impl Pipe {
                             continue;
                         }
                     }
-                    take_client(flows, wires, swires, *route, l, li, addr, key, p, step, now, moved, *cur);
+                    take_client(flows, wires, swires, route, later, l, li, addr, key, p, step, now, moved, *cur);
                 }
                 if n < BATCH {
                     break;
@@ -227,7 +228,8 @@ pub(super) fn take_client(
     flows: &mut Flows,
     wires: &mut [crate::member::Wire],
     swires: &mut [crate::link::StreamWire],
-    route: [u8; 2],
+    route: &Route,
+    later: &mut Later,
     l: &Listen,
     li: usize,
     addr: sys::sockaddr_in,
@@ -249,7 +251,7 @@ pub(super) fn take_client(
     let Some((f, counts)) = flows.with_counts(id) else { return false };
     let mut at = 0;
     while at < p.len() {
-        carry(wires, swires, route, f, id, &p[at..(at + step).min(p.len())], now);
+        carry(wires, swires, route, later, f, id, &p[at..(at + step).min(p.len())], now);
         if !f.echo() {
             counts.out += 1;
         }

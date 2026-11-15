@@ -49,7 +49,10 @@ func (p *Pipe) SetPool(w Pool) error {
 	if err != nil {
 		return err
 	}
-	return sendWith(p.conn, &p.wmu, msg)
+	if err := sendWith(p.conn, &p.wmu, msg); err != nil {
+		return err
+	}
+	return p.setFate(w.ID, w.Fate)
 }
 
 // tcpListensCopy is the client ports of streams, for a reload.

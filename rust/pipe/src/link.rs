@@ -283,6 +283,8 @@ pub struct StreamWire {
     pub reach: Reach,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
+    /// The member the wire last sent a datagram on (carry.rs).
+    pub rr: usize,
     pub t: WireTick,
 }
 
@@ -295,6 +297,7 @@ impl StreamWire {
             links: (0..members).map(|_| Link::new()).collect(),
             reach,
             proof: 0,
+            rr: 0,
             t: WireTick { id, ..Default::default() },
         }
     }

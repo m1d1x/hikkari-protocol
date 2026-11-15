@@ -1,368 +1,335 @@
-//! Which wire and members carry a flow's datagram (trunk flows.go:
-//! sendDgramLocked, dgramWireLocked; wires.go: Route).
+//! Which wires and members carry a flow's datagram (trunk fates.go:
+//! carriesLocked, voiceSetLocked, resolveLocked, sendDgramLocked,
+//! sendOnLocked; spec/trunk.md, "Datagrams" and "Wires").
+//!
+//! A datagram goes on every wire of its flow's set at once, as one dgram
+//! frame of the flow's seq: the exit takes the first copy, whichever wire
+//! brought it. The set is the route's (route.rs): for voice, the main wire
+//! with the flow's copies and one copy on the best wire of the other fate
+//! that is up, or the route's whole set; for video and bulk one wire; for a
+//! pinned flow (the brain's call on a wire) its pin alone. A wire of the set
+//! with no member up gives its place to the best wire of its fate that is up
+//! and not in the set yet (lowest id), else is left out; TCP never carries
+//! voice alone while a wire of fate udp is up. A set that carried nothing
+//! goes on any member up; a pinned flow's datagram is dropped instead,
+//! counted on its wire.
+//!
+//! The members of a wire go round: each copy on the member after the last
+//! one the wire used, so that a stream member's retransmit holds up one
+//! datagram in N, not every one (trunk sendOnLocked takes the member that
+//! sent the longest ago). A datagram is never owed, so a stream member
+//! carrying it is not held to account for it; one whose out buffer is full
+//! drops it. The members are those of the flow's session (the pipe's
+//! session.rs): the session of a draining exit's old process reaches only
+//! that process.
+//!
+//! A carry with a delay (after_ns) puts the copy in Later, sent by the loop
+//! when its time comes (trunk laterLocked): no thread, nothing allocated.
+
+use std::collections::VecDeque;
 
 use hikkari_trunk::flow::COPIES;
 use hikkari_trunk::frame::{self, DGRAM_HEAD};
 use hikkari_trunk::sched::Class;
 
 use crate::ctl::ANY_WIRE;
-use crate::flow::Flow;
+use crate::flow::{Flow, CLASS_VIDEO, CLASS_VOICE};
 use crate::link::StreamWire;
 use crate::member::Wire;
+use crate::route::{Carry, Route, Set, FATE_NONE, FATE_TCP, FATE_UDP};
 
-/// Carries one datagram of flow `id` on `copies` members at once, never
-/// sent again (spec/trunk.md, "Datagrams"). The members are those of the
-/// flow's session (the pipe's session.rs: the session of a draining exit's
-/// old process reaches only that process), and of its wire, of packet
-/// members or of stream members: its pin, else its class's
-/// route. A route's wire with no member up is passed over for any member
-/// up, of any wire (trunk Route); a pinned flow's datagram is dropped
-/// instead, counted on its wire. ANY_WIRE is any member up.
-///
-/// Go takes the members carrying least (trunk sendDgramLocked): a stream
-/// member by its unconfirmed chunk bytes, a packet member carries none. Of
-/// members carrying the same, a flow takes the same ones while they are up,
-/// spread over flows by id: its datagrams stay in order. A datagram is never
-/// owed, so a stream member carrying it is not held to account for it; one
-/// whose out buffer is full drops it.
-#[inline]
-pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: [u8; 2], f: &mut Flow, id: u32, p: &[u8], now: u64) {
+/// The wires of one session as a set sees them: which are up, their fates.
+struct View<'a> {
+    wires: &'a [Wire],
+    swires: &'a [StreamWire],
+    sess: u8,
+    fates: &'a [u8; 256],
+}
+
+impl View<'_> {
+    fn up(&self, id: u8) -> bool {
+        self.wires.iter().any(|w| w.id == id && w.sess == self.sess && w.any_up())
+            || self.swires.iter().any(|w| w.id == id && w.sess == self.sess && w.up() > 0)
+    }
+
+    /// Wire id's fate: the route's, or a stream wire's tcp and a packet
+    /// wire's udp (trunk fateOr).
+    fn fate(&self, id: u8) -> u8 {
+        match self.fates[id as usize] {
+            FATE_NONE if self.swires.iter().any(|w| w.id == id && w.sess == self.sess) => FATE_TCP,
+            FATE_NONE => FATE_UDP,
+            f => f,
+        }
+    }
+
+    /// The wire of fate f with a member up that set does not hold yet,
+    /// lowest id first; ANY_WIRE for none (trunk bestUpLocked).
+    fn best_up(&self, f: u8, set: &Set) -> u8 {
+        let packets = self.wires.iter().filter(|w| w.sess == self.sess && w.any_up()).map(|w| w.id);
+        let streams = self.swires.iter().filter(|w| w.sess == self.sess && w.up() > 0).map(|w| w.id);
+        packets.chain(streams).filter(|&id| id != ANY_WIRE && !set.has(id) && self.fate(id) == f).min().unwrap_or(ANY_WIRE)
+    }
+
+    /// A set's wires with no member up taken off it: each goes to the best
+    /// wire of its fate up and not in the set yet, or is left out (trunk
+    /// resolveLocked).
+    fn resolve(&self, set: Set) -> Set {
+        let mut out = Set::default();
+        for &c in set.carries() {
+            let mut c = c;
+            if c.wire != ANY_WIRE && !self.up(c.wire) {
+                c.wire = self.best_up(self.fate(c.wire), &out);
+                if c.wire == ANY_WIRE {
+                    continue;
+                }
+            }
+            out.add(c);
+        }
+        out
+    }
+
+    /// The voice class's set (trunk voiceSetLocked).
+    fn voice(&self, r: &Route) -> Set {
+        let mut set = r.voice_set;
+        if set.is_empty() {
+            let mut main = r.voice;
+            if main == ANY_WIRE || !self.up(main) {
+                main = self.best_up(FATE_UDP, &set);
+            }
+            if main == ANY_WIRE {
+                return set; // no wire of fate udp up: the pool alone, as any member
+            }
+            set.add(Carry { wire: main, copies: 0, after_ns: 0 });
+            let other = if self.fate(main) == FATE_TCP { FATE_UDP } else { FATE_TCP };
+            let w = self.best_up(other, &set);
+            if w != ANY_WIRE {
+                set.add(Carry { wire: w, copies: 1, after_ns: 0 });
+            }
+        }
+        let set = self.resolve(set);
+        if set.carries().iter().any(|c| c.wire == ANY_WIRE || self.fate(c.wire) != FATE_TCP) {
+            return set;
+        }
+        let mut set = set;
+        let w = self.best_up(FATE_UDP, &set);
+        if w != ANY_WIRE {
+            set.add(Carry { wire: w, copies: 1, after_ns: 0 });
+        }
+        set
+    }
+
+    /// The set a flow's next datagram goes on, and whether it is held to it
+    /// (trunk carriesLocked).
+    fn carries(&self, r: &Route, f: &Flow) -> (Set, bool) {
+        if f.pin != ANY_WIRE {
+            return (Set::of(&[Carry { wire: f.pin, copies: 0, after_ns: 0 }]), true);
+        }
+        let set = match f.class {
+            CLASS_VOICE => self.voice(r),
+            CLASS_VIDEO => {
+                let mut w = r.video();
+                if w == ANY_WIRE {
+                    w = self.best_up(FATE_UDP, &Set::default());
+                }
+                self.resolve(Set::of(&[Carry { wire: w, copies: 0, after_ns: 0 }]))
+            }
+            _ => self.resolve(Set::of(&[Carry { wire: r.bulk, copies: 0, after_ns: 0 }])),
+        };
+        if set.is_empty() {
+            return (Set::of(&[Carry { wire: ANY_WIRE, copies: 0, after_ns: 0 }]), false);
+        }
+        (set, false)
+    }
+}
+
+/// A datagram's copy waiting for its carry's delay.
+struct Pending {
+    due: u64,
+    wire: u8,
+    copies: u8,
+    sess: u8,
+    id: u32,
+    seq: u32,
+    port: u16,
+    len: u16,
+    buf: [u8; LATER_MAX],
+}
+
+/// The most a later copy holds: a client datagram (the pipe's MAX_CLIENT).
+pub const LATER_MAX: usize = 1500;
+/// Later copies waiting at once, at most: a call is 50 a second, a delay
+/// 10 ms; past this they are dropped, counted.
+const LATER_CAP: usize = 512;
+
+/// The copies that leave after their carry's delay, in order of it.
+pub struct Later {
+    q: VecDeque<Pending>,
+    /// Copies dropped: too big for a later copy, or the queue full.
+    pub dropped: u64,
+}
+
+impl Default for Later {
+    fn default() -> Later {
+        Later::new()
+    }
+}
+
+impl Later {
+    pub fn new() -> Later {
+        Later { q: VecDeque::with_capacity(LATER_CAP), dropped: 0 }
+    }
+
+    /// When the next copy is due; u64::MAX for none.
+    pub fn next_due(&self) -> u64 {
+        self.q.front().map_or(u64::MAX, |p| p.due)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put(&mut self, due: u64, wire: u8, copies: u8, f: &Flow, id: u32, p: &[u8]) {
+        if p.len() > LATER_MAX || self.q.len() == LATER_CAP {
+            self.dropped += 1;
+            return;
+        }
+        let mut i = self.q.len();
+        while i > 0 && self.q[i - 1].due > due {
+            i -= 1;
+        }
+        let mut d = Pending { due, wire, copies, sess: f.sess, id, seq: f.seq, port: f.port, len: p.len() as u16, buf: [0; LATER_MAX] };
+        d.buf[..p.len()].copy_from_slice(p);
+        self.q.insert(i, d);
+    }
+
+    /// Sends the copies whose time has come (trunk sendLater).
+    pub fn send_due(&mut self, wires: &mut [Wire], swires: &mut [StreamWire], now: u64) {
+        while self.q.front().is_some_and(|d| d.due <= now) {
+            let d = self.q.pop_front().expect("a front");
+            let p = &d.buf[..d.len as usize];
+            send_on(wires, swires, d.sess, d.wire, d.copies as usize, d.id, d.seq, d.port, p, now);
+        }
+    }
+}
+
+/// Carries one datagram of flow `id` on every wire of its set, never sent
+/// again.
+#[allow(clippy::too_many_arguments)]
+pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later: &mut Later, f: &mut Flow, id: u32, p: &[u8], now: u64) {
     f.used = now;
     f.seq = f.seq.wrapping_add(1);
-    let strict = f.pin != ANY_WIRE;
-    let want = if strict { f.pin } else { route[(f.class & 1) as usize] };
-    let sess = f.sess;
-    let has = |id: u8| wires.iter().any(|w| w.id == id && w.sess == sess && w.any_up()) || swires.iter().any(|w| w.id == id && w.sess == sess && w.up() > 0);
-    let only = if want != ANY_WIRE && (strict || has(want)) { Some(want) } else { None };
-    let takes = |wid: u8, ws: u8| ws == sess && only.is_none_or(|o| wid == o);
-    let up: usize = wires.iter().filter(|w| takes(w.id, w.sess)).map(|w| w.up()).sum();
-    let sup: usize = swires.iter().filter(|w| takes(w.id, w.sess)).map(|w| w.up()).sum();
-    if up + sup == 0 {
-        // Nothing can carry it: dropped, counted on the wire it wanted (a
-        // flow with no pin and no route: on the first).
-        if let Some(w) = wires.iter_mut().find(|w| w.id == want && w.sess == sess) {
-            w.t.dropped += 1;
-        } else if let Some(w) = swires.iter_mut().find(|w| w.id == want && w.sess == sess) {
-            w.t.dropped += 1;
-        } else if !strict {
-            if let Some(w) = wires.iter_mut().find(|w| w.sess == sess) {
-                w.t.dropped += 1;
-            } else if let Some(w) = swires.iter_mut().find(|w| w.sess == sess) {
-                w.t.dropped += 1;
-            }
-        }
-        return;
-    }
+    let (set, strict) = View { wires, swires, sess: f.sess, fates: &route.fates }.carries(route, f);
     // 0 is the trunk's default, as a Go flow opened with Copies 0.
-    let copies = (if f.copies == 0 { COPIES } else { f.copies } as usize).min(up + sup);
-    if sup == 0 {
-        on_packets(wires, only, up, copies, f, id, p, now);
-    } else {
-        on_least(wires, swires, only, up + sup, copies, f, id, p, now);
-    }
-}
-
-/// Packet members only, all carrying nothing: the k-th member up from the
-/// flow's start, for k < copies.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn on_packets(wires: &mut [Wire], only: Option<u8>, up: usize, copies: usize, f: &Flow, id: u32, p: &[u8], now: u64) {
-    let start = id as usize % up;
-    let (seq, port) = (f.seq, f.port);
-    let mut k = 0;
-    for w in wires.iter_mut() {
-        if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
+    let own = if f.copies == 0 { COPIES } else { f.copies };
+    let (mut sent, mut queued) = (0, false);
+    for c in set.carries() {
+        let copies = if c.copies == 0 { own } else { c.copies };
+        if c.after_ns > 0 {
+            later.put(now + c.after_ns, c.wire, copies, f, id, p);
+            queued = true;
             continue;
         }
-        let glue_max = w.glue_max;
-        let mut on_wire = false;
-        for m in w.members.iter_mut().filter(|m| m.h.up) {
-            let rank = (k + up - start) % up;
-            k += 1;
-            if rank >= copies {
-                continue;
-            }
-            m.frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
-            on_wire = true;
-        }
-        if on_wire {
-            w.t.up_pkts += 1;
-            w.t.up_bytes += p.len() as u64;
+        sent += send_on(wires, swires, f.sess, c.wire, copies as usize, id, f.seq, f.port, p, now);
+    }
+    if sent > 0 || queued {
+        return;
+    }
+    // The set's wires all went down since: any member up.
+    if !strict && send_on(wires, swires, f.sess, ANY_WIRE, own as usize, id, f.seq, f.port, p, now) > 0 {
+        return;
+    }
+    // Nothing can carry it: dropped, counted on the wire it wanted: its pin
+    // or its class's route (with none, on the session's first).
+    let want = match f.class {
+        _ if strict => f.pin,
+        CLASS_VOICE => route.voice,
+        CLASS_VIDEO => route.video(),
+        _ => route.bulk,
+    };
+    if let Some(w) = wires.iter_mut().find(|w| w.id == want && w.sess == f.sess) {
+        w.t.dropped += 1;
+    } else if let Some(w) = swires.iter_mut().find(|w| w.id == want && w.sess == f.sess) {
+        w.t.dropped += 1;
+    } else if !strict {
+        if let Some(w) = wires.iter_mut().find(|w| w.sess == f.sess) {
+            w.t.dropped += 1;
+        } else if let Some(w) = swires.iter_mut().find(|w| w.sess == f.sess) {
+            w.t.dropped += 1;
         }
     }
 }
 
-/// A member up the datagram may go on: packet member (wire, index) or
-/// stream member (wire, index).
-#[derive(Clone, Copy)]
-enum On {
-    Packet(usize, usize),
-    Stream(usize, usize),
-}
-
-/// With stream members among them: `copies` times the member carrying
-/// least not taken yet, ties by its rank from the flow's start. Keys are
-/// (bytes carried, rank) and ranks differ, so each pass takes the least key
-/// above the last one taken: no list of members taken.
+/// Sends the dgram frame on `copies` members of wire `wire` of session
+/// `sess` (of any of its wires for ANY_WIRE, packet wires first), each wire's
+/// members in turn; says on how many (trunk sendOnLocked).
 #[allow(clippy::too_many_arguments)]
-fn on_least(wires: &mut [Wire], swires: &mut [StreamWire], only: Option<u8>, up: usize, copies: usize, f: &Flow, id: u32, p: &[u8], now: u64) {
-    let start = id as usize % up;
-    let (seq, port) = (f.seq, f.port);
-    let mut last: Option<(usize, usize)> = None;
-    // Wires counted for this datagram: bit wi for packet wires, 32 + wi
-    // for stream wires.
-    let mut counted = 0u64;
-    for _ in 0..copies {
-        let mut best: Option<((usize, usize), On)> = None;
-        let mut consider = |key: (usize, usize), on: On| {
-            if last.is_none_or(|l| key > l) && best.is_none_or(|b| key < b.0) {
-                best = Some((key, on));
-            }
-        };
-        let mut k = 0;
-        for (wi, w) in wires.iter().enumerate() {
-            if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
-                continue;
-            }
-            for (mi, _) in w.members.iter().enumerate().filter(|(_, m)| m.h.up) {
-                consider((0, (k + up - start) % up), On::Packet(wi, mi));
-                k += 1;
-            }
-        }
-        for (wi, w) in swires.iter().enumerate() {
-            if w.sess != f.sess || only.is_some_and(|o| w.id != o) {
-                continue;
-            }
-            for (li, l) in w.links.iter().enumerate().filter(|(_, l)| l.h.up) {
-                consider((l.inflight, (k + up - start) % up), On::Stream(wi, li));
-                k += 1;
-            }
-        }
-        let Some((key, on)) = best else { break };
-        last = Some(key);
-        match on {
-            On::Packet(wi, mi) => {
-                let w = &mut wires[wi];
-                let glue_max = w.glue_max;
-                w.members[mi].frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
-                if counted & (1 << (wi & 31)) == 0 {
-                    counted |= 1 << (wi & 31);
-                    w.t.up_pkts += 1;
-                    w.t.up_bytes += p.len() as u64;
-                }
-            }
-            On::Stream(wi, li) => {
-                let w = &mut swires[wi];
-                if !w.links[li].out.frame(DGRAM_HEAD + p.len(), |b| frame::put_dgram(b, id, seq, port, p)) {
-                    w.t.dropped += 1;
-                } else if counted & (1 << (32 + (wi & 31))) == 0 {
-                    counted |= 1 << (32 + (wi & 31));
-                    w.t.up_pkts += 1;
-                    w.t.up_bytes += p.len() as u64;
-                }
-            }
+fn send_on(wires: &mut [Wire], swires: &mut [StreamWire], sess: u8, wire: u8, copies: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+    let takes = |wid: u8, ws: u8| ws == sess && (wire == ANY_WIRE || wid == wire);
+    let mut n = 0;
+    for w in wires.iter_mut().filter(|w| takes(w.id, w.sess)) {
+        n += on_packets(w, copies - n, id, seq, port, p, now);
+        if n == copies {
+            return n;
         }
     }
+    for w in swires.iter_mut().filter(|w| takes(w.id, w.sess)) {
+        n += on_streams(w, copies - n, id, seq, port, p);
+        if n == copies {
+            break;
+        }
+    }
+    n
+}
+
+/// The next `want` packet members up after the wire's last one.
+fn on_packets(w: &mut Wire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+    let (len, glue_max, start) = (w.members.len(), w.glue_max, w.rr);
+    let mut n = 0;
+    for k in 1..=len {
+        if n == want {
+            break;
+        }
+        let mi = (start + k) % len;
+        let m = &mut w.members[mi];
+        if !m.h.up {
+            continue;
+        }
+        m.frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
+        w.rr = mi;
+        n += 1;
+    }
+    if n > 0 {
+        w.t.up_pkts += 1;
+        w.t.up_bytes += p.len() as u64;
+    }
+    n
+}
+
+/// The next `want` stream members up after the wire's last one; a member
+/// whose out buffer is full drops it.
+fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: &[u8]) -> usize {
+    let (len, start) = (w.links.len(), w.rr);
+    let (mut n, mut put) = (0, false);
+    for k in 1..=len {
+        if n == want {
+            break;
+        }
+        let li = (start + k) % len;
+        let l = &mut w.links[li];
+        if !l.h.up {
+            continue;
+        }
+        if l.out.frame(DGRAM_HEAD + p.len(), |b| frame::put_dgram(b, id, seq, port, p)) {
+            put = true;
+        } else {
+            w.t.dropped += 1;
+        }
+        w.rr = li;
+        n += 1;
+    }
+    if put {
+        w.t.up_pkts += 1;
+        w.t.up_bytes += p.len() as u64;
+    }
+    n
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::flow::{Dest, CLASS_BULK, CLASS_VOICE};
-    use crate::member::Member;
-
-    const KEY: [u8; 32] = [7; 32];
-
-    /// Wires by id, each of `n` members, the ones in `down` not up.
-    fn wires(spec: &[(u8, usize)], down: &[(u8, usize)]) -> Vec<Wire> {
-        spec.iter()
-            .map(|&(id, n)| {
-                let mut w = Wire::new(id, KEY, 300_000_000);
-                w.glue_max = 1200;
-                for i in 0..n {
-                    let mut m = Member::new(None, &KEY);
-                    if !down.contains(&(id, i)) {
-                        m.h.join(1);
-                    }
-                    w.members.push(m);
-                }
-                w
-            })
-            .collect()
-    }
-
-    fn flow(class: u8, pin: u8, copies: u8) -> Flow {
-        Flow::new(Dest::Brain { tag: 1 }, class, pin, 443, copies, 0)
-    }
-
-    /// Which members got a frame, as "wire/index".
-    fn carried(ws: &[Wire]) -> Vec<String> {
-        let mut out = vec![];
-        for w in ws {
-            for (i, m) in w.members.iter().enumerate() {
-                if m.glue_n > 0 {
-                    out.push(format!("{}/{i}", w.id));
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn two_copies_go_on_two_members_of_the_routes_wire_one_copy_on_one() {
-        let mut ws = wires(&[(1, 3), (2, 3)], &[]);
-        let mut f = flow(CLASS_VOICE, ANY_WIRE, 2);
-        carry(&mut ws, &mut [], [1, 2], &mut f, 4, b"hi", 10);
-        assert_eq!(carried(&ws), ["2/1", "2/2"], "voice on wire 2, flow 4 from member 4 % 3");
-        assert_eq!((f.seq, f.used, ws[1].t.up_pkts, ws[0].t.up_pkts), (1, 10, 1, 0));
-        let mut ws = wires(&[(1, 3)], &[]);
-        let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
-        carry(&mut ws, &mut [], [1, 2], &mut f, 5, b"hi", 10);
-        assert_eq!(carried(&ws), ["1/2"]);
-        let mut ws = wires(&[(1, 3)], &[]);
-        carry(&mut ws, &mut [], [1, 2], &mut flow(CLASS_BULK, ANY_WIRE, 0), 0, b"hi", 10);
-        assert_eq!(carried(&ws).len(), 2, "copies 0 is the trunk's 2");
-    }
-
-    #[test]
-    fn a_flow_keeps_to_its_members_while_they_are_up() {
-        let mut ws = wires(&[(1, 4)], &[]);
-        let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
-        for _ in 0..3 {
-            carry(&mut ws, &mut [], [1, 1], &mut f, 6, b"x", 10);
-        }
-        assert_eq!(carried(&ws), ["1/2"]);
-        assert_eq!(f.seq, 3, "each datagram its own seq");
-    }
-
-    #[test]
-    fn a_route_wire_with_none_up_is_passed_over_for_any_member_of_any_wire() {
-        // As trunk sendDgramLocked: no member on the route's wire, so the
-        // copies go on any member, here across the other two wires.
-        let mut ws = wires(&[(1, 1), (2, 2), (3, 1)], &[(2, 0), (2, 1)]);
-        carry(&mut ws, &mut [], [2, 2], &mut flow(CLASS_BULK, ANY_WIRE, 2), 0, b"x", 10);
-        assert_eq!(carried(&ws), ["1/0", "3/0"]);
-        assert_eq!((ws[0].t.up_pkts, ws[1].t.dropped, ws[2].t.up_pkts), (1, 0, 1));
-    }
-
-    #[test]
-    fn a_pinned_flow_is_dropped_while_its_wire_has_none_up() {
-        let mut ws = wires(&[(1, 2), (2, 2)], &[(2, 0), (2, 1)]);
-        let mut f = flow(CLASS_VOICE, 2, 1);
-        carry(&mut ws, &mut [], [1, 1], &mut f, 0, b"x", 10);
-        assert!(carried(&ws).is_empty(), "not on wire 1, whatever the route");
-        assert_eq!((ws[1].t.dropped, ws[0].t.dropped), (1, 0));
-        let mut ws = wires(&[(1, 2), (2, 2)], &[(2, 0)]);
-        carry(&mut ws, &mut [], [1, 1], &mut flow(CLASS_VOICE, 2, 2), 0, b"x", 10);
-        assert_eq!(carried(&ws), ["2/1"], "two copies, one member up: one copy");
-    }
-
-    #[test]
-    fn a_flow_goes_only_on_its_sessions_members() {
-        // Session 1 is the exit's new process, 0 its old one: a flow of each
-        // reaches only its own (spec/trunk.md, Drain).
-        let mut ws = wires(&[(1, 2), (1, 2)], &[]);
-        ws[1].sess = 1;
-        let mut f = flow(CLASS_VOICE, ANY_WIRE, 2);
-        f.sess = 1;
-        carry(&mut ws, &mut [], [1, 1], &mut f, 0, b"x", 10);
-        assert!(ws[0].members.iter().all(|m| m.glue_n == 0), "nothing on session 0's members");
-        assert!(ws[1].members.iter().all(|m| m.glue_n > 0), "two copies on session 1's two");
-        let mut ws = wires(&[(1, 2), (2, 1)], &[]);
-        ws[1].sess = 1;
-        let mut ps = [pool(0, &[0])];
-        ps[0].sess = 1;
-        let mut f = flow(CLASS_VOICE, 1, 2);
-        f.sess = 1;
-        carry(&mut ws, &mut ps, [1, 1], &mut f, 0, b"x", 10);
-        assert!(carried(&ws).is_empty() && on_pool(&ps).is_empty(), "pinned to wire 1, which session 1 lacks: dropped");
-        assert_eq!((ws[0].t.dropped, ws[1].t.dropped), (0, 0), "counted on no other session's wire");
-    }
-
-    #[test]
-    fn nothing_up_drops_on_the_wire_it_wanted() {
-        let mut ws = wires(&[(1, 1), (2, 1)], &[(1, 0), (2, 0)]);
-        carry(&mut ws, &mut [], [2, 2], &mut flow(CLASS_BULK, ANY_WIRE, 2), 0, b"x", 10);
-        assert_eq!((ws[0].t.dropped, ws[1].t.dropped), (0, 1));
-        carry(&mut ws, &mut [], [ANY_WIRE, ANY_WIRE], &mut flow(CLASS_BULK, ANY_WIRE, 2), 0, b"x", 10);
-        assert_eq!(ws[0].t.dropped, 1, "no route: on the first wire");
-    }
-
-    /// A stream wire of `n` members up, member i carrying inflight[i].
-    fn pool(id: u8, inflight: &[usize]) -> StreamWire {
-        let reach = crate::link::Reach::Plain("127.0.0.1:1".parse().unwrap());
-        let mut w = StreamWire::new(id, reach, inflight.len(), 300_000_000);
-        for (l, &b) in w.links.iter_mut().zip(inflight) {
-            l.h.join(1);
-            l.inflight = b;
-        }
-        w
-    }
-
-    /// Which stream members got a frame, as "wire/index".
-    fn on_pool(ws: &[StreamWire]) -> Vec<String> {
-        let mut out = vec![];
-        for w in ws {
-            for (i, l) in w.links.iter().enumerate() {
-                if l.out.pending() {
-                    out.push(format!("{}/{i}", w.id));
-                }
-            }
-        }
-        out
-    }
-
-    #[test]
-    fn a_datagram_on_the_pool_goes_on_the_members_carrying_least() {
-        // trunk sendDgramLocked: the Copies members of least inflight.
-        let mut ps = [pool(0, &[65536, 0, 16384, 0])];
-        carry(&mut [], &mut ps, [0, 0], &mut flow(CLASS_VOICE, ANY_WIRE, 2), 7, b"hi", 10);
-        assert_eq!(on_pool(&ps), ["0/1", "0/3"]);
-        assert_eq!((ps[0].t.up_pkts, ps[0].t.up_bytes), (1, 2), "one datagram on the wire, two copies");
-        let mut ps = [pool(0, &[65536, 0, 16384, 0])];
-        carry(&mut [], &mut ps, [0, 0], &mut flow(CLASS_VOICE, ANY_WIRE, 3), 7, b"hi", 10);
-        assert_eq!(on_pool(&ps), ["0/1", "0/2", "0/3"]);
-        // The same load: a flow keeps to the same members, spread by id.
-        let mut ps = [pool(0, &[0, 0, 0, 0])];
-        let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
-        for _ in 0..3 {
-            carry(&mut [], &mut ps, [0, 0], &mut f, 6, b"x", 10);
-        }
-        assert_eq!(on_pool(&ps), ["0/2"]);
-    }
-
-    #[test]
-    fn a_frame_on_a_stream_member_is_the_dgram_the_exit_reads() {
-        let mut ps = [pool(0, &[0])];
-        carry(&mut [], &mut ps, [0, 0], &mut flow(CLASS_VOICE, 0, 1), 9, b"voice", 10);
-        let b = ps[0].links[0].out.bytes();
-        match frame::next_frame(b, 0) {
-            Some((frame::Frame::Dgram { stream: 9, seq: 1, port: 443, off, len }, n)) => {
-                assert_eq!((&b[off..off + len], n), (&b"voice"[..], b.len()));
-            }
-            other => panic!("not one dgram frame: {:?}", other.map(|x| x.1)),
-        }
-    }
-
-    #[test]
-    fn the_pool_with_none_up_passes_a_flow_to_packet_members_and_back() {
-        let mut ws = wires(&[(2, 2)], &[]);
-        let mut ps = [pool(0, &[0, 0])];
-        for l in ps[0].links.iter_mut() {
-            l.h.down();
-        }
-        carry(&mut ws, &mut ps, [0, 0], &mut flow(CLASS_VOICE, ANY_WIRE, 1), 0, b"x", 10);
-        assert_eq!((carried(&ws), on_pool(&ps)), (vec!["2/0".to_string()], vec![]));
-        let mut ws = wires(&[(2, 2)], &[(2, 0), (2, 1)]);
-        let mut ps = [pool(0, &[0, 0])];
-        carry(&mut ws, &mut ps, [2, 2], &mut flow(CLASS_VOICE, ANY_WIRE, 1), 0, b"x", 10);
-        assert_eq!(on_pool(&ps).len(), 1, "the route's wire has none up: the pool carries it");
-        let mut ps = [pool(0, &[0, 0])];
-        for l in ps[0].links.iter_mut() {
-            l.h.down();
-        }
-        let mut f = flow(CLASS_VOICE, 0, 1);
-        carry(&mut [], &mut ps, [0, 0], &mut f, 0, b"x", 10);
-        assert_eq!(ps[0].t.dropped, 1, "pinned to the pool with none up: dropped on it");
-    }
-}
+mod tests;

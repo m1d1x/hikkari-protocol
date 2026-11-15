@@ -55,6 +55,9 @@ type Wire struct {
 	// H3, when set, makes it the Chromium QUIC wire to the exit's QUIC port
 	// at Exit (FormH3Dgram): the pipe opens its members itself.
 	H3 *H3Form
+	// Fate is what must break on the path for the wire to lose a frame
+	// (trunk Wire.Fate); empty is udp, as for any wire but the pool.
+	Fate trunk.Fate
 }
 
 // staleTick is how old the latest tick may be before the brain takes the
@@ -72,6 +75,9 @@ type Pipe struct {
 	err  error // the process's end, once done is closed
 
 	wmu sync.Mutex // one writer at a time: a message and its sockets go together
+	// routeMu keeps one route message out at a time, fates and route of one
+	// moment (SetRoute, setFate); it is taken before mu, never under it.
+	routeMu sync.Mutex
 
 	mu      sync.Mutex
 	pid     int
@@ -80,10 +86,13 @@ type Pipe struct {
 	// tcpListens are the client ports of streams (pool_linux.go).
 	tcpListens map[byte]*tcpListenConf
 	route      trunk.Route
-	tick       Tick
-	tickAt     time.Time
-	resumed    time.Time
-	flows      map[uint32]func([]byte)
+	// fates are the wires' fates the brain gave (SetWire, SetPool), sent
+	// with the route.
+	fates   map[trunk.WireID]trunk.Fate
+	tick    Tick
+	tickAt  time.Time
+	resumed time.Time
+	flows   map[uint32]func([]byte)
 
 	nextTag atomic.Uint32
 	hello   chan struct{}
@@ -126,7 +135,7 @@ func Start(cfg Config) (*Pipe, error) {
 		return nil, err
 	}
 	p := &Pipe{cfg: cfg, cmd: cmd, conn: conn, done: make(chan struct{}), wires: map[trunk.WireID]*wireConf{},
-		listens: map[byte]*listenConf{}, tcpListens: map[byte]*tcpListenConf{}, route: trunk.AnyRoute, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
+		listens: map[byte]*listenConf{}, tcpListens: map[byte]*tcpListenConf{}, route: trunk.AnyRoute, fates: map[trunk.WireID]trunk.Fate{}, flows: map[uint32]func([]byte){}, hello: make(chan struct{}),
 		drained: make(chan struct{}), answers: make(chan []byte, 1)}
 	go func() {
 		p.err = cmd.Wait()
@@ -351,7 +360,7 @@ func (p *Pipe) SetWire(w Wire) error {
 	}
 	p.wires[w.ID] = &wireConf{w: w, members: members}
 	p.mu.Unlock()
-	return nil
+	return p.setFate(w.ID, w.Fate)
 }
 
 // RemoveWire takes a wire away; its flows go on by the route.
@@ -365,7 +374,7 @@ func (p *Pipe) RemoveWire(id trunk.WireID) error {
 		delete(p.wires, id)
 	}
 	p.mu.Unlock()
-	return nil
+	return p.setFate(id, "")
 }
 
 func dialMember(exit netip.AddrPort) (*net.UDPConn, error) {
@@ -406,25 +415,6 @@ func (p *Pipe) LastPause() time.Time {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.resumed
-}
-
-// Route is the route the brain last gave the pipe.
-func (p *Pipe) Route() trunk.Route {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.route
-}
-
-// SetRoute gives the pipe the wire of each class: its next datagram of each
-// class goes on it (trunk.Steered).
-func (p *Pipe) SetRoute(r trunk.Route) {
-	if err := p.send(putRoute(r)); err != nil {
-		p.cfg.Logf("pipectl: route: %v", err)
-		return
-	}
-	p.mu.Lock()
-	p.route = r
-	p.mu.Unlock()
 }
 
 // Tick is the pipe's latest tick and when it came.
