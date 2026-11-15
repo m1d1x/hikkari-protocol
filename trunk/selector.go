@@ -442,9 +442,9 @@ func (s *Selector) betterLocked(class Class, a, b WireID, now time.Time) bool {
 	if class == ClassVoice {
 		va, vb := s.voiceLocked(s.wires[a], now), s.voiceLocked(s.wires[b], now)
 		// Datagrams not inside TCP (owner, 10.11): of two wires as good for
-		// a call, the one of datagrams; a wire of streams is voice's
-		// fallback.
-		if as, bs := s.wires[a].w.Streams, s.wires[b].w.Streams; as != bs && va.known && vb.known && va.bad == vb.bad {
+		// a call, or both not heard yet (a new process), the one of
+		// datagrams; a wire of streams is voice's fallback.
+		if as, bs := s.wires[a].w.Streams, s.wires[b].w.Streams; as != bs && va.known == vb.known && (!va.known || va.bad == vb.bad) {
 			return !as
 		}
 		return va.better(vb)

@@ -68,6 +68,10 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 // datagrams, and a wire worse than the pool does not take voice from it.
 func TestSelectorBringsVoiceBackOffThePool(t *testing.T) {
 	now := time.Now()
+	// A new process has heard no call yet: voice starts on datagrams.
+	if c := NewSelector(SelectorConfig{}, selPool, selUDP).Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Route.Bulk != PoolWire {
+		t.Fatalf("a new selector puts voice on %d, bulk on %d", c.Route.Voice, c.Route.Bulk)
+	}
 	sel := NewSelector(SelectorConfig{}, selPool, selUDP)
 	for i := 0; i < 10; i++ {
 		at := now.Add(-time.Duration(i) * time.Minute)
