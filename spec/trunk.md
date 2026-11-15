@@ -234,12 +234,34 @@ owing together is a pause of the entry or a cut of the whole path: nothing is re
 left while every wire is red, or within 10 s of a pause of the entry's own (its session's clock or the selector's tick ran
 late): a box that was not run buries and owes on every wire, and which one comes back last is luck, not the wire. Such a
 wire is held; while it has no member up, its traffic goes on any member that can carry it. Otherwise the
-rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
-its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
-carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Datagrams do not go
-inside TCP alone (the set adds the pool's copy, Datagrams): of two wires as good for a call, voice takes the one of datagrams as its main wire, and voice on a wire of streams (where a red
-wire left it) goes back to a wire of datagrams that is no worse after the 5 minutes, with no margin. Bulk goes only on
-wires that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
+rank is slow. Bulk goes by its 1 MiB downloads over an hour (failures, then the median speed, then CPU), only on wires that
+carry streams, and a wire takes it from the one that carries it only when it is a quarter faster at as few failures for 5
+minutes.
+
+Voice goes on a set of two fates (hikkari-client `plans/2026-11-15-live-udp-two-fates.md`, раздел 5): the route gives the
+whole set, the best wire of fate `udp` as its main wire with the flow's copies, and the best wire of another fate with one
+copy. A wire is ranked for voice by what a listener heard of its own call (the call pinned to it) in its latest minute, up
+and down together at the 60 ms buffer (What a listener hears): fewer bad seconds, then fewer runs of 2 holes or more, then
+fewer holes, then the shorter round trip at p50, two round trips within 50 ms of each other being equal. A wire whose exit
+stamps nothing is ranked by what its call has: lost datagrams as holes, pauses over 60 ms as runs, over 150 ms as bad
+seconds. A wire not heard yet ranks below every wire heard. A wire better than the one in its place takes it once it has
+stayed better for 5 minutes; a red one is left at once for the next best wire of its fate. With no wire of fate `udp` to be
+had, the main wire is the best of the others, and a wire of fate `udp` takes it back as soon as it is not red: one fate is
+the fallback, not a rank.
+
+The set grows at once and shrinks slowly. Each second, 1 s after it ends, the entry hears the voice set's calls as one
+listener over that second's frames, against the best delays of every frame its calls still keep (the open minute and the
+one in its grace), at the 60 ms buffer; a second is bad as in What a listener hears. After 2 bad seconds of the last 5,
+voice gets one more copy on its main wire 10 ms after the first; it goes after 5 minutes with no bad second. A copy moves no
+traffic, so there is nothing to hold it against. The set heard is the two fates' calls, not the copies: the third copy does
+not hide the seconds that brought it.
+
+Video goes on one wire. Its rank is the bad seconds its call heard at a 200 ms buffer over the last minute, judged second by
+second as the set's, then the voice rank. It leaves its wire after 3 bad seconds of the last 5, for the best wire of another
+fate (of any fate when there is none), the next frame on the new wire; a better wire takes it after 5 minutes. Video has no
+copies: its frames left on the old wire may be lost.
+
+For each class the chosen wire and the best other wire of another shape are kept warm, and every wire of voice's set.
 
 The numbers are from the stand's night (11.11, 01:00–05:46 UTC, nekko-spb → unl1, the four candidate wires and the pool's
 own call side by side), to be checked against the stand's full day and the peak:
@@ -249,7 +271,8 @@ own call side by side), to be checked against the stand's full day and the peak:
   (the box not run on :x0) silenced every wire at once for 157–320 ms: nobody red. 1000 ms would miss the QUIC stalls
   and 22 of the pool's. A voice wire's death costs the call at most this long only if its other copy is lost too: the
   client's stream copy of a voice packet rides the bulk wire, of another shape.
-- Voice margin 5, hold 5 minutes. Replayed over the night's minutes: with the bare UDP wire present, margin 3 moved
+- Voice margin 5, hold 5 minutes (voice was one wire until 15.11; the set keeps the hold, the margin went with the
+  minutes ranked by pauses). Replayed over the night's minutes: with the bare UDP wire present, margin 3 moved
   voice twice in 4.6 h (to salamander for 9 minutes and back), margin 5 never, red minutes under voice 0 either way.
   Between QUIC and salamander alone, margin 3 and a 3-minute hold moved it 9 times, margin 5 and 5 minutes 3 times, and
   the minutes voice spent on a red minute were 7 and 6: moving between wires as good as each other buys nothing.

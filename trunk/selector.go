@@ -3,6 +3,7 @@ package trunk
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -27,25 +28,22 @@ import (
 //     own pauses, at the stand's rounds). Such a wire is Held, not left;
 //     while it has no member the session carries its traffic on any member
 //     that can, as for any wire without one.
-//   - Otherwise the rank is slow. Voice is ranked by its call (CallWindow)
-//     over VoiceSpan: fewer red minutes, then fewer pauses over 60 ms, then
-//     a shorter round trip at p99. Bulk is ranked by its 1 MiB downloads
-//     over BulkSpan: fewer failed, then the faster median, then less CPU.
-//     A wire takes a class over from the one carrying it only when it is
-//     better by a margin and stays so for Hold: traffic does not swing.
+//   - Otherwise the rank is slow. Bulk is ranked by its 1 MiB downloads
+//     over BulkSpan: fewer failed, then the faster median, then less CPU,
+//     and a wire takes bulk from the one carrying it only when it is better
+//     by BulkMargin and stays so for Hold. Voice is a set of two fates and
+//     video one wire, both ranked by what a listener heard of each wire's
+//     call (selector_voice.go).
 //
-// The warm pair: for each class the chosen wire and the best other wire of
-// another shape, so that one rule against one form does not take both.
+// The warm wires: for each class the chosen wire and the best other wire of
+// another shape, so that one rule against one form does not take both, and
+// every wire of voice's set.
 
 // SelectorConfig tunes a Selector. Zero fields take the defaults.
 type SelectorConfig struct {
 	RedSilence time.Duration // 500 ms
-	VoiceSpan  time.Duration // 10 min of calls
 	BulkSpan   time.Duration // 1 h of downloads
 	Hold       time.Duration // 5 min a challenger must stay better
-	// VoiceMargin is how many red minutes plus pauses over 60 ms a
-	// challenger must have fewer of, over VoiceSpan, to take voice.
-	VoiceMargin int
 	// BulkMargin is how much faster a challenger's median download must be,
 	// as a fraction (0.25: a quarter), at as few failures.
 	BulkMargin float64
@@ -56,40 +54,29 @@ type SelectorConfig struct {
 
 const (
 	DefaultRedSilence = 500 * time.Millisecond
-	DefaultVoiceSpan  = 10 * time.Minute
 	DefaultBulkSpan   = time.Hour
-	// The margins and the hold from the stand's night (11.11 01:00–05:46
+	// The margin and the hold from the stand's night (11.11 01:00–05:46
 	// UTC, hikkari-client plans/research/2026-11-11-trunk-selector-thresholds.md):
 	// voice moved between wires as good as each other did not lower its red
 	// minutes, only shook the call; a 1 MiB download measures a round trip
 	// or two of slow start, its medians of equal wires differ by up to 12%.
-	DefaultHold        = 5 * time.Minute
-	DefaultVoiceMargin = 5
-	DefaultBulkMargin  = 0.25
+	DefaultHold       = 5 * time.Minute
+	DefaultBulkMargin = 0.25
 	// A pause train of the entry at a round of the stand (11.11) took its
 	// udp members and kept the wire red 7 s after the last pause, while they
 	// redialed: the grace covers it with room.
 	DefaultPauseGrace = 10 * time.Second
-	// A minute of a call is red when it lost more than this share of its
-	// datagrams or paused longer than callGapWord (a word).
-	redLossPerK = 10
 )
 
 func (c SelectorConfig) withDefaults() SelectorConfig {
 	if c.RedSilence <= 0 {
 		c.RedSilence = DefaultRedSilence
 	}
-	if c.VoiceSpan <= 0 {
-		c.VoiceSpan = DefaultVoiceSpan
-	}
 	if c.BulkSpan <= 0 {
 		c.BulkSpan = DefaultBulkSpan
 	}
 	if c.Hold <= 0 {
 		c.Hold = DefaultHold
-	}
-	if c.VoiceMargin <= 0 {
-		c.VoiceMargin = DefaultVoiceMargin
 	}
 	if c.BulkMargin <= 0 {
 		c.BulkMargin = DefaultBulkMargin
@@ -126,7 +113,11 @@ type Choice struct {
 	// part per class that moved, joined by "; ", each one of
 	// "<class>: on <wire>", "<class>: <wire> is red, to <wire>" and
 	// "<class>: <wire> better than <wire> for <hold>" (hub cascadewatch
-	// reads them back as events).
+	// reads them back as events); <class> is bulk, voice (the set's main
+	// wire), voice2 (its wire of another fate) or video. Voice's third copy
+	// says "voice: third copy on <wire> (<n> bad seconds of 5)" and "voice:
+	// third copy off (no bad second for <hold>)", video's quick move
+	// "video: <wire> had <n> bad seconds of 5, to <wire>".
 	Why string
 }
 
@@ -134,17 +125,28 @@ type selWire struct {
 	w     Wire
 	calls []CallWindow
 	dls   []Download
+	// secs are the seconds its pinned call heard (CallSecond), the last
+	// minute's.
+	secs []CallSecond
 }
 
 // Selector ranks an entry's wires. Feed it each wire's call windows and
-// downloads; Choose gives the route.
+// seconds, the voice set's seconds and the downloads; Choose gives the route.
 type Selector struct {
 	cfg SelectorConfig
 
 	mu    sync.Mutex
 	wires map[WireID]*selWire
 	cur   Route
-	chall [2]challenger // by Class
+	// voice2 is the set's wire of another fate, video video's wire; AnyWire
+	// for none (cur holds them too, as its set and WithVideo).
+	voice2, video WireID
+	chall         [slots]challenger
+	// voiceSecs are the voice set's last seconds, oldest first; boosted says
+	// voice has its third copy, lastBad when the set last had a bad second.
+	voiceSecs []CallSecond
+	boosted   bool
+	lastBad   time.Time
 	// paused is when this box last came back from a pause of its own.
 	paused time.Time
 }
@@ -154,11 +156,28 @@ type challenger struct {
 	since time.Time
 }
 
+// slot is a place of the route the selector fills.
+type slot uint8
+
+const (
+	slotBulk slot = iota
+	slotVoice
+	slotVoice2
+	slotVideo
+	slots
+)
+
+func (sl slot) String() string {
+	return [slots]string{"bulk", "voice", "voice2", "video"}[sl]
+}
+
 // NewSelector ranks the given wires (the pool among them, if the entry has
 // one).
 func NewSelector(cfg SelectorConfig, wires ...Wire) *Selector {
-	s := &Selector{cfg: cfg.withDefaults(), wires: map[WireID]*selWire{}, cur: AnyRoute,
-		chall: [2]challenger{{wire: AnyWire}, {wire: AnyWire}}}
+	s := &Selector{cfg: cfg.withDefaults(), wires: map[WireID]*selWire{}, cur: AnyRoute, voice2: AnyWire, video: AnyWire}
+	for i := range s.chall {
+		s.chall[i].wire = AnyWire
+	}
 	for _, w := range wires {
 		s.wires[w.ID] = &selWire{w: w}
 	}
@@ -193,25 +212,6 @@ func (s *Selector) Download(id WireID, d Download) {
 	}
 }
 
-// voiceScore is what voice is ranked by: red minutes and pauses over
-// 60 ms (lower is better), then the round trip at p99. known is false for a
-// wire with no call in the span.
-type voiceScore struct {
-	known bool
-	bad   int
-	p99   time.Duration
-}
-
-func (v voiceScore) better(o voiceScore) bool {
-	if v.known != o.known {
-		return v.known
-	}
-	if v.bad != o.bad {
-		return v.bad < o.bad
-	}
-	return v.p99 < o.p99
-}
-
 type bulkScore struct {
 	known  bool
 	failed int
@@ -230,27 +230,6 @@ func (b bulkScore) better(o bulkScore) bool {
 		return b.mbps > o.mbps
 	}
 	return b.cpu < o.cpu
-}
-
-func (s *Selector) voiceLocked(sw *selWire, now time.Time) voiceScore {
-	var v voiceScore
-	var p99s []time.Duration
-	for _, w := range sw.calls {
-		if now.Sub(w.To) > s.cfg.VoiceSpan {
-			continue
-		}
-		v.known = true
-		if w.Sent > 0 && w.Lost()*1000 > redLossPerK*w.Sent || w.GapMax > callGapWord {
-			v.bad++
-		}
-		v.bad += w.Gaps60
-		p99s = append(p99s, w.RTTP99)
-	}
-	if len(p99s) > 0 {
-		sort.Slice(p99s, func(i, j int) bool { return p99s[i] < p99s[j] })
-		v.p99 = p99s[len(p99s)/2]
-	}
-	return v
 }
 
 func (s *Selector) bulkLocked(sw *selWire, now time.Time) bulkScore {
@@ -282,16 +261,24 @@ func median(v []float64) float64 {
 	return v[len(v)/2]
 }
 
-// forget drops what is older than both spans.
+// forgetLocked drops what no rank looks at any more: calls older than
+// callKeep, seconds older than secondsKept, downloads older than BulkSpan.
 func (s *Selector) forgetLocked(now time.Time) {
 	for _, sw := range s.wires {
 		keep := sw.calls[:0]
 		for _, w := range sw.calls {
-			if now.Sub(w.To) <= s.cfg.VoiceSpan {
+			if now.Sub(w.To) <= callKeep {
 				keep = append(keep, w)
 			}
 		}
 		sw.calls = keep
+		sk := sw.secs[:0]
+		for _, c := range sw.secs {
+			if now.Sub(c.At) <= secondsKept {
+				sk = append(sk, c)
+			}
+		}
+		sw.secs = sk
 		dk := sw.dls[:0]
 		for _, d := range sw.dls {
 			if now.Sub(d.At) <= s.cfg.BulkSpan {
@@ -341,57 +328,25 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 	}
 
 	var why []string
-	next := s.cur
-	for _, class := range []Class{ClassVoice, ClassBulk} {
-		eligible := func(id WireID) bool {
-			return !left[id] && (class == ClassVoice || s.wires[id].w.Streams)
-		}
-		// Ranked best first; ties by id, so the choice is stable.
-		var ranked []WireID
-		for _, id := range ids {
-			if eligible(id) {
-				ranked = append(ranked, id)
-			}
-		}
-		sort.SliceStable(ranked, func(i, j int) bool {
-			return s.betterLocked(class, ranked[i], ranked[j], now)
-		})
-		cur := s.cur.of(class)
-		ch := &s.chall[class]
-		var pick WireID
-		switch {
-		case len(ranked) == 0:
-			// Every wire red: keep what there is, the session falls back to
-			// any member that can carry it.
-			pick = cur
-			ch.wire = AnyWire
-		case cur == AnyWire || !eligible(cur):
-			pick = ranked[0]
-			ch.wire = AnyWire
-			if cur != AnyWire {
-				why = append(why, fmt.Sprintf("%s: %s is red, to %s", class, s.wires[cur].w.Name, s.wires[pick].w.Name))
-			} else {
-				why = append(why, fmt.Sprintf("%s: on %s", class, s.wires[pick].w.Name))
-			}
-		case ranked[0] != cur && s.byMarginLocked(class, ranked[0], cur, now):
-			pick = cur
-			if ch.wire != ranked[0] {
-				ch.wire, ch.since = ranked[0], now
-			} else if now.Sub(ch.since) >= s.cfg.Hold {
-				pick = ranked[0]
-				ch.wire = AnyWire
-				why = append(why, fmt.Sprintf("%s: %s better than %s for %s", class, s.wires[pick].w.Name, s.wires[cur].w.Name, s.cfg.Hold))
-			}
-		default:
-			pick = cur
-			ch.wire = AnyWire
-		}
-		if class == ClassVoice {
-			next.Voice = pick
-		} else {
-			next.Bulk = pick
+	say := func(w string) {
+		if w != "" {
+			why = append(why, w)
 		}
 	}
+	var bulk []WireID
+	for _, id := range ids {
+		if !left[id] && s.wires[id].w.Streams {
+			bulk = append(bulk, id)
+		}
+	}
+	sort.SliceStable(bulk, func(i, j int) bool { return s.bulkBetterLocked(bulk[i], bulk[j], now) })
+	bulkOn, moved := s.pickLocked(slotBulk, s.cur.Bulk, bulk, left, func(a, b WireID) bool { return s.byMarginLocked(a, b, now) }, now)
+	say(moved)
+	next := Route{Voice: AnyWire, Bulk: bulkOn}
+	for _, w := range s.chooseVoiceLocked(&next, ids, left, now) {
+		say(w)
+	}
+	say(s.chooseVideoLocked(&next, ids, left, now))
 	s.cur = next
 
 	c := Choice{Route: next}
@@ -404,7 +359,10 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 		}
 	}
 	warm := map[WireID]bool{}
-	for _, class := range []Class{ClassVoice, ClassBulk} {
+	for i := 0; i < next.VoiceSet.Len(); i++ {
+		warm[next.VoiceSet.At(i).Wire] = true
+	}
+	for _, class := range []Class{ClassVoice, ClassBulk, ClassVideo} {
 		chosen := next.of(class)
 		if chosen == AnyWire {
 			continue
@@ -419,7 +377,7 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 			if class == ClassBulk && !s.wires[id].w.Streams {
 				continue
 			}
-			if second == AnyWire || s.betterLocked(class, id, second, now) {
+			if second == AnyWire || s.classBetterLocked(class, id, second, now) {
 				second = id
 			}
 		}
@@ -438,34 +396,57 @@ func (s *Selector) Choose(now time.Time, live map[WireID]WireState) Choice {
 	return c
 }
 
-func (s *Selector) betterLocked(class Class, a, b WireID, now time.Time) bool {
-	if class == ClassVoice {
-		va, vb := s.voiceLocked(s.wires[a], now), s.voiceLocked(s.wires[b], now)
-		// Datagrams not inside TCP (owner, 10.11): of two wires as good for
-		// a call, or both not heard yet (a new process), the one of
-		// datagrams; a wire of streams is voice's fallback.
-		if as, bs := s.wires[a].w.Streams, s.wires[b].w.Streams; as != bs && va.known == vb.known && (!va.known || va.bad == vb.bad) {
-			return !as
+// pickLocked keeps or moves the wire in slot sl, cur now: ranked are the
+// wires that may take it, best first, and better says a beats b by enough to
+// take it from b once it stays so for Hold. A wire not among ranked is left
+// at once for ranked[0]; with none ranked cur stays (the session falls back
+// to any member that can carry the class). It says what moved, "" for
+// nothing.
+func (s *Selector) pickLocked(sl slot, cur WireID, ranked []WireID, left map[WireID]bool, better func(a, b WireID) bool, now time.Time) (WireID, string) {
+	ch := &s.chall[sl]
+	switch {
+	case len(ranked) == 0:
+		ch.wire = AnyWire
+		return cur, ""
+	case cur == AnyWire || !slices.Contains(ranked, cur):
+		ch.wire = AnyWire
+		pick := ranked[0]
+		if cur != AnyWire && left[cur] {
+			return pick, fmt.Sprintf("%s: %s is red, to %s", sl, s.wires[cur].w.Name, s.wires[pick].w.Name)
 		}
-		return va.better(vb)
+		return pick, fmt.Sprintf("%s: on %s", sl, s.wires[pick].w.Name)
+	case ranked[0] != cur && better(ranked[0], cur):
+		if ch.wire != ranked[0] {
+			ch.wire, ch.since = ranked[0], now
+			return cur, ""
+		}
+		if now.Sub(ch.since) < s.cfg.Hold {
+			return cur, ""
+		}
+		ch.wire = AnyWire
+		return ranked[0], fmt.Sprintf("%s: %s better than %s for %s", sl, s.wires[ranked[0]].w.Name, s.wires[cur].w.Name, s.cfg.Hold)
 	}
+	ch.wire = AnyWire
+	return cur, ""
+}
+
+// classBetterLocked ranks a over b for class.
+func (s *Selector) classBetterLocked(class Class, a, b WireID, now time.Time) bool {
+	switch class {
+	case ClassBulk:
+		return s.bulkBetterLocked(a, b, now)
+	case ClassVideo:
+		return s.videoBetterLocked(a, b, now)
+	}
+	return s.voiceBetterLocked(a, b)
+}
+
+func (s *Selector) bulkBetterLocked(a, b WireID, now time.Time) bool {
 	return s.bulkLocked(s.wires[a], now).better(s.bulkLocked(s.wires[b], now))
 }
 
-// byMarginLocked says a beats b by enough to take the class from it.
-func (s *Selector) byMarginLocked(class Class, a, b WireID, now time.Time) bool {
-	if class == ClassVoice {
-		va, vb := s.voiceLocked(s.wires[a], now), s.voiceLocked(s.wires[b], now)
-		// Voice on a wire of streams (the pool, where a red wire left it)
-		// goes back to one of datagrams that is no worse, after Hold, with
-		// no margin: the fallback is not kept for a night of equal wires
-		// (14.11 21:50 UTC: udp red at a reload of the exit, voice on the
-		// pool until morning).
-		if s.wires[b].w.Streams && !s.wires[a].w.Streams {
-			return va.known && (!vb.known || va.bad <= vb.bad)
-		}
-		return va.known && (!vb.known || va.bad+s.cfg.VoiceMargin <= vb.bad)
-	}
+// byMarginLocked says a beats b by enough to take bulk from it.
+func (s *Selector) byMarginLocked(a, b WireID, now time.Time) bool {
 	ba, bb := s.bulkLocked(s.wires[a], now), s.bulkLocked(s.wires[b], now)
 	if !ba.known {
 		return false

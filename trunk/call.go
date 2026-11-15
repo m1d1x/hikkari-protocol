@@ -212,11 +212,13 @@ type CallSet struct {
 }
 
 // CallReports takes what RunCalls hears: Leg each call's window by its
-// place in the calls given, Set each set's. Both run on the calls' own
-// goroutine; either may be nil.
+// place in the calls given, Set each set's, Second each second of each set
+// and of each call pinned to a wire (second.go). All run on the calls' own
+// goroutine; any may be nil.
 type CallReports struct {
-	Leg func(i int, w CallWindow)
-	Set func(w CallSetWindow)
+	Leg    func(i int, w CallWindow)
+	Set    func(w CallSetWindow)
+	Second func(s CallSecond)
 }
 
 // maxCallSets is how many sets RunCalls hears (a bit of callSent's sets each).
@@ -307,6 +309,11 @@ func RunCalls(ctx context.Context, carrier func() CallCarrier, legs []CallConfig
 			for _, w := range setWs {
 				if rep.Set != nil {
 					rep.Set(w)
+				}
+			}
+			if rep.Second != nil {
+				for _, sec := range g.seconds(now) {
+					rep.Second(sec)
 				}
 			}
 		}

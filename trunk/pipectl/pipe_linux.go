@@ -623,7 +623,8 @@ func (p *Pipe) Run(ctx context.Context, sel *trunk.Selector, wires []trunk.WireI
 				call(wires[i], cw)
 			}
 		},
-		Set: set,
+		Set:    set,
+		Second: sel.Second,
 	})
 	trunk.SteerOn(ctx, p, sel, logf)
 }

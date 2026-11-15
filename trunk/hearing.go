@@ -129,7 +129,7 @@ func (c *hearCount) flush() {
 	if c.i == 0 {
 		c.h.Seconds++
 	}
-	if c.holesSec >= badSecondHoles && c.holesSec*100 >= badSecondPct*c.inSec {
+	if badSecond(c.holesSec, c.inSec) {
 		c.h.BadS[c.i]++
 	}
 	c.inSec, c.holesSec = 0, 0
@@ -211,6 +211,8 @@ func lagOf(d []time.Duration) CallLag {
 type callGroup struct {
 	legs []*call
 	sets []CallSet
+	// judged is the start of the latest second heard (second.go).
+	judged time.Time
 }
 
 // members marks, for each call, the sets its wire is in now (in) and those

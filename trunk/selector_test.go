@@ -55,63 +55,48 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 		t.Fatalf("voice stayed on a red wire: %+v", c)
 	}
 	// The hub reads this line back part by part (cascadewatch).
-	if c.Why != "voice: udp is red, to pool" {
+	if c.Why != "voice: udp is red, to pool; video: udp is red, to pool" {
 		t.Fatalf("the log says %q", c.Why)
 	}
 }
 
-// TestSelectorBringsVoiceBackOffThePool: a red wire of datagrams left voice
-// on the pool; once it is green and its call no worse than the pool's, voice
-// goes back to it after Hold, with no margin to beat (14.11 21:50 UTC: udp
-// red at a reload of the exit, then voice inside TCP all night on calls as
-// clean as each other). Of two wires as good, the first choice is the one of
-// datagrams, and a wire worse than the pool does not take voice from it.
-func TestSelectorBringsVoiceBackOffThePool(t *testing.T) {
+// TestSelectorBringsVoiceBackOffThePoolAtOnce: a red wire of datagrams left
+// voice on the pool; once it is not red it is voice's main wire again at
+// once, with no Hold (spec/trunk.md, Wires: one fate is the fallback, not a
+// rank; 14.11 21:50 UTC voice stayed inside TCP all night after a reload of
+// the exit). A wire of datagrams rougher than the pool is still voice's main
+// wire: the pool carries its copy in the set whatever the rank.
+func TestSelectorBringsVoiceBackOffThePoolAtOnce(t *testing.T) {
 	now := time.Now()
 	// A new process has heard no call yet: voice starts on datagrams.
 	if c := NewSelector(SelectorConfig{}, selPool, selUDP).Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Route.Bulk != PoolWire {
 		t.Fatalf("a new selector puts voice on %d, bulk on %d", c.Route.Voice, c.Route.Bulk)
 	}
 	sel := NewSelector(SelectorConfig{}, selPool, selUDP)
-	for i := 0; i < 10; i++ {
-		at := now.Add(-time.Duration(i) * time.Minute)
-		sel.Call(testUDP, calm(at, 50*time.Millisecond))
-		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
-	}
-	if c := sel.Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Voice != testUDP {
-		t.Fatalf("of two calls as clean, voice went on %d, not the datagrams' wire", c.Route.Voice)
+	sel.Call(testUDP, calm(now, 50*time.Millisecond))
+	sel.Call(PoolWire, calm(now, 40*time.Millisecond))
+	c := sel.Choose(now, liveAll(now, PoolWire, testUDP))
+	if want := SetOf(Carry{Wire: testUDP}, Carry{Wire: PoolWire, Copies: 1}); c.Route.Voice != testUDP || c.Route.VoiceSet != want {
+		t.Fatalf("voice is not the set of two fates: %+v", c.Route)
 	}
 	t1 := now.Add(time.Second)
 	live := liveAll(t1, PoolWire, testUDP)
 	live[testUDP] = WireState{ID: testUDP, Members: 2, Proof: now, Owed: 600 * time.Millisecond}
-	if c := sel.Choose(t1, live); c.Route.Voice != PoolWire {
+	if c := sel.Choose(t1, live); c.Route.Voice != PoolWire || c.Route.VoiceSet != SetOf(Carry{Wire: PoolWire}) {
 		t.Fatalf("voice stayed on a red wire: %+v", c)
 	}
-	// Green again, as clean as the pool: back after Hold, not before.
 	t2 := t1.Add(time.Second)
-	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != PoolWire {
-		t.Fatalf("voice back before Hold: %+v", c)
+	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Why != "voice: on udp; voice2: on pool" {
+		t.Fatalf("voice not back on the datagrams' wire at once: %+v", c)
 	}
-	t3 := t2.Add(DefaultHold)
-	for i := 0; i < 5; i++ {
-		at := t3.Add(-time.Duration(i) * time.Minute)
-		sel.Call(testUDP, calm(at, 50*time.Millisecond))
-		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
-	}
-	c := sel.Choose(t3, liveAll(t3, PoolWire, testUDP))
-	if c.Route.Voice != testUDP || c.Why != "voice: udp better than pool for 5m0s" {
-		t.Fatalf("voice not back on the datagrams' wire after Hold: %+v", c)
-	}
-	// A wire of datagrams that is worse than the pool does not take voice.
+
 	sel = NewSelector(SelectorConfig{}, selPool, selUDP)
-	for i := 0; i < 10; i++ {
-		at := now.Add(-time.Duration(i) * time.Minute)
-		sel.Call(testUDP, rough(at))
-		sel.Call(PoolWire, calm(at, 40*time.Millisecond))
-	}
+	sel.Call(testUDP, rough(now))
+	sel.Call(PoolWire, calm(now, 40*time.Millisecond))
 	sel.Choose(now, liveAll(now, PoolWire, testUDP))
-	if c := sel.Choose(now.Add(DefaultHold+time.Second), liveAll(now.Add(DefaultHold+time.Second), PoolWire, testUDP)); c.Route.Voice != PoolWire {
-		t.Fatalf("a rough wire of datagrams took voice from a clean pool: %+v", c)
+	later := now.Add(DefaultHold + time.Second)
+	if c := sel.Choose(later, liveAll(later, PoolWire, testUDP)); c.Route.Voice != testUDP || !c.Route.VoiceSet.has(PoolWire) {
+		t.Fatalf("a rough wire of datagrams lost voice to the pool: %+v", c)
 	}
 }
 
@@ -217,7 +202,7 @@ func TestSteerLeavesACutWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.entry.Steer(ctx, sel, t.Logf)
-	waitFor(t, func() bool { return h.entry.Route() == Route{Voice: testUDP, Bulk: testQuic} })
+	waitFor(t, func() bool { r := h.entry.Route(); return r.Voice == testUDP && r.Bulk == testQuic })
 
 	c := h.carry()
 	defer c.Close()

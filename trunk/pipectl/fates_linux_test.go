@@ -300,3 +300,74 @@ func TestVoiceRidesTwoFatesThroughThePipe(t *testing.T) {
 		})
 	}
 }
+
+// TestTheSelectorSetsVoiceOnTwoFatesThroughThePipe: as
+// TestVoiceRidesTwoFatesThroughThePipe, but no route is given: the brain's
+// selector hears the wires' calls through hk-pipe and puts voice on the set
+// itself, the udp wire under the night's path as its main wire and the pool
+// with one copy. The call through it hears under 1% of holes at 60 ms and no
+// run of two.
+func TestTheSelectorSetsVoiceOnTwoFatesThroughThePipe(t *testing.T) {
+	const frames = 1500 // 30 s
+	for _, x := range []struct {
+		name string
+		mk   func(*testing.T, context.Context) fatesStand
+	}{{"goexit", goFatesExit}, {"rustexit", rustFatesExit}} {
+		t.Run(x.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			st := x.mk(t, ctx)
+			night := newGilbert(t, st.wire, 0.147, 0.67)
+			p, err := Start(Config{Bin: pipeBin(t), Stderr: os.Stderr, Logf: t.Logf})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { p.Close() })
+			if err := p.SetPool(Pool{ID: trunk.PoolWire, Members: 4, Exit: st.pool}); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.SetWire(Wire{ID: dgramWire, Name: "udp", Exit: night.addr(), Key: testKey, Members: 2}); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, 20*time.Second, "the pool's and the wire's members up", func() bool {
+				return wireUp(p, trunk.PoolWire, 4) && wireUp(p, dgramWire, 2)
+			})
+			sel := trunk.NewSelector(trunk.SelectorConfig{},
+				trunk.Wire{ID: trunk.PoolWire, Name: "pool", Shape: "browser", Streams: true},
+				trunk.Wire{ID: dgramWire, Name: "udp", Shape: "random", Packet: true})
+			go p.Run(ctx, sel, []trunk.WireID{trunk.PoolWire, dgramWire}, nil, []trunk.CallSet{trunk.VoiceCallSet(p.Route)}, nil, t.Logf)
+			want := trunk.SetOf(trunk.Carry{Wire: dgramWire}, trunk.Carry{Wire: trunk.PoolWire, Copies: 1})
+			waitFor(t, 10*time.Second, "voice on the set of two fates", func() bool {
+				r := p.Route()
+				return r.Voice == dgramWire && r.VoiceSet == want
+			})
+			lc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := p.Listen(0, lc, trunk.ClassVoice, st.echo, 1); err != nil {
+				t.Fatal(err)
+			}
+			l := callThrough(t, ctx, lc.LocalAddr().(*net.UDPAddr).AddrPort(), frames)
+			holes, runs2, lost := l.holes(60 * time.Millisecond)
+			t.Logf("%s: route %+v; holes at 60 ms %.2f%% (%d), runs of 2+ %d, lost %d of %d",
+				x.name, p.Route(), 100*float64(holes)/frames, holes, runs2, lost, frames)
+			if holes*100 >= frames || runs2 > 0 {
+				t.Errorf("holes %d of %d (want under 1%%), runs of 2+ %d (want 0)", holes, frames, runs2)
+			}
+			if r := p.Route(); r.Voice != dgramWire || !setHas(r.VoiceSet, trunk.PoolWire) {
+				t.Errorf("voice left the set of two fates under the call: %+v", r)
+			}
+		})
+	}
+}
+
+// setHas says whether s carries on wire id.
+func setHas(s trunk.Set, id trunk.WireID) bool {
+	for i := 0; i < s.Len(); i++ {
+		if s.At(i).Wire == id {
+			return true
+		}
+	}
+	return false
+}
