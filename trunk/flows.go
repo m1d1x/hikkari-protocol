@@ -7,10 +7,11 @@ import (
 
 // A flow is one client UDP association: on the entry, one client address on
 // one forwarded port; on the exit, one socket to the relay. Its datagrams go
-// over Copies members at once and are never sent again: a call wants the
-// first copy now, not a late one. A flow whose sender copies its datagrams
-// itself (Hikkari v1.02 sends a call over both its channels) is opened with
-// one copy: a second copy here would make four of every packet.
+// on every wire of its set at once (fates.go), Copies members of its main
+// wire, and are never sent again: a call wants the first copy now, not a
+// late one. A flow whose sender copies its datagrams itself (Hikkari v1.02
+// sends a call over both its channels) is opened with one copy: a second
+// copy on its main wire would make four of every packet.
 //
 // A flow to EchoPort is the trunk's own synthetic call (call.go): the exit
 // sends every datagram straight back, without a socket, and neither end
@@ -35,11 +36,11 @@ type flow struct {
 	// echo is a flow to EchoPort: the trunk's own call, not a client's.
 	echo bool
 	// class and pin are the entry's: the route it follows, or the one wire
-	// it is held to (wires.go). wire is the exit's: the wire the entry last
-	// sent it on, where the answers go.
+	// it is held to (wires.go). heard is the exit's: the wires the entry
+	// sent it on, where the answers go (fates.go answerSet).
 	class Class
 	pin   WireID
-	wire  WireID
+	heard [MaxCarries]heardOn
 
 	// What an observed flow reports (observe.go).
 	opened          time.Time
@@ -79,7 +80,7 @@ func (s *Session) OpenFlowWith(port uint16, o FlowOptions, deliver func([]byte),
 	defer s.mu.Unlock()
 	s.nextID++
 	f := &flow{id: s.nextID, port: port, deliver: deliver, used: time.Now(), onEnd: onEnd, copies: copies, opened: time.Now(), echo: port == EchoPort,
-		class: o.Class, pin: o.Pin, wire: AnyWire}
+		class: o.Class, pin: o.Pin}
 	if s.shutdown {
 		f.ended = true
 	} else {
@@ -115,63 +116,6 @@ func (h *Flow) Close() {
 	h.s.endFlowLocked(h.f)
 }
 
-func (s *Session) sendDgramLocked(f *flow, p []byte) {
-	f.seq++
-	f.out++
-	b := appendDgram(make([]byte, 0, 13+len(p)), f.id, f.seq, f.port, p)
-	// The Copies least loaded members of the flow's wire; a datagram is
-	// never owed, so a member carrying it is not held to account for it.
-	copies := f.copies
-	if copies <= 0 {
-		copies = s.cfg.Copies
-	}
-	want, strict := s.dgramWireLocked(f)
-	if want != AnyWire && !strict {
-		up := false
-		for m := range s.members {
-			up = up || m.kind.wire == want
-		}
-		if !up {
-			want = AnyWire
-		}
-	}
-	var used []*member
-	for len(used) < copies {
-		var best *member
-		for m := range s.members {
-			if want != AnyWire && m.kind.wire != want {
-				continue
-			}
-			taken := false
-			for _, u := range used {
-				taken = taken || u == m
-			}
-			if !taken && (best == nil || m.inflight < best.inflight) {
-				best = m
-			}
-		}
-		if best == nil {
-			break
-		}
-		used = append(used, best)
-		best.lastSend = time.Now()
-		best.send(b, true)
-	}
-}
-
-// dgramWireLocked is the wire a flow's datagrams go on, and whether only
-// that one: the entry's pin (strict) or its route for the flow's class; on
-// the exit the wire the entry last sent the flow on.
-func (s *Session) dgramWireLocked(f *flow) (WireID, bool) {
-	if s.local != nil {
-		return f.wire, false
-	}
-	if f.pin != AnyWire {
-		return f.pin, true
-	}
-	return s.route.of(f.class), false
-}
-
 // dgramLocked: a datagram arrived on m.
 func (s *Session) dgramLocked(m *member, fr frame) {
 	f := s.flows[fr.stream]
@@ -180,7 +124,7 @@ func (s *Session) dgramLocked(m *member, fr frame) {
 			return // the entry's flow is over
 		}
 		if fr.port == EchoPort {
-			f = &flow{id: fr.stream, port: fr.port, used: time.Now(), copies: 1, opened: time.Now(), echo: true, wire: m.kind.wire}
+			f = &flow{id: fr.stream, port: fr.port, used: time.Now(), copies: 1, opened: time.Now(), echo: true}
 			s.flows[f.id] = f
 			s.dgramLocked(m, fr)
 			return
@@ -189,23 +133,22 @@ func (s *Session) dgramLocked(m *member, fr frame) {
 		if err != nil {
 			return
 		}
-		// The exit answers a flow as the entry sends it: on one member
-		// until a copy arrives, then on Copies.
-		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1, opened: time.Now(), wire: m.kind.wire}
+		// The exit answers a flow as the entry sends it: on the wires its
+		// datagrams come on, each on one member until a copy comes on it,
+		// then on Copies (fates.go heardLocked).
+		f = &flow{id: fr.stream, port: fr.port, conn: conn, used: time.Now(), copies: 1, opened: time.Now()}
 		s.flows[f.id] = f
 		go s.readFlow(f)
 	}
+	dup := f.replay.seen(fr.seq)
 	if s.local != nil {
-		f.wire = m.kind.wire // answers follow the entry's latest choice
+		s.heardLocked(f, m.kind.wire, fr.seq, dup, time.Now()) // answers follow the entry's set
 	}
-	if f.replay.seen(fr.seq) {
+	if dup {
 		if !f.echo {
 			s.dgramsCopy.Add(1)
 		}
 		f.copied++
-		if s.local != nil {
-			f.copies = s.cfg.Copies
-		}
 		return
 	}
 	f.used = time.Now()

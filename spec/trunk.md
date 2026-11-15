@@ -118,17 +118,30 @@ and the entry logs `trunk: paused <duration>`.
 ## Datagrams
 
 A flow is one client UDP association (entry: one client address on one listened port; exit: one socket to the loopback port).
-Every datagram goes as a dgram frame on the 2 members carrying least; no ack, no resend. The receiver drops copies by `seq`
-in a window of 1024. A flow ends after 2 minutes unused.
+Every datagram goes as a dgram frame on every wire of its flow's set (Wires): on each wire on as many of its members as the
+set says, no ack, no resend. All copies carry the flow's one `seq`; the receiver takes the first and drops the others by
+`seq` in a window of 1024, whichever wire brought it. On a wire the members go round: each copy goes on the member of that
+wire that sent last the longest ago, so a TCP member's resend holds up one datagram in N, not every one. A flow ends after 2
+minutes unused.
 
-A flow whose sender already copies its datagrams goes on one member: Hikkari v1.02 sends a call over both its channels, and a
-second copy on the trunk would make four of every packet. The entry chooses per listened port (the hub sets one copy on ports
-that reach the exit's Hikkari relay). The exit answers a flow as the entry sends it: on one member until a copy of the flow's
-datagrams arrives, then on 2.
+The copies on a flow's main wire are its own: 2 by default, one for a flow whose sender already copies its datagrams
+(Hikkari v1.02 sends a call over both its channels, and a second copy on the trunk would make four of every packet). The
+entry chooses per listened port (the hub sets one copy on ports that reach the exit's Hikkari relay). Such a port still gets
+the set of two fates: the client's own copy goes inside its stream channel, TCP to the entry, and under a cut of UDP it
+comes 95–166 ms late; it guards the client's leg, not the trunk's.
+
+The exit answers a flow on every wire its datagrams came on in the last second; with none in that second, on the wire of the
+latest. On each wire it answers on one member, and on 2 once a copy comes on that wire of a datagram that wire already
+brought (the entry's copies there, not another wire's).
+
+A member of the pool that carries dgram frames has Nagle off (`TCP_NODELAY`) at both ends: a voice copy is a small frame
+every 20 ms, and with Nagle the kernel holds it until the last one is acknowledged. Each end sets it on a member that is a
+TCP socket of its own; the entry's Chromium sets it on the pool's sockets, and the relay that hands the exit its members
+accepts them on Go's TCP, which sets it on every socket.
 
 A flow to port 0 is the trunk's own call (`call.go`): the exit sends every datagram straight back, with no socket, as it
-came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, a datagram every 20 ms, and
-reports each minute of the wall clock: sent, answered within 2 s, round trips, and the pauses between answers a call hears
+came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, a datagram every 20 ms, both of
+the voice class on its set (Wires), and reports each minute of the wall clock: sent, answered within 2 s, round trips, and the pauses between answers a call hears
 (over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with their time). Neither end counts the call
 among its clients' flows and datagrams, and it never keeps a retired session open. An exit older than this answers nothing on
 port 0: the call reports every datagram lost.
@@ -164,11 +177,31 @@ datagram, both ways; its hello is said again every 250 ms until answered, and th
 100 ms whether or not the last ping came back, owes progress from its oldest unanswered ping, a pong of any ping since
 then is its proof, and its stall limit is the member's limit plus 100 ms: datagrams lost one by one do not kill it.
 
-The entry routes two classes of traffic, each on a wire of its choice: voice (calls and other small live datagrams; by the
-port, as one copy is chosen today) and bulk (streams and every other datagram). A wire with no member that can carry the
-class is passed over for any member that can. The exit has no route: it answers a stream or a flow on the wire the entry
-last sent it on. The trunk's call can be pinned to one wire: then its datagrams go on that wire only, and are lost while it
-has no member, so the call hears the wire alone.
+Every wire has a fate: what must break on the path for it to lose a frame (hikkari-client
+`plans/2026-11-15-live-udp-two-fates.md`). `udp` is datagrams of IP on the path (the bare UDP wire, `h3dgram`, QUIC,
+salamander), `tcp` is streams TCP sends again (the pool). The hub sets it in the wire's knobs as it sets the shape; a wire
+that says none is `tcp` for the pool and `udp` for any other. The shape answers another question: which wires one rule
+against one form takes together. On the night of 14.11 the path lost 15–20% of every UDP datagram and almost no TCP segment;
+two copies on two members of one wire were lost together (5%), a copy on each fate lost almost nothing (0.3–0.8% heard
+holes at a 60 ms buffer, hikkari-client `plans/research/2026-11-15-voice-night-lab.md`).
+
+The entry routes three classes of traffic, by the listened port:
+
+- voice (calls and other small live datagrams): a set of wires of different fates at once. The route names the main wire,
+  where the flow's own copies go, and the entry adds one copy on the best wire of the other fate that has a member up; or
+  the route gives the whole set: up to 4 carries, each a wire, its copies (0 for the flow's) and how long after the
+  datagram they leave (a later copy on one wire misses the burst that took the first). TCP never carries voice alone while
+  a wire of fate `udp` has a member up: a set of the pool alone gets one copy on the best such wire. With no such wire up
+  the set is the pool alone, as any member.
+- video (a client's video and screen, too big to copy): one wire, the route's, or voice's main wire when the route names
+  none.
+- bulk (streams and every other datagram): one wire.
+
+A wire of a set, or the one wire of video or bulk, with no member up is passed over for the best wire of its fate that has
+one and is not in the set yet, else left out; a flow with no wire left goes on any member that can carry it. Between wires
+of one fate the best is the lowest id (owner's choice of 2026-11-15). The exit has no route: it answers a stream on the
+wire the entry last sent it on, a flow on its set as it hears it (Datagrams). The trunk's call can be pinned to one wire:
+then its datagrams go on that wire only, and are lost while it has no member, so the call hears the wire alone.
 
 The entry chooses the route every second (the selector). A wire is red when it has no member up, or when every member has
 owed progress for 500 ms while another wire proved the path alive in that time; a red wire is left at once. Every wire
@@ -179,7 +212,7 @@ wire is held; while it has no member up, its traffic goes on any member that can
 rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
 its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
 carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Datagrams do not go
-inside TCP: of two wires as good for a call, voice takes the one of datagrams, and voice on a wire of streams (where a red
+inside TCP alone (the set adds the pool's copy, Datagrams): of two wires as good for a call, voice takes the one of datagrams as its main wire, and voice on a wire of streams (where a red
 wire left it) goes back to a wire of datagrams that is no worse after the 5 minutes, with no margin. Bulk goes only on
 wires that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
 

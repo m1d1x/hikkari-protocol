@@ -183,9 +183,10 @@ type Session struct {
 	peerObserve bool
 	reports     chan Report
 	obsDropped  atomic.Int64
-	// route is the entry's: which wire each class goes on (wires.go). The
-	// exit has none: it answers on the wire the entry last used.
+	// route is the entry's: which wires each class goes on (wires.go). The
+	// exit has none: it answers on the wires the entry used (fates.go).
 	route Route
+	fate  fateState
 
 	joined, stalls, broken, resent       atomic.Int64
 	pauses                               atomic.Int64

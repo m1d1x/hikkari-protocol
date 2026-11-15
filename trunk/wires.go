@@ -21,10 +21,12 @@ import "time"
 // row go unanswered).
 //
 // Which wire carries what is the entry's choice, per class of traffic
-// (Route): voice (a client's calls, small datagrams) and bulk (streams and
-// every other datagram). The exit follows: it answers a stream or a flow on
-// the wire the entry last sent it on. The trunk's own call can be pinned to
-// one wire (FlowOptions.Pin) to measure it whatever the route.
+// (Route): voice (a client's calls, small datagrams) goes on a set of wires
+// of different fates at once (fates.go), video on one wire, bulk (streams
+// and every other datagram) on one wire. The exit follows: it answers a
+// stream on the wire the entry last sent it on, a flow on every wire the
+// entry sent it on in the last second. The trunk's own call can be pinned
+// to one wire (FlowOptions.Pin) to measure it whatever the route.
 
 // WireID names a wire of the trunk.
 type WireID uint8
@@ -81,6 +83,10 @@ type Wire struct {
 	// The selector keeps its warm pair in two shapes, so that one rule
 	// against one form does not take both (stage plan, принцип 5).
 	Shape string
+	// Fate is what must break on the path for the wire to lose a frame
+	// (fates.go): FateUDP or FateTCP, from the hub's knobs as Shape is.
+	// Empty is FateTCP for the pool and FateUDP for any other wire.
+	Fate Fate
 	// Members is how many members the wire keeps up.
 	Members int
 	// Dial opens a member. localPort is from Ports (the entry's own book
@@ -105,37 +111,78 @@ type Class uint8
 const (
 	// ClassBulk is streams and datagrams that are not a call.
 	ClassBulk Class = iota
-	// ClassVoice is a client's calls and other small, live datagrams.
+	// ClassVoice is a client's calls and other small, live datagrams: a
+	// set of wires of different fates carries each.
 	ClassVoice
+	// ClassVideo is a client's video and screen: live, too big to copy, on
+	// one wire.
+	ClassVideo
 )
 
 func (c Class) String() string {
-	if c == ClassVoice {
+	switch c {
+	case ClassVoice:
 		return "voice"
+	case ClassVideo:
+		return "video"
 	}
 	return "bulk"
 }
 
-// Route is which wire each class goes on. AnyWire is any member, as a t1
-// session; a wire with no member up now is passed over for any member that
-// can carry the traffic.
+// Route is which wires each class goes on. AnyWire is any member, as a t1
+// session; a wire with no member up now is passed over for the best wire of
+// its fate that is up, else for any member that can carry the traffic.
 type Route struct {
-	Voice, Bulk WireID
+	// Voice is the voice class's main wire: its datagrams go there with
+	// their flow's copies, and with one copy on the best wire of the other
+	// fate that is up (fates.go voiceSetLocked).
+	Voice WireID
+	// VoiceSet, when it holds a wire, is the voice class's whole set
+	// instead. Either way TCP never carries voice alone while a wire of
+	// fate udp is up.
+	VoiceSet Set
+	// Bulk is the wire of streams and every other datagram.
+	Bulk WireID
+	// video is the video class's one wire plus one; zero, the zero value
+	// of a Route written without it, is Voice's main wire (Video,
+	// WithVideo).
+	video uint16
 }
 
-// AnyRoute is no preference for either class.
+// AnyRoute is no preference for any class.
 var AnyRoute = Route{Voice: AnyWire, Bulk: AnyWire}
 
-func (r Route) of(c Class) WireID {
-	if c == ClassVoice {
+// Video is the video class's one wire: its own, or Voice's main wire.
+func (r Route) Video() WireID {
+	if r.video == 0 {
 		return r.Voice
+	}
+	return WireID(r.video - 1)
+}
+
+// WithVideo is r with video on wire w; AnyWire is on Voice's main wire.
+func (r Route) WithVideo(w WireID) Route {
+	r.video = 0
+	if w != AnyWire {
+		r.video = uint16(w) + 1
+	}
+	return r
+}
+
+func (r Route) of(c Class) WireID {
+	switch c {
+	case ClassVoice:
+		return r.Voice
+	case ClassVideo:
+		return r.Video()
 	}
 	return r.Bulk
 }
 
 // FlowOptions shape a datagram flow (Session.OpenFlowWith).
 type FlowOptions struct {
-	// Copies is how many members carry each datagram; 0 is the session's.
+	// Copies is how many members of the main wire carry each datagram (of
+	// the one wire for a pin, video or bulk); 0 is the session's.
 	Copies int
 	// Class is the route the flow follows.
 	Class Class

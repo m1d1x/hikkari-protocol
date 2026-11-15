@@ -134,6 +134,7 @@ func (e *Entry) AddWire(w Wire) error {
 		w.Ports = e.ports
 	}
 	e.wires = append(e.wires, w)
+	e.shareFatesLocked()
 	return nil
 }
 
@@ -154,12 +155,30 @@ func (e *Entry) Wires() map[WireID]WireState { return e.Session().Wires() }
 
 // poolWire is the pool as a Wire.
 func (e *Entry) poolWire() Wire {
-	return Wire{ID: PoolWire, Name: "pool", Shape: "browser", Members: e.members, Dial: e.dial, Ports: e.ports, Streams: true}
+	return Wire{ID: PoolWire, Name: "pool", Shape: "browser", Fate: FateTCP, Members: e.members, Dial: e.dial, Ports: e.ports, Streams: true}
+}
+
+// fatesLocked is the fate of each of the entry's wires, the pool's too.
+func (e *Entry) fatesLocked() map[WireID]Fate {
+	out := map[WireID]Fate{PoolWire: FateTCP}
+	for _, w := range e.wires {
+		out[w.ID] = w.fate()
+	}
+	return out
+}
+
+// shareFatesLocked gives every session the wires' fates (fates.go).
+func (e *Entry) shareFatesLocked() {
+	fates := e.fatesLocked()
+	for _, g := range e.allLocked() {
+		g.s.setFates(fates)
+	}
 }
 
 func (e *Entry) newGeneration() (*generation, error) {
 	g := &generation{s: newSession(e.cfg, nil), runs: map[WireID]*wireRun{}}
 	g.s.route = e.route
+	g.s.fate.fates = e.fatesLocked()
 	if _, err := rand.Read(g.id[:]); err != nil {
 		return nil, err
 	}
@@ -315,6 +334,7 @@ func (e *Entry) SetWires(ws []Wire) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.wires = append([]Wire(nil), ws...)
+	e.shareFatesLocked()
 	if e.run == nil {
 		return nil
 	}
@@ -347,7 +367,7 @@ func (e *Entry) SetWires(ws []Wire) error {
 
 // sameWire says a running wire needs no restart for w.
 func sameWire(a, b Wire) bool {
-	return a.Name == b.Name && a.Shape == b.Shape && a.Members == b.Members && a.Streams == b.Streams && a.Packet == b.Packet && a.Knobs == b.Knobs
+	return a.Name == b.Name && a.Shape == b.Shape && a.Fate == b.Fate && a.Members == b.Members && a.Streams == b.Streams && a.Packet == b.Packet && a.Knobs == b.Knobs
 }
 
 // drained answers the exit's fDrain on g: a new generation comes up, takes
@@ -497,6 +517,7 @@ func (e *Entry) slot(ctx context.Context, g *generation, w Wire, n int) {
 			grow()
 			continue
 		}
+		noDelay(conn)
 		epoch, r, err := exchangeHello(conn, g.id, e.cfg.Observe != nil, w.kind())
 		if err != nil {
 			conn.Close()
