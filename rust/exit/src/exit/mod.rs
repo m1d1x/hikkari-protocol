@@ -122,6 +122,11 @@ pub struct Exit {
     relay_buf: Vec<u8>,
     /// A QUIC datagram read (h3.rs), and the members of closed connections.
     dgram_buf: Vec<u8>,
+    /// The trunk's call's answer being stamped (wire.rs flow_dgram), and the
+    /// wall clock less the monotonic one, taken on the members' clock: the
+    /// stamp is now plus it, no clock read per packet.
+    echo_buf: Vec<u8>,
+    wall_off: i64,
     gone: Vec<(usize, u32)>,
     carriers: [Seen; 2],
     msg: Vec<u8>,
@@ -171,6 +176,8 @@ impl Exit {
             wrecv: Some(RecvBatch::new(SLOT)),
             relay_buf: vec![0; 65535],
             dgram_buf: vec![0; crate::h3wire::DGRAM],
+            echo_buf: Vec::with_capacity(65535),
+            wall_off: sys::wall_ns() as i64 - now as i64,
             gone: Vec::with_capacity(16),
             carriers: [(NONE, 0); 2],
             msg: vec![0; 65536],

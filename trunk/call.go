@@ -20,12 +20,19 @@ import (
 // crosses the same leg with its own copies (Hikkari v1.02 over both its
 // channels): a call with one copy is what one of them gets here, a call with
 // two copies is what a client's plain UDP gets.
+//
+// Calls run side by side tick with one frame number (RunCalls): the call of
+// every wire sends frame n at the same moment, so the entry hears any set of
+// wires without a datagram more, a frame being heard if it came in time on
+// one of them. The exit writes its stamp and map into each answer (echo.go),
+// and the entry hears each direction apart, as a listener with a jitter
+// buffer would (hearing.go).
 
 // CallConfig shapes a call. Zero fields take the defaults.
 type CallConfig struct {
 	Copies int           // members per datagram; 0 is DefaultCopies
 	Every  time.Duration // one datagram this often; 20 ms, a voice frame
-	Size   int           // bytes of each datagram, at least 16
+	Size   int           // bytes of each datagram, at least 24 (the exit's stamp and map)
 	Window time.Duration // one report per window of the wall clock; a minute
 	// Grace is how long after its window an answer still counts. A later
 	// one is lost: no call plays a frame two seconds late.
@@ -59,7 +66,7 @@ func (c CallConfig) withDefaults() CallConfig {
 	if c.Every <= 0 {
 		c.Every = defaultCallEvery
 	}
-	if c.Size < 16 {
+	if c.Size < callStamped {
 		c.Size = defaultCallSize
 	}
 	if c.Size > MaxPayload {
@@ -90,6 +97,7 @@ type CallGap struct {
 // so Silent adds up, and GapMax and Worst are each window's part of it.
 type CallWindow struct {
 	Copies   int
+	Wire     WireID // the wire the call is held to; AnyWire for a call of the route
 	From, To time.Time
 	Sent     int
 	Got      int
@@ -102,6 +110,9 @@ type CallWindow struct {
 	Silent   time.Duration // how much longer than Every the pauses over 60 ms were, in all
 	Worst    []CallGap     // the longest pauses over 60 ms, longest first
 	Sessions int           // sessions the call used in the window (a drain of the exit moves it)
+	// Up and Down are what a listener at the exit and one at the entry
+	// heard of the frames sent in the window (hearing.go).
+	Up, Down CallHearing
 }
 
 // Lost is how many datagrams of the window got no answer in time.
@@ -124,6 +135,14 @@ type callSent struct {
 	at       time.Time
 	b        *callBucket // its window; nil for a seq never sent
 	answered bool
+	// had is the exit having had it, by its answer or by the map of a
+	// later one; exit is the exit's stamp of it and back when its answer
+	// came, unix ns of each end's wall clock, 0 for none (echo.go).
+	had        bool
+	exit, back int64
+	// sets has bit k for each set k of RunCalls the call's wire was in when
+	// the datagram went, lead for each the wire was the first of.
+	sets, lead uint8
 }
 
 // call is a running call's state, shared by its sender and the answers.
@@ -178,47 +197,117 @@ func RunCall(ctx context.Context, session func() *Session, cfg CallConfig, repor
 // RunCallOn is RunCall on any carrier: carrier gives the current one, and a
 // new one is a new flow, counted in the window's Sessions.
 func RunCallOn(ctx context.Context, carrier func() CallCarrier, cfg CallConfig, report func(CallWindow)) {
-	cfg = cfg.withDefaults()
-	c := newCall(cfg, time.Now())
-	var (
-		cur  CallCarrier
-		flow CallFlow
-		seq  uint64
-	)
+	RunCalls(ctx, carrier, []CallConfig{cfg}, nil, CallReports{Leg: func(_ int, w CallWindow) { report(w) }})
+}
+
+// CallSet is a set of wires a listener hears as one: a frame is heard if it
+// came in time on one of them (the voice class over two fates, hikkari-client
+// plans/2026-11-15-live-udp-two-fates.md).
+type CallSet struct {
+	Name string
+	// Wires is the set at the moment, asked every frame; a wire without a
+	// call held to it among the calls of RunCalls is not heard. The others'
+	// lag is measured behind the first (CallSetWindow).
+	Wires func() []WireID
+}
+
+// CallReports takes what RunCalls hears: Leg each call's window by its
+// place in the calls given, Set each set's. Both run on the calls' own
+// goroutine; either may be nil.
+type CallReports struct {
+	Leg func(i int, w CallWindow)
+	Set func(w CallSetWindow)
+}
+
+// maxCallSets is how many sets RunCalls hears (a bit of callSent's sets each).
+const maxCallSets = 8
+
+// callLeg is one call of RunCalls on its current carrier.
+type callLeg struct {
+	cfg     CallConfig
+	c       *call
+	cur     CallCarrier
+	flow    CallFlow
+	payload []byte
+}
+
+// send sends frame seq on carrier s, opening the call's flow anew on a new
+// carrier or after the last one ended.
+func (l *callLeg) send(s CallCarrier, seq uint64, now time.Time, sets, lead uint8) {
+	if s != l.cur || l.flow == nil {
+		if l.flow != nil {
+			l.flow.Close()
+		}
+		l.cur = s
+		o := FlowOptions{Copies: l.cfg.Copies, Class: ClassVoice, Pin: AnyWire}
+		if l.cfg.OnWire {
+			o.Pin = l.cfg.Wire
+		}
+		l.flow = s.OpenCallFlow(o, l.c.answer)
+	}
+	binary.BigEndian.PutUint64(l.payload, seq)
+	l.c.sentIn(seq, now, s, sets, lead)
+	if !l.flow.Send(l.payload) {
+		// The flow ended (the exit restarted under the session, or the
+		// session closed): this datagram is lost, the next opens anew.
+		l.flow = nil
+	}
+}
+
+// RunCalls keeps calls going side by side on one ticker until ctx ends: each
+// of legs sends frame n at the same moment (legs[0] gives Every, Window and
+// Grace to all), and each of sets (at most 8) is heard from the calls held
+// to its wires. carrier gives the current carrier, as for RunCallOn.
+func RunCalls(ctx context.Context, carrier func() CallCarrier, legs []CallConfig, sets []CallSet, rep CallReports) {
+	if len(legs) == 0 {
+		return
+	}
+	sets = sets[:min(len(sets), maxCallSets)]
+	g := &callGroup{sets: sets}
+	ls := make([]callLeg, len(legs))
+	start := time.Now()
+	for i, cfg := range legs {
+		cfg = cfg.withDefaults()
+		if i > 0 {
+			cfg.Every, cfg.Window, cfg.Grace = ls[0].cfg.Every, ls[0].cfg.Window, ls[0].cfg.Grace
+		}
+		ls[i] = callLeg{cfg: cfg, c: newCall(cfg, start), payload: make([]byte, cfg.Size)}
+		g.legs = append(g.legs, ls[i].c)
+	}
 	defer func() {
-		if flow != nil {
-			flow.Close()
+		for _, l := range ls {
+			if l.flow != nil {
+				l.flow.Close()
+			}
 		}
 	}()
-	t := time.NewTicker(cfg.Every)
+	t := time.NewTicker(ls[0].cfg.Every)
 	defer t.Stop()
-	payload := make([]byte, cfg.Size)
+	var seq uint64
+	in, lead := make([]uint8, len(ls)), make([]uint8, len(ls))
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-t.C:
-			if s := carrier(); s != cur || flow == nil {
-				if flow != nil {
-					flow.Close()
-				}
-				cur = s
-				o := FlowOptions{Copies: cfg.Copies, Class: ClassVoice, Pin: AnyWire}
-				if cfg.OnWire {
-					o.Pin = cfg.Wire
-				}
-				flow = s.OpenCallFlow(o, c.answer)
-			}
+			g.members(in, lead)
+			s := carrier()
 			seq++
-			binary.BigEndian.PutUint64(payload, seq)
-			c.sent(seq, now, cur)
-			if !flow.Send(payload) {
-				// The flow ended (the exit restarted under the session, or the
-				// session closed): this datagram is lost, the next opens anew.
-				flow = nil
+			for i := range ls {
+				ls[i].send(s, seq, now, in[i], lead[i])
 			}
-			for _, w := range c.due(now) {
-				report(w)
+			legWs, setWs := g.due(now)
+			for i, ws := range legWs {
+				for _, w := range ws {
+					if rep.Leg != nil {
+						rep.Leg(i, w)
+					}
+				}
+			}
+			for _, w := range setWs {
+				if rep.Set != nil {
+					rep.Set(w)
+				}
 			}
 		}
 	}
@@ -266,7 +355,11 @@ func (c *call) push(r callSent) {
 	c.n++
 }
 
-func (c *call) sent(seq uint64, at time.Time, s CallCarrier) {
+func (c *call) sent(seq uint64, at time.Time, s CallCarrier) { c.sentIn(seq, at, s, 0, 0) }
+
+// sentIn notes datagram seq sent at at on s, its wire in the sets of sets
+// and the first of those of lead.
+func (c *call) sentIn(seq uint64, at time.Time, s CallCarrier, sets, lead uint8) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.bucketLocked(at)
@@ -283,12 +376,12 @@ func (c *call) sent(seq uint64, at time.Time, s CallCarrier) {
 		// Older than every datagram kept: RunCall never numbers back.
 	case seq-c.base < uint64(c.n):
 		r := c.slot(seq)
-		r.at, r.b = at, b
+		r.at, r.b, r.sets, r.lead = at, b, sets, lead
 	default:
 		for c.base+uint64(c.n) < seq {
 			c.push(callSent{}) // a seq skipped: nothing was sent under it
 		}
-		c.push(callSent{at: at, b: b})
+		c.push(callSent{at: at, b: b, sets: sets, lead: lead})
 	}
 }
 
@@ -301,13 +394,34 @@ func (c *call) answerAt(now time.Time, p []byte) {
 		return
 	}
 	seq := binary.BigEndian.Uint64(p)
+	var exit int64
+	var bits uint64
+	if len(p) >= callStamped {
+		exit = int64(binary.BigEndian.Uint64(p[callStampAt:]))
+		bits = binary.BigEndian.Uint64(p[callMapAt:])
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if exit != 0 {
+		// The exit's map: the frames before this one it has had, whose
+		// answers may be lost on the way down.
+		for i := uint64(1); i < 64 && i < seq; i++ {
+			if bits&(1<<i) == 0 {
+				continue
+			}
+			if q := c.slot(seq - i); q != nil && q.b != nil && !q.b.closed {
+				q.had = true
+			}
+		}
+	}
 	r := c.slot(seq)
 	if r == nil || r.b == nil || r.b.closed || r.answered {
 		return // a window already reported, or a copy the replay window let by
 	}
 	r.answered = true
+	if exit != 0 {
+		r.had, r.exit, r.back = true, exit, now.UnixNano()
+	}
 	r.b.got++
 	r.b.rtts = append(r.b.rtts, now.Sub(r.at))
 	ab := c.bucketLocked(now)
@@ -317,6 +431,19 @@ func (c *call) answerAt(now time.Time, p []byte) {
 // due takes the windows whose Grace is over.
 func (c *call) due(now time.Time) []CallWindow {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	done := c.closeLocked(now)
+	if done == nil {
+		return nil
+	}
+	out := c.windowsLocked(done)
+	c.dropLocked()
+	return out
+}
+
+// closeLocked closes the windows whose Grace is over, oldest first: their
+// datagrams' answers no longer count.
+func (c *call) closeLocked(now time.Time) []*callBucket {
 	var done []*callBucket
 	open := c.buckets[:0]
 	for _, b := range c.buckets {
@@ -331,14 +458,41 @@ func (c *call) due(now time.Time) []CallWindow {
 		c.buckets[i] = nil
 	}
 	c.buckets = open
-	if done == nil {
-		c.mu.Unlock()
-		return nil
+	sort.Slice(done, func(i, j int) bool { return done[i].from.Before(done[j].from) })
+	return done
+}
+
+// windowsLocked is what the closed windows done heard, their datagrams still
+// in the ring.
+func (c *call) windowsLocked(done []*callBucket) []CallWindow {
+	out := make([]CallWindow, 0, len(done))
+	for _, b := range done {
+		// A window the call did not cover from its start (it started, or
+		// the box slept) is still reported: its pauses start at the call's
+		// first datagram, not before.
+		from := b.from
+		if c.start.After(from) {
+			from = c.start
+		}
+		w := c.cfg.window(b, from)
+		var frames []heardFrame
+		for i := 0; i < c.n; i++ {
+			if r := &c.ring[(c.head+i)&(len(c.ring)-1)]; r.b == b {
+				frames = append(frames, heardFrame{at: r.at, legs: []*callSent{r}, lead: -1})
+			}
+		}
+		h := hear(frames)
+		w.Up, w.Down = h.up, h.down
+		out = append(out, w)
 	}
-	// The datagrams of the windows reported leave from the ring's head. A
-	// wall clock set back can leave a later window's datagrams before an
-	// earlier one's: those stay until the head goes, and their answers do
-	// not count, their window being closed.
+	return out
+}
+
+// dropLocked takes the datagrams of the windows reported from the ring's
+// head. A wall clock set back can leave a later window's datagrams before an
+// earlier one's: those stay until the head goes, and their answers do not
+// count, their window being closed.
+func (c *call) dropLocked() {
 	for c.n > 0 {
 		r := &c.ring[c.head]
 		if r.b != nil && !r.b.closed {
@@ -349,24 +503,13 @@ func (c *call) due(now time.Time) []CallWindow {
 		c.n--
 		c.base++
 	}
-	c.mu.Unlock()
-	sort.Slice(done, func(i, j int) bool { return done[i].from.Before(done[j].from) })
-	out := make([]CallWindow, 0, len(done))
-	for _, b := range done {
-		// A window the call did not cover from its start (it started, or
-		// the box slept) is still reported: its pauses start at the call's
-		// first datagram, not before.
-		from := b.from
-		if c.start.After(from) {
-			from = c.start
-		}
-		out = append(out, c.cfg.window(b, from))
-	}
-	return out
 }
 
 func (cfg CallConfig) window(b *callBucket, from time.Time) CallWindow {
-	w := CallWindow{Copies: cfg.Copies, From: b.from, To: b.to, Sent: b.sent, Got: b.got, Sessions: len(b.sessions)}
+	w := CallWindow{Copies: cfg.Copies, Wire: AnyWire, From: b.from, To: b.to, Sent: b.sent, Got: b.got, Sessions: len(b.sessions)}
+	if cfg.OnWire {
+		w.Wire = cfg.Wire
+	}
 	if len(b.rtts) > 0 {
 		sort.Slice(b.rtts, func(i, j int) bool { return b.rtts[i] < b.rtts[j] })
 		w.RTTP50 = quantile(b.rtts, 50)

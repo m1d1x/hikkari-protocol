@@ -32,8 +32,10 @@ type flow struct {
 	// copies is how many members carry each datagram of the flow. The
 	// entry's is chosen at open; the exit's follows the entry's (dgramLocked).
 	copies int
-	// echo is a flow to EchoPort: the trunk's own call, not a client's.
-	echo bool
+	// echo is a flow to EchoPort: the trunk's own call, not a client's;
+	// echoed is the exit's map of its frames (echo.go).
+	echo   bool
+	echoed echoMap
 	// class and pin are the entry's: the route it follows, or the one wire
 	// it is held to (wires.go). wire is the exit's: the wire the entry last
 	// sent it on, where the answers go.
@@ -211,6 +213,7 @@ func (s *Session) dgramLocked(m *member, fr frame) {
 	f.used = time.Now()
 	f.in++
 	if f.echo && s.local != nil {
+		f.echoed.stamp(fr.payload, time.Now())
 		s.sendDgramLocked(f, fr.payload) // the exit's echo: straight back
 		return
 	}

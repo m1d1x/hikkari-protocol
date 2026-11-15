@@ -26,6 +26,14 @@ pub fn now_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
+/// The wall clock, unix ns: what the exit stamps the trunk's call with
+/// (hikkari_trunk::echo), the two ends' clocks being apart only by NTP.
+pub fn wall_ns() -> u64 {
+    let mut ts: libc::timespec = unsafe { zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
 pub fn sockaddr(a: SocketAddrV4) -> libc::sockaddr_in {
     let mut s: libc::sockaddr_in = unsafe { zeroed() };
     s.sin_family = libc::AF_INET as libc::sa_family_t;

@@ -326,7 +326,7 @@ func TestTheSelectorMovesVoiceOffACutWire(t *testing.T) {
 	// Two shapes, so the warm pair is the two wires.
 	sel := trunk.NewSelector(trunk.SelectorConfig{},
 		trunk.Wire{ID: 2, Name: names[2], Shape: "random"}, trunk.Wire{ID: 3, Name: names[3], Shape: "browser"})
-	go p.Run(ctx, sel, []trunk.WireID{2, 3}, nil, t.Logf)
+	go p.Run(ctx, sel, []trunk.WireID{2, 3}, nil, nil, nil, t.Logf)
 
 	waitFor(t, 5*time.Second, "both wires up", func() bool { return wireUp(p, 2, 2) && wireUp(p, 3, 2) })
 	waitFor(t, 5*time.Second, "a route for voice", func() bool { v := p.Route().Voice; return v == 2 || v == 3 })
