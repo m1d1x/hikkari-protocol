@@ -57,6 +57,9 @@ func TestExitGolden(t *testing.T) {
 	if _, err := putExitWire(h3); err == nil {
 		t.Fatal("a QUIC wire without its key's file taken")
 	}
+	if got := putExitCopies(4 * time.Millisecond); !reflect.DeepEqual(got, []byte{xCopies, 0xa0, 0x0f, 0, 0}) {
+		t.Fatalf("exit copies % x", got)
+	}
 	if got := putExitPorts([]uint16{8443, 80}); !reflect.DeepEqual(got, []byte{xPorts, 2, 0, 0xfb, 0x20, 0x50, 0}) {
 		t.Fatalf("ports % x", got)
 	}

@@ -129,6 +129,12 @@ pub struct Alone {
     /// it is checked by (None: the system's), how the members use their
     /// sessions. Their source ports come from `ports`.
     pub h3: Option<(String, Option<String>, hikkari_cronet::Usage)>,
+    /// Voice on two fates, as the people's route of 15.11: the wire with the
+    /// listen's copies and one copy on the pool (needs both).
+    pub two_fates: bool,
+    /// The pool's members of copies and their window (copies.rs; 0: none).
+    pub copy_members: usize,
+    pub copy_window_ns: u64,
 }
 
 pub struct Pipe {
@@ -162,6 +168,9 @@ pub struct Pipe {
     route: Route,
     /// The copies that leave after their carry's delay (carry.rs).
     later: Later,
+    /// The pool's members of copies and their window, from the brain's
+    /// B_COPIES, for every pool it sets (copies.rs).
+    pool_copies: (usize, u64),
     flows: Flows,
     tcp_listens: Vec<TcpListen>,
     swires: Vec<StreamWire>,
@@ -228,6 +237,7 @@ impl Pipe {
             h3s: Vec::new(),
             route: Route::one(ANY_WIRE),
             later: Later::new(),
+            pool_copies: (0, 0),
             flows: Flows::new(),
             tcp_listens: Vec::new(),
             swires: Vec::new(),
@@ -316,7 +326,13 @@ impl Pipe {
             };
             p.ports = Book::new(a.ports.0, a.ports.1, ports::DEAD_FOR_NS).map_err(io::Error::other)?;
             p.ports_range = a.ports;
-            p.swires.push(StreamWire::new(POOL_WIRE, reach, a.tcp_members, health::STALL));
+            let mut w = StreamWire::new(POOL_WIRE, reach, a.tcp_members, health::STALL);
+            w.set_copies(a.copy_members, a.copy_window_ns);
+            p.swires.push(w);
+            if a.two_fates && a.members > 0 {
+                let set = Set::of(&[Carry { wire: a.wire, copies: 0, after_ns: 0 }, Carry { wire: POOL_WIRE, copies: 1, after_ns: 0 }]);
+                p.route = Route { voice_set: set, ..Route::one(a.wire) };
+            }
             let now = now_ns();
             for li in 0..a.tcp_members {
                 p.redial(0, li, now);
@@ -350,7 +366,7 @@ impl Pipe {
             // pause of the pipe's own.
             self.judge.turn(prev, now);
             prev = now;
-            let next = self.timers(now).min(self.later.next_due());
+            let next = self.timers(now).min(self.later.next_due()).min(self.copies_due());
             if self.dirty {
                 self.rebuild_poll();
             }
@@ -407,6 +423,12 @@ impl Pipe {
             self.flush_links(now);
             busy = self.moved != moved0;
         }
+    }
+
+    /// When a pool's held window of copies is due (u64::MAX: none held):
+    /// an idle loop wakes for it.
+    fn copies_due(&self) -> u64 {
+        self.swires.iter().map(|w| w.copies_due()).filter(|&t| t != 0).min().unwrap_or(u64::MAX)
     }
 
     fn rebuild_poll(&mut self) {

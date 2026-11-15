@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 7
+const Version = 8
 
 // Brain → pipe.
 const (
@@ -44,6 +44,7 @@ const (
 	bAdopt  = 0x0b // one socket: the new end of a handoff
 	// tcp_listen and pool: the streams' part (rust/pipe/src/pipe/pool.rs).
 	bTCPListen = 0x0c // id u8, to u16; one socket: a listening TCP socket
+	bCopies    = 0x10 // members u8, window_us u32: the pool's members of copies and their window; 0 members: none
 	bPool      = 0x0d // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots
 	bClients   = 0x0e // the leg client → entry of the minute, now (answered by pClients)
 	bStats     = 0x0f // the counters of the minute line, now (answered by pStats)
@@ -186,6 +187,23 @@ type Pool struct {
 // roots that replace the system's ("": the system's).
 type ChromiumForm struct {
 	SNI, Key, Cronet, Roots string
+}
+
+// Copies is the pool's members of copies (rust/pipe/src/copies.rs,
+// spec/trunk.md "Copies on the pool"): Members of the pool carry datagrams'
+// copies and no client's stream, the copies of each Window held on one of
+// them and written at once. Members 0 is the pool as before: copies go
+// round every member, each written at once.
+type Copies struct {
+	Members int
+	Window  time.Duration
+}
+
+func putCopies(c Copies) ([]byte, error) {
+	if c.Members < 0 || c.Members > 255 || c.Window < 0 || c.Window > time.Second {
+		return nil, fmt.Errorf("pipectl: copies: %d members, window %v; want 0-255 and at most 1s", c.Members, c.Window)
+	}
+	return binary.LittleEndian.AppendUint32([]byte{bCopies, byte(c.Members)}, uint32(c.Window/time.Microsecond)), nil
 }
 
 func putTCPListen(id byte, to uint16) []byte {

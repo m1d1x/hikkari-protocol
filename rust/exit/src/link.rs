@@ -52,6 +52,10 @@ pub struct Link {
     /// it takes bytes (edge-triggered: told once, until it would block).
     pub can_read: bool,
     pub can_write: bool,
+    /// The entry sent a stream's frame on it (an open, a chunk, a FIN, an
+    /// ack): it is not one of the pool's members of copies, whose answers
+    /// are held for the window (spec/trunk.md, "Copies on the pool").
+    pub streams: bool,
 }
 
 impl Link {
@@ -72,6 +76,7 @@ impl Link {
             accepted_at: 0,
             can_read: false,
             can_write: false,
+            streams: false,
         }
     }
 
@@ -107,10 +112,11 @@ impl Link {
         }
     }
 
-    /// Writes what waits, as much as the socket takes: false when it failed.
-    pub fn flush(&mut self) -> bool {
+    /// Writes what waits, as much as the socket takes, unless it is held for
+    /// its window: false when it failed.
+    pub fn flush(&mut self, now: u64) -> bool {
         let Some(fd) = &self.fd else { return true };
-        while self.can_write && self.out.pending() {
+        while self.can_write && self.out.due(now) {
             match sys::write(fd, self.out.bytes()) {
                 Io::Done(n) => self.out.wrote(n),
                 Io::Again => self.can_write = false,
@@ -161,6 +167,7 @@ impl Links {
         l.inflight = 0;
         l.owing = 0;
         l.accepted_at = now;
+        l.streams = false;
         // A socket just taken may hold its hello already: read it at once.
         l.can_read = true;
         l.can_write = true;

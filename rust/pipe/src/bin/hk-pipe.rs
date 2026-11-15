@@ -62,6 +62,9 @@ mod linux {
             tcp_chromium: None,
             ports: (hikkari_trunk::ports::LO, hikkari_trunk::ports::HI),
             h3: None,
+            two_fates: false,
+            copy_members: 0,
+            copy_window_ns: 0,
         };
         let (mut h3, mut h3_roots, mut usage): (Option<String>, Option<String>, hikkari_cronet::Usage) = (None, None, Default::default());
         let (mut chromium, mut roots, mut cronet): (Option<String>, Option<String>, Option<String>) = (None, None, None);
@@ -86,6 +89,9 @@ mod linux {
                 "--gro" => gro = v == "1",
                 "--wire-id" => a.wire = v.parse().expect("--wire-id"),
                 "--copies" => a.copies = v.parse().expect("--copies"),
+                "--two-fates" => a.two_fates = v == "1",
+                "--copy-members" => a.copy_members = v.parse().expect("--copy-members"),
+                "--copy-window-us" => a.copy_window_ns = v.parse::<u64>().expect("--copy-window-us") * 1000,
                 "--flow-idle-ms" => flow_idle_ms = Some(v.parse().expect("--flow-idle-ms")),
                 "--take-over-ms" => take_over_ms = Some(v.parse().expect("--take-over-ms")),
                 "--retire-ms" => retire_ms = Some(v.parse().expect("--retire-ms")),

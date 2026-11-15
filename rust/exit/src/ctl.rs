@@ -5,7 +5,7 @@
 //! trunk/pipectl (exitmsg.go); both sides hold the same golden bytes in their
 //! tests. Here are only the messages, so they are tested on any platform.
 
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 // Brain → exit.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -16,6 +16,7 @@ pub const B_GEN: u8 = 0x0c; // gen u8: the generation the exit's QUIC connection
 pub const B_DRAIN: u8 = 0x0d; // one fd: the old end of a handoff (hikkari_trunk::handoff)
 pub const B_ADOPT: u8 = 0x0e; // one fd: the new end of a handoff
 pub const B_MARK: u8 = 0x0f; // kind u8, session [16], stream u32, id u64: a tester's stream or flow (spec/trunk.md, "Observation")
+pub const B_COPIES: u8 = 0x11; // window_us u32: answers on a stream member that carried no stream are held this long (spec/trunk.md, "Copies on the pool"); 0: none
 pub const B_LINK: u8 = 0x10; // one fd: a stream member's connected socket, as if accepted on the pool's port
 
 // Exit → brain.
@@ -58,6 +59,9 @@ pub enum Msg<'a> {
     /// A stream member the brain accepted itself (the relay takes its
     /// CONNECT): its connected socket comes with the message.
     Link,
+    /// How long answers wait on a pool's member of copies for the ones
+    /// after them (spec/trunk.md, "Copies on the pool"); 0: not at all.
+    Copies { window_us: u32 },
     /// The exit's generation (spec/trunk.md, "An exit's own process
     /// replaced"): every QUIC connection id it issues names it.
     Gen { gen: u8 },
@@ -131,6 +135,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_DRAIN => Msg::Drain,
         B_ADOPT => Msg::Adopt,
         B_LINK => Msg::Link,
+        B_COPIES => Msg::Copies { window_us: r.u32()? },
         B_MARK => Msg::Mark { kind: r.u8()?, session: r.take(16)?.try_into().ok()?, stream: r.u32()?, id: r.u64()? },
         _ => return None,
     };
@@ -425,10 +430,13 @@ mod tests {
         assert!(matches!(parse(&[B_DRAIN]), Some(Msg::Drain)));
         assert!(matches!(parse(&[B_ADOPT]), Some(Msg::Adopt)));
         assert!(matches!(parse(&[B_LINK]), Some(Msg::Link)));
+        // exitCopiesGolden: answers held 4 ms on a member of copies.
+        assert!(matches!(parse(&[B_COPIES, 0xa0, 0x0f, 0, 0]), Some(Msg::Copies { window_us: 4000 })));
+        assert!(parse(&[B_COPIES, 0xa0, 0x0f, 0]).is_none());
         assert!(parse(&[B_LINK, 0]).is_none());
         let mut b = [0u8; 16];
         let n = put_hello(&mut b, 0x0102_0304);
-        assert_eq!(&b[..n], &[P_HELLO, 3, 0, 4, 3, 2, 1]);
+        assert_eq!(&b[..n], &[P_HELLO, 4, 0, 4, 3, 2, 1]);
         let t = Tick {
             pause_ago_ms: NONE_MS,
             pauses: 1,

@@ -74,7 +74,7 @@ func (x *Exit) Handoff(next *Exit, gen byte) error {
 	for _, w := range x.wires {
 		wires = append(wires, w)
 	}
-	pool, ports := x.pool, append([]uint16(nil), x.ports...)
+	pool, ports, window := x.pool, append([]uint16(nil), x.ports...), x.copyWindow
 	x.mu.Unlock()
 	for _, w := range wires {
 		if err := next.SetWire(w); err != nil {
@@ -87,6 +87,9 @@ func (x *Exit) Handoff(next *Exit, gen byte) error {
 		}
 	}
 	if err := next.SetPorts(ports); err != nil {
+		return err
+	}
+	if err := next.SetCopyWindow(window); err != nil {
 		return err
 	}
 	return x.Drain(old)

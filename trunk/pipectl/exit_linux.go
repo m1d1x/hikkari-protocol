@@ -65,13 +65,16 @@ type Exit struct {
 
 	wmu sync.Mutex
 
-	mu     sync.Mutex
-	pid    int
-	wires  map[trunk.WireID]ExitWire
-	pool   *exitPool
-	ports  []uint16
-	tick   ExitTick
-	tickAt time.Time
+	mu    sync.Mutex
+	pid   int
+	wires map[trunk.WireID]ExitWire
+	pool  *exitPool
+	ports []uint16
+	// copyWindow is the window answers wait on a member of copies
+	// (SetCopyWindow), for a reload.
+	copyWindow time.Duration
+	tick       ExitTick
+	tickAt     time.Time
 
 	hello chan struct{}
 	// tags are what the streams and flows the brain marked were marked
@@ -193,6 +196,22 @@ func (x *Exit) SetPorts(ports []uint16) error {
 	}
 	x.mu.Lock()
 	x.ports = append([]uint16(nil), ports...)
+	x.mu.Unlock()
+	return nil
+}
+
+// SetCopyWindow is how long the exit holds answers on a stream member that
+// carried no stream, a pool's member of copies (spec/trunk.md, "Copies on
+// the pool"): the answers of a window go down in one write. 0 holds none.
+func (x *Exit) SetCopyWindow(window time.Duration) error {
+	if window < 0 || window > time.Second {
+		return fmt.Errorf("pipectl: a window of copies %v, want 0 to 1s", window)
+	}
+	if err := x.send(putExitCopies(window)); err != nil {
+		return err
+	}
+	x.mu.Lock()
+	x.copyWindow = window
 	x.mu.Unlock()
 	return nil
 }

@@ -25,6 +25,10 @@
 //!
 //! A carry with a delay (after_ns) puts the copy in Later, sent by the loop
 //! when its time comes (trunk laterLocked): no thread, nothing allocated.
+//!
+//! A pool with members of copies (copies.rs) takes a datagram on its
+//! window's member first, then on the next members of copies, each held
+//! for the window; with none of them up, on its members in turn as before.
 
 use std::collections::VecDeque;
 
@@ -270,7 +274,7 @@ fn send_on(wires: &mut [Wire], swires: &mut [StreamWire], sess: u8, wire: u8, co
         }
     }
     for w in swires.iter_mut().filter(|w| takes(w.id, w.sess)) {
-        n += on_streams(w, copies - n, id, seq, port, p);
+        n += on_streams(w, copies - n, id, seq, port, p, now);
         if n == copies {
             break;
         }
@@ -302,9 +306,14 @@ fn on_packets(w: &mut Wire, want: usize, id: u32, seq: u32, port: u16, p: &[u8],
     n
 }
 
-/// The next `want` stream members up after the wire's last one; a member
+/// The next `want` stream members up after the wire's last one, or its
+/// window's member of copies and the ones after it (copies.rs); a member
 /// whose out buffer is full drops it.
-fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: &[u8]) -> usize {
+#[allow(clippy::too_many_arguments)]
+fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+    if let Some(first) = w.window_member(now) {
+        return on_copies(w, first, want, id, seq, port, p, now);
+    }
     let (len, start) = (w.links.len(), w.rr);
     let (mut n, mut put) = (0, false);
     for k in 1..=len {
@@ -325,6 +334,35 @@ fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: 
         n += 1;
     }
     if put {
+        w.t.up_pkts += 1;
+        w.t.up_bytes += p.len() as u64;
+    }
+    n
+}
+
+/// `want` members of copies up from the window's, each frame held for the
+/// window.
+#[allow(clippy::too_many_arguments)]
+fn on_copies(w: &mut StreamWire, first: usize, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+    let (len, window) = (w.links.len(), w.copies.window_ns);
+    let (mut n, mut put) = (0, false);
+    for k in 0..len {
+        if n == want {
+            break;
+        }
+        let li = (first + k) % len;
+        if !w.is_copy(li) || !w.links[li].h.up {
+            continue;
+        }
+        if w.links[li].out.frame_held(DGRAM_HEAD + p.len(), now, window, |b| frame::put_dgram(b, id, seq, port, p)) {
+            put = true;
+        } else {
+            w.t.dropped += 1;
+        }
+        n += 1;
+    }
+    if put {
+        w.copies.frames += 1;
         w.t.up_pkts += 1;
         w.t.up_bytes += p.len() as u64;
     }

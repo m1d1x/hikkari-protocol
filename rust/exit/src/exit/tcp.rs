@@ -192,6 +192,9 @@ impl Exit {
                 ok = false;
                 break;
             }
+            if matches!(fr, Frame::Open { .. } | Frame::Data { .. } | Frame::Fin { .. } | Frame::Ack { .. }) {
+                self.links.all[li].streams = true;
+            }
             match fr {
                 Frame::Hello => {
                     if !self.link_hello(li, &inb[..n], at, now) {
@@ -284,7 +287,7 @@ impl Exit {
     pub(super) fn flush_links(&mut self, now: u64) {
         for li in 0..self.links.all.len() {
             let l = &mut self.links.all[li];
-            if l.live && l.out.pending() && !l.flush() {
+            if l.live && l.out.pending() && !l.flush(now) {
                 self.link_down(li, Down::Gone, now);
             }
         }

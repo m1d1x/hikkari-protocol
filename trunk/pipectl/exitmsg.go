@@ -17,19 +17,20 @@ import (
 // entry's members and their streams.
 
 // ExitVersion is the exit's socket's version.
-const ExitVersion = 3
+const ExitVersion = 4
 
 // Brain → exit.
 const (
-	xHello = 0x01 // ver u16
-	xWire  = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; on FormH3Dgram then cert_len u16, cert path, key_len u16, key path; one socket
-	xPorts = 0x0a // n u16, port u16 × n
-	xPool  = 0x0b // dead_ms u16, quiet_ms u32; one socket: the pool's listening TCP socket, or none (members come by xLink)
-	xGen   = 0x0c // gen u8: the generation the exit's QUIC connection ids name, before any wire
-	xDrain = 0x0d // one socket: the old end of a handoff (HandoffLink)
-	xAdopt = 0x0e // one socket: the new end of a handoff
-	xMark  = 0x0f // kind u8, session [16], stream u32, id u64: a tester's stream or flow
-	xLink  = 0x10 // one socket: a stream member's connected socket, as if accepted on the pool's port
+	xHello  = 0x01 // ver u16
+	xWire   = 0x03 // id u8, form u8, glue_us u32, glue_max u16, dead_ms u16, quiet_ms u32, n u8, keys [32] × n; on FormH3Dgram then cert_len u16, cert path, key_len u16, key path; one socket
+	xPorts  = 0x0a // n u16, port u16 × n
+	xPool   = 0x0b // dead_ms u16, quiet_ms u32; one socket: the pool's listening TCP socket, or none (members come by xLink)
+	xGen    = 0x0c // gen u8: the generation the exit's QUIC connection ids name, before any wire
+	xDrain  = 0x0d // one socket: the old end of a handoff (HandoffLink)
+	xAdopt  = 0x0e // one socket: the new end of a handoff
+	xMark   = 0x0f // kind u8, session [16], stream u32, id u64: a tester's stream or flow
+	xLink   = 0x10 // one socket: a stream member's connected socket, as if accepted on the pool's port
+	xCopies = 0x11 // window_us u32: answers on a stream member that carried no stream wait this long (spec/trunk.md, "Copies on the pool"); 0: none
 )
 
 // Exit → brain.
@@ -91,6 +92,10 @@ func putExitWire(w ExitWire) ([]byte, error) {
 func putExitPool(stall, quiet time.Duration) []byte {
 	b := binary.LittleEndian.AppendUint16([]byte{xPool}, uint16(stall/time.Millisecond))
 	return binary.LittleEndian.AppendUint32(b, uint32(quiet/time.Millisecond))
+}
+
+func putExitCopies(window time.Duration) []byte {
+	return binary.LittleEndian.AppendUint32([]byte{xCopies}, uint32(window/time.Microsecond))
 }
 
 func putExitPorts(ports []uint16) []byte {

@@ -90,6 +90,10 @@ impl Exit {
                 let fd = sys::stream_from_fd(fds.remove(0)).map_err(|e| format!("exit: a member's socket: {e}"))?;
                 self.link(fd, sys::now_ns())
             }
+            Msg::Copies { window_us } => {
+                self.copy_window_ns = window_us as u64 * 1_000;
+                Ok(())
+            }
             Msg::Gen { gen } => {
                 self.set_gen(gen);
                 Ok(())

@@ -9,6 +9,12 @@
 //! Nothing is allocated per frame: an Out is allocated once, and a chunk of
 //! a local connection's bytes is read straight into it behind its frame's
 //! head (chunk_room, chunk_buf, chunk_done).
+//!
+//! A member that carries only datagrams' copies holds its frames for a
+//! window (spec/trunk.md, "Copies on the pool"): a write into Chromium costs
+//! about the same for one frame as for twenty, so the copies of a window go
+//! in one write (frame_held, due). Any other frame ends the hold: it is due
+//! at once, and the copies before it go with it.
 
 use crate::frame::{self, DATA_HEAD};
 use crate::stream::INFLIGHT;
@@ -24,12 +30,18 @@ pub const SPARE: usize = 64 << 10;
 /// A member's in buffer: room for several frames of the largest chunk a
 /// frame can carry (n is u16).
 pub const IN: usize = 256 << 10;
+/// What a held window waits for at most: one TLS record's worth, past which
+/// waiting saves no write.
+pub const HOLD_MAX: usize = 16 << 10;
 
 /// Frames waiting for the member's socket, at buf[head..tail].
 pub struct Out {
     buf: Box<[u8]>,
     head: usize,
     tail: usize,
+    /// When what waits is held to: frames held since the out buffer was
+    /// empty, every one of them a held one (0: due at once).
+    hold_until: u64,
 }
 
 impl Default for Out {
@@ -40,12 +52,13 @@ impl Default for Out {
 
 impl Out {
     pub fn new() -> Out {
-        Out { buf: vec![0; OUT].into_boxed_slice(), head: 0, tail: 0 }
+        Out { buf: vec![0; OUT].into_boxed_slice(), head: 0, tail: 0, hold_until: 0 }
     }
 
     pub fn clear(&mut self) {
         self.head = 0;
         self.tail = 0;
+        self.hold_until = 0;
     }
 
     pub fn pending(&self) -> bool {
@@ -70,14 +83,51 @@ impl Out {
     }
 
     /// One frame of at most `need` bytes, written by `put`; false when the
-    /// buffer has no room for it.
+    /// buffer has no room for it. It is due at once, with all that waits.
     #[inline]
     pub fn frame(&mut self, need: usize, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
         if !self.room(need) {
             return false;
         }
         self.tail += put(&mut self.buf[self.tail..]);
+        self.hold_until = 0;
         true
+    }
+
+    /// A frame that may wait `window_ns` from `now` for the ones after it:
+    /// held when the buffer was empty, or held already (the window is the
+    /// first frame's); behind a frame that is due it is due too. A window
+    /// of 0 is `frame`.
+    #[inline]
+    pub fn frame_held(&mut self, need: usize, now: u64, window_ns: u64, put: impl FnOnce(&mut [u8]) -> usize) -> bool {
+        let was_empty = !self.pending();
+        if !self.room(need) {
+            return false;
+        }
+        self.tail += put(&mut self.buf[self.tail..]);
+        if window_ns == 0 {
+            self.hold_until = 0;
+        } else if was_empty {
+            self.hold_until = now + window_ns;
+        }
+        true
+    }
+
+    /// Whether what waits goes to the socket now: something waits, and it is
+    /// not held, or its window is over, or it holds HOLD_MAX.
+    #[inline]
+    pub fn due(&self, now: u64) -> bool {
+        self.pending() && (self.hold_until == 0 || now >= self.hold_until || self.tail - self.head >= HOLD_MAX)
+    }
+
+    /// When held frames are due, for the loop's wake-up; 0: none held.
+    #[inline]
+    pub fn held_until(&self) -> u64 {
+        if self.pending() {
+            self.hold_until
+        } else {
+            0
+        }
     }
 
     /// Room for a chunk of up to `n` bytes, leaving SPARE: the bytes a chunk
@@ -97,6 +147,7 @@ impl Out {
     pub fn chunk_done(&mut self, stream: u32, off: u64, n: usize) {
         frame::put_data_head(&mut self.buf[self.tail..], stream, off, n as u16);
         self.tail += DATA_HEAD + n;
+        self.hold_until = 0;
     }
 
     /// What waits for the socket, in order.
@@ -109,6 +160,9 @@ impl Out {
     #[inline]
     pub fn wrote(&mut self, n: usize) {
         self.head += n;
+        if self.head == self.tail {
+            self.hold_until = 0;
+        }
     }
 }
 
@@ -181,6 +235,37 @@ mod tests {
             o.chunk_done(1, 0, k);
         }
         assert!(o.frame(30, |b| frame::put_ack(b, 1, 0, 0, 0, 0)), "an ack fits in the spare");
+    }
+
+    #[test]
+    fn held_copies_wait_for_their_window_and_a_frame_that_is_not_ends_it() {
+        let mut o = Out::new();
+        let dg = |b: &mut [u8]| frame::put_dgram(b, 5, 1, 443, &[1, 2, 3]);
+        assert!(o.frame_held(64, 1_000, 4_000, dg));
+        assert!(o.frame_held(64, 3_000, 4_000, dg));
+        assert!(!o.due(4_999), "within the first frame's window");
+        assert_eq!(o.held_until(), 5_000);
+        assert!(o.due(5_000));
+        let all = o.bytes().len();
+        o.wrote(all);
+        assert_eq!(o.held_until(), 0);
+        // A ping behind held copies takes them at once.
+        assert!(o.frame_held(64, 10_000, 4_000, dg));
+        assert!(o.frame(9, |b| frame::put_ping(b, frame::F_PING, 1)));
+        assert!(o.due(10_000));
+        // A copy behind a frame that is due is due too.
+        assert!(o.frame_held(64, 10_000, 4_000, dg));
+        assert!(o.due(10_000));
+        o.clear();
+        // A full record's worth goes before its window.
+        while o.bytes().len() < HOLD_MAX {
+            assert!(o.frame_held(1200, 20_000, 4_000, |b| frame::put_dgram(b, 5, 1, 443, &[0; 1100])));
+        }
+        assert!(o.due(20_000));
+        // No window: due at once.
+        o.clear();
+        assert!(o.frame_held(64, 30_000, 0, dg));
+        assert!(o.due(30_000));
     }
 
     #[test]

@@ -137,6 +137,10 @@ pub struct Exit {
     pause: Judge,
     clock_at: u64,
     late_max: u64,
+    /// How long answers wait on a pool's member of copies (B_COPIES): the
+    /// answers of a window go down in one write (spec/trunk.md, "Copies on
+    /// the pool").
+    copy_window_ns: u64,
     tick_at: u64,
     stats_at: u64,
     moved: u64,
@@ -176,6 +180,7 @@ impl Exit {
             wrecv: Some(RecvBatch::new(SLOT)),
             relay_buf: vec![0; 65535],
             dgram_buf: vec![0; crate::h3wire::DGRAM],
+            copy_window_ns: 0,
             echo_buf: Vec::with_capacity(65535),
             wall_off: sys::wall_ns() as i64 - now as i64,
             gone: Vec::with_capacity(16),
@@ -251,7 +256,7 @@ impl Exit {
                 }
             }
             prev = now;
-            let next = self.timers(now);
+            let next = self.timers(now).min(self.held_until());
             if self.dirty {
                 self.rebuild_poll();
             }
@@ -294,6 +299,15 @@ impl Exit {
             self.seal_due(now_ns());
             busy = self.moved != moved0;
         }
+    }
+
+    /// When the first answers held for their window are due (u64::MAX:
+    /// none held): an idle loop wakes for them.
+    fn held_until(&self) -> u64 {
+        if self.copy_window_ns == 0 {
+            return u64::MAX;
+        }
+        self.links.all.iter().filter(|l| l.live).map(|l| l.out.held_until()).filter(|&t| t != 0).min().unwrap_or(u64::MAX)
     }
 
     /// The poll set: the brain, each wire (waited for only while the exit

@@ -228,3 +228,49 @@ fn a_frame_on_a_stream_member_is_the_dgram_the_exit_reads() {
         other => panic!("not one dgram frame: {:?}", other.map(|x| x.1)),
     }
 }
+
+/// Copies on the pool (spec/trunk.md, "Copies on the pool"): a window's
+/// copies all go on one member of copies, held for the window; the next
+/// window goes on the next member of copies; a member of copies that died
+/// gives its place and the copies go on with no gap.
+#[test]
+fn a_windows_copies_go_on_one_member_of_copies_held() {
+    let mut ps = [pool(POOL, 8, &[])];
+    ps[0].set_copies(4, 4_000_000);
+    let r = route(POOL, POOL);
+    let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
+    let mut later = Later::new();
+    for t in 0..20u64 {
+        carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 1_000 + t * 100_000);
+    }
+    let held = carried(&[], &ps);
+    assert_eq!(held.len(), 1, "one member holds the window: {held:?}");
+    let li = ps[0].copies.at;
+    assert!(ps[0].is_copy(li) && held[0] == format!("{POOL}/{li}×20"));
+    assert!(!ps[0].links[li].out.due(3_000_000), "held for the window");
+    assert!(ps[0].links[li].out.due(4_001_000));
+    // The next window, after its member's copies left: the next member.
+    ps[0].links[li].out.clear();
+    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_002_000);
+    let next = ps[0].copies.at;
+    assert!(next != li && ps[0].is_copy(next));
+    // It dies: the next copy goes on a member up at once.
+    ps[0].links[next].h.down();
+    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_003_000);
+    let after = ps[0].copies.at;
+    assert!(after != next && ps[0].links[after].h.up && ps[0].is_copy(after));
+    assert_eq!((0..8).filter(|&i| ps[0].is_copy(i)).count(), 4);
+}
+
+/// With no members of copies the pool goes round as before, each copy due at
+/// once.
+#[test]
+fn no_members_of_copies_go_round_due_at_once() {
+    let mut ps = [pool(POOL, 4, &[])];
+    let r = route(POOL, POOL);
+    let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
+    let later = send(&mut [], &mut ps, &r, &mut f, 4);
+    assert_eq!(later.next_due(), u64::MAX);
+    assert_eq!(carried(&[], &ps).len(), 4);
+    assert!(ps[0].links.iter().all(|l| l.out.due(10)));
+}

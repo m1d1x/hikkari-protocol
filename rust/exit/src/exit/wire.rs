@@ -251,7 +251,7 @@ impl Exit {
     /// A set that has no member up goes on any member up of the session,
     /// packet members first (trunk sendDgramLocked on the exit).
     pub(super) fn answer(&mut self, fi: usize, payload: &[u8], now: u64) {
-        let Exit { flows, sessions, peers, wires, carriers, links, .. } = self;
+        let Exit { flows, sessions, peers, wires, carriers, links, copy_window_ns, .. } = self;
         let f = &mut flows.all[fi];
         f.seq = f.seq.wrapping_add(1);
         f.obs.out += 1;
@@ -282,8 +282,12 @@ impl Exit {
             match link_slot(m) {
                 // A member whose buffer is full takes no writes and dies by
                 // its stall: the answer is lost, as on a full socket.
+                // On a member of copies (no stream on it), held for the
+                // window: the answers of a window go in one write.
                 Some(li) => {
-                    let _ = links.all[li].out.frame(len, |b| frame::put_dgram(b, stream, seq, port, payload));
+                    let l = &mut links.all[li];
+                    let window = if l.streams { 0 } else { *copy_window_ns };
+                    let _ = l.out.frame_held(len, now, window, |b| frame::put_dgram(b, stream, seq, port, payload));
                 }
                 None => {
                     let p = &mut peers[m.0];

@@ -80,6 +80,7 @@ impl Pipe {
         let Some(wi) = self.swires.iter().position(|w| w.id == id && w.sess == sess) else {
             let mut w = StreamWire::new(id, reach, members, stall_ns);
             w.sess = sess;
+            w.set_copies(self.pool_copies.0, self.pool_copies.1);
             let wi = match self.swires.iter().position(|w| w.sess == crate::link::NO_SESSION) {
                 Some(i) => {
                     self.swires[i] = w;
@@ -110,12 +111,22 @@ impl Pipe {
         while w.links.len() < members {
             w.links.push(Link::new());
         }
+        w.set_copies(self.pool_copies.0, self.pool_copies.1);
         for li in 0..members {
             if self.swires[wi].links[li].renew_at == 0 {
                 self.redial(wi, li, now);
             }
         }
         Ok(())
+    }
+
+    /// The pool's members of copies and their window (B_COPIES), on every
+    /// pool now and on the ones set after.
+    pub(super) fn set_copies(&mut self, members: u8, window_us: u32) {
+        self.pool_copies = (members as usize, window_us as u64 * 1_000);
+        for w in &mut self.swires {
+            w.set_copies(self.pool_copies.0, self.pool_copies.1);
+        }
     }
 
     /// Every stream member down (a new book of source ports): what they

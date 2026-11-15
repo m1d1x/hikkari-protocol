@@ -74,7 +74,7 @@ impl Why {
 /// with room under INFLIGHT.
 pub(super) fn pick(wires: &[StreamWire], sess: u8, bulk: u8, chunk: bool) -> Option<(usize, usize)> {
     let only = wires.iter().any(|w| w.id == bulk && w.sess == sess && w.up() > 0);
-    let mut best: Option<(usize, usize, usize)> = None;
+    let mut best: Option<(usize, usize, (bool, usize))> = None;
     for (wi, w) in wires.iter().enumerate() {
         if w.sess != sess || only && w.id != bulk {
             continue;
@@ -83,8 +83,11 @@ pub(super) fn pick(wires: &[StreamWire], sess: u8, bulk: u8, chunk: bool) -> Opt
             if !l.h.up || chunk && !l.takes_chunk() {
                 continue;
             }
-            if best.is_none_or(|b| l.inflight < b.2) {
-                best = Some((wi, li, l.inflight));
+            // A member of copies carries a stream's frame only when no
+            // other member can (copies.rs).
+            let key = (w.is_copy(li), l.inflight);
+            if best.is_none_or(|b| key < b.2) {
+                best = Some((wi, li, key));
             }
         }
     }
@@ -436,7 +439,7 @@ impl Pipe {
                 }
                 let l = &mut self.swires[wi].links[li];
                 let Some(sock) = &mut l.sock else { continue };
-                if let Io::Gone = link::flush(&mut l.out, sock) {
+                if let Io::Gone = link::flush(&mut l.out, sock, now) {
                     let down = gone(l);
                     self.link_down(wi, li, down, now);
                 }
@@ -620,6 +623,7 @@ pub(super) fn stats(streams: &Streams, wires: &[StreamWire], ports: &Book) -> St
     );
     for w in wires.iter().filter(|w| w.sess != link::NO_SESSION) {
         s += &format!(" | swire {}/{} up={}/{} frames={}/{} dropped={}", w.id, w.sess, w.up(), w.links.len(), w.t.up_pkts, w.t.down_pkts, w.t.dropped);
+        s += &w.copies.line();
     }
     let (dead, kills) = ports.dead_now();
     s + &format!(" | ports free={} dead={dead} kills={kills}", ports.free())

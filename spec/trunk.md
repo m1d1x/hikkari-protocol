@@ -139,6 +139,25 @@ every 20 ms, and with Nagle the kernel holds it until the last one is acknowledg
 TCP socket of its own; the entry's Chromium sets it on the pool's sockets, and the relay that hands the exit its members
 accepts them on Go's TCP, which sets it on every socket.
 
+### Copies on the pool
+
+A write into a pool's member costs much the same for one frame as for many: on the entry each is an HTTP/2 DATA frame, a
+TLS record, a `sendmsg` and a hand-over to Chromium's thread; on the exit the relay seals each write it is handed. So the
+pool may carry the datagrams' copies on members of their own, written a window at a time (hikkari-client
+`plans/2026-11-15-pool-copy-coalescing.md`). The wire's bytes do not change: a window is dgram frames one after another on
+the member's stream, as any frames are, each with its stream, `seq` and port.
+
+The entry sets K members of copies (the brain's `copies`, 4 of the pool's 32 by default; 0 is none, and copies go round
+every member as above). A member of copies carries datagrams and its own pings and pongs, and a stream's frame only when no
+other member is up. The copies of one window, W from the first of them (4 ms by default), all go on one member of copies
+and leave in one write once the window is over, or sooner once they hold 16 KiB; the next window goes on the next member
+of copies up. A member of copies that goes down leaves at the next window, and the member up that owes least takes its
+place, so a copy never waits for a new connection. Any other frame on a member ends its window: what waits goes at once.
+
+The exit holds its answers the same way, for its own window (the brain's `copy window`, 4 ms by default, 0 none), on a
+member the entry never sent a stream's frame on (an open, a chunk, a FIN, an ack): the answers go where the flow's
+datagrams came, so on the entry's members of copies.
+
 A flow to port 0 is the trunk's own call (`call.go`): the exit sends every datagram straight back, with no socket, as it
 came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, both of the voice class on
 its set (Wires), and one held to each wire, a datagram every 20 ms, and reports each minute of the wall clock: sent, answered within 2 s, round trips,

@@ -55,6 +55,16 @@ func (p *Pipe) SetPool(w Pool) error {
 	return p.setFate(w.ID, w.Fate)
 }
 
+// SetCopies gives the pipe's pools their members of copies and window
+// (Copies), now and for every pool set after.
+func (p *Pipe) SetCopies(c Copies) error {
+	msg, err := putCopies(c)
+	if err != nil {
+		return err
+	}
+	return sendWith(p.conn, &p.wmu, msg)
+}
+
 // tcpListensCopy is the client ports of streams, for a reload.
 func (p *Pipe) tcpListensCopy() map[byte]*tcpListenConf {
 	p.mu.Lock()

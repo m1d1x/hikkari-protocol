@@ -97,6 +97,10 @@ impl Pipe {
                 }
                 return Ok(());
             }
+            Some(Msg::Copies { members, window_us }) => {
+                self.set_copies(members, window_us);
+                return Ok(());
+            }
             Some(Msg::Unwire { id }) => self.unpool(id),
             Some(Msg::Wire { h3: Some(_), .. }) => {
                 // The QUIC wire's strings point into the message buffer.
@@ -219,7 +223,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Clients | Msg::Stats => unreachable!("taken above"),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Clients | Msg::Stats => unreachable!("taken above"),
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));

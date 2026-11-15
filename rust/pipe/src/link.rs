@@ -71,9 +71,9 @@ impl Sock {
 }
 
 /// Writes what waits in a member's out buffer, as much as its connection
-/// takes.
-pub fn flush(out: &mut Out, sock: &mut Sock) -> Io {
-    if !out.pending() {
+/// takes, unless it is held for its window (copies.rs).
+pub fn flush(out: &mut Out, sock: &mut Sock, now: u64) -> Io {
+    if !out.due(now) {
         return Io::Done(0);
     }
     let r = sock.write(out.bytes());
@@ -285,6 +285,8 @@ pub struct StreamWire {
     pub proof: u64,
     /// The member the wire last sent a datagram on (carry.rs).
     pub rr: usize,
+    /// Its members of copies and their window (copies.rs).
+    pub copies: crate::copies::Copies,
     pub t: WireTick,
 }
 
@@ -298,6 +300,7 @@ impl StreamWire {
             reach,
             proof: 0,
             rr: 0,
+            copies: crate::copies::Copies::default(),
             t: WireTick { id, ..Default::default() },
         }
     }
