@@ -55,8 +55,48 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 		t.Fatalf("voice stayed on a red wire: %+v", c)
 	}
 	// The hub reads this line back part by part (cascadewatch).
-	if c.Why != "voice: udp is red, to pool" {
+	if c.Why != "voice: udp is red, to pool; video: udp is red, to pool" {
 		t.Fatalf("the log says %q", c.Why)
+	}
+}
+
+// TestSelectorBringsVoiceBackOffThePoolAtOnce: a red wire of datagrams left
+// voice on the pool; once it is not red it is voice's main wire again at
+// once, with no Hold (spec/trunk.md, Wires: one fate is the fallback, not a
+// rank; 14.11 21:50 UTC voice stayed inside TCP all night after a reload of
+// the exit). A wire of datagrams rougher than the pool is still voice's main
+// wire: the pool carries its copy in the set whatever the rank.
+func TestSelectorBringsVoiceBackOffThePoolAtOnce(t *testing.T) {
+	now := time.Now()
+	// A new process has heard no call yet: voice starts on datagrams.
+	if c := NewSelector(SelectorConfig{}, selPool, selUDP).Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Route.Bulk != PoolWire {
+		t.Fatalf("a new selector puts voice on %d, bulk on %d", c.Route.Voice, c.Route.Bulk)
+	}
+	sel := NewSelector(SelectorConfig{}, selPool, selUDP)
+	sel.Call(testUDP, calm(now, 50*time.Millisecond))
+	sel.Call(PoolWire, calm(now, 40*time.Millisecond))
+	c := sel.Choose(now, liveAll(now, PoolWire, testUDP))
+	if want := SetOf(Carry{Wire: testUDP}, Carry{Wire: PoolWire, Copies: 1}); c.Route.Voice != testUDP || c.Route.VoiceSet != want {
+		t.Fatalf("voice is not the set of two fates: %+v", c.Route)
+	}
+	t1 := now.Add(time.Second)
+	live := liveAll(t1, PoolWire, testUDP)
+	live[testUDP] = WireState{ID: testUDP, Members: 2, Proof: now, Owed: 600 * time.Millisecond}
+	if c := sel.Choose(t1, live); c.Route.Voice != PoolWire || c.Route.VoiceSet != SetOf(Carry{Wire: PoolWire}) {
+		t.Fatalf("voice stayed on a red wire: %+v", c)
+	}
+	t2 := t1.Add(time.Second)
+	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Why != "voice: on udp; voice2: on pool" {
+		t.Fatalf("voice not back on the datagrams' wire at once: %+v", c)
+	}
+
+	sel = NewSelector(SelectorConfig{}, selPool, selUDP)
+	sel.Call(testUDP, rough(now))
+	sel.Call(PoolWire, calm(now, 40*time.Millisecond))
+	sel.Choose(now, liveAll(now, PoolWire, testUDP))
+	later := now.Add(DefaultHold + time.Second)
+	if c := sel.Choose(later, liveAll(later, PoolWire, testUDP)); c.Route.Voice != testUDP || !c.Route.VoiceSet.has(PoolWire) {
+		t.Fatalf("a rough wire of datagrams lost voice to the pool: %+v", c)
 	}
 }
 
@@ -162,7 +202,7 @@ func TestSteerLeavesACutWire(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.entry.Steer(ctx, sel, t.Logf)
-	waitFor(t, func() bool { return h.entry.currentRoute() == Route{Voice: testUDP, Bulk: testQuic} })
+	waitFor(t, func() bool { r := h.entry.Route(); return r.Voice == testUDP && r.Bulk == testQuic })
 
 	c := h.carry()
 	defer c.Close()
@@ -174,7 +214,7 @@ func TestSteerLeavesACutWire(t *testing.T) {
 	waitFor(t, func() bool { return h.wires[testQuic].out.Load() > 4<<20 })
 	cut := time.Now()
 	h.wires[testQuic].cut.Store(true)
-	waitFor(t, func() bool { return h.entry.currentRoute().Bulk == PoolWire })
+	waitFor(t, func() bool { return h.entry.Route().Bulk == PoolWire })
 	if d := time.Since(cut); d > 5*time.Second {
 		t.Fatalf("the route left the cut wire after %s", d)
 	} else {
@@ -279,7 +319,7 @@ func TestSteerHoldsThroughOwnPause(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go h.entry.Steer(ctx, sel, t.Logf)
-	waitFor(t, func() bool { return h.entry.currentRoute().Voice == testUDP })
+	waitFor(t, func() bool { return h.entry.Route().Voice == testUDP })
 
 	s := h.entry.Session()
 	s.mu.Lock()
@@ -288,12 +328,12 @@ func TestSteerHoldsThroughOwnPause(t *testing.T) {
 	pausedAt := time.Now()
 	h.wires[testUDP].cut.Store(true)
 	for time.Since(pausedAt) < grace-300*time.Millisecond {
-		if r := h.entry.currentRoute(); r.Voice != testUDP {
+		if r := h.entry.Route(); r.Voice != testUDP {
 			t.Fatalf("voice left udp %s after this box's pause", time.Since(pausedAt).Round(time.Millisecond))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	waitFor(t, func() bool { return h.entry.currentRoute().Voice == PoolWire })
+	waitFor(t, func() bool { return h.entry.Route().Voice == PoolWire })
 	if d := time.Since(pausedAt); d > grace+5*time.Second {
 		t.Fatalf("the route left the cut wire %s after the pause", d)
 	} else {

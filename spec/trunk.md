@@ -41,6 +41,7 @@ Both ways, big-endian:
 | ping 8, pong 9 | token u64 |
 | drain 10 | (exit to entry) |
 | observe 11 | kind u8 (1 stream, 2 flow), stream u32, id u64 (exit to entry) |
+| frag 12 | id u16, index u8, count u8, n u16, n bytes (packet members of the `h3dgram` wire only, "Wires") |
 
 The entry's first frame on a member is hello with its session id (random per entry run) and a zero epoch; the exit answers
 hello with the same id and the epoch of its session (random per exit session). The entry has no epoch: the first byte of
@@ -50,11 +51,41 @@ exit lost its streams: the entry resets its own.
 Drain is the exit's process being replaced without a cut. The entry answers it once per session: a new session with a new
 id and a full pool, which reaches the exit's new process, takes every new stream and flow once a quarter of its pool is up
 (or after 10 seconds); until then the old session takes them, as the exit's old process still serves, and replaces none of
-its members. Nothing new waits for a pool that is not there: the trunk's call goes on through the old session. Then the old
+its members. Nothing new waits for a pool that is not there: the trunk's call goes on through the old session, and moves to
+the new one when it takes over; the exit's new process numbers its answers anew, so an entry counts a flow's answers only
+from members of its own session. Then the old
 one is retired: it keeps its members, replaces none, and closes when it carries nothing more or after 30 minutes. An entry whose own process is being
 replaced retires its current session the same way and opens no session after it, so a drain that reaches the old entry
 process changes nothing: a process that takes no new clients has no use for a new pool. What an entry cuts when it stops
 counts every session it has, the retired ones too.
+
+An entry's own process replaced (a generation of its unit, trunkentry `handoff.go`; the Rust pipe's `drain` and `adopt`)
+cuts nothing either. The new process gets the same client sockets and opens a session of its own. The old one stops
+accepting and stops reading the shared UDP sockets, and first tells the new one every client address its flows are for; the
+new one reads no client datagram before that list is whole. A datagram from such an address the new process hands to the
+old one, which carries it on its own session; the answers go out of the shared socket from the process that holds the flow.
+A flow stays with its process until it ends (2 minutes unused): then the old process lets the address go, and a datagram it
+was handed for a flow it no longer has goes back to the new one with it, which opens the flow itself. A stream stays with the
+process that accepted it. An old process that carries nothing more says so and leaves, at the latest after 30 minutes; one
+that is gone gives every address it held to the new one.
+
+An exit's own process replaced (the Rust exit's `drain` and `adopt`, R6.4; the relay's generations, edge `handoff.go`)
+cuts nothing either, and is what sends the drain above. Every process of the exit holds the same sockets: each packet
+wire's UDP socket and the pool's port. The old process sends drain on every member of every session it holds, and on
+any member that joins it later; it stops reading the shared UDP sockets and stops accepting on the pool's port, and
+first tells the new one every entry address its members of the bare UDP wire come from (an address it holds is its
+own from the first datagram that opened, before the hello is answered). The new one reads no packet wire before every
+older process said that list is whole. From then on a datagram of the bare UDP wire from an address an older process
+holds, and a QUIC packet of the `h3dgram` wire whose destination connection id an older process issued, the new one
+hands to that process, which takes it as one it read and answers out of the shared socket. Every connection id an exit
+process issues names its generation, as the relay's do (the first byte is the second's XOR the generation, so the
+first byte on the wire is as random as the rest); a packet of a connection id that is no exit's, or of the newest
+generation, is the newest process's. A stream member stays with the process that accepted it. The old process lets an
+address go when it forgets its member (dead, or silent past PeerIdle); a datagram it was handed for an address it no
+longer holds goes back to the new one with it, which takes it as its own (a hello there makes a member of the new
+process). The old process says when it carries nothing more (no client's flow, no stream; the trunk's call is no
+client's); the one that started it closes it then, or after 30 minutes. One that is gone leaves every address it held
+to the new one: a member there that says no hello carries nothing, dies by its health on the entry and is replaced.
 
 ## Streams
 
@@ -66,7 +97,9 @@ the window, 2 MiB), `got` the offset of the chunk this ack answers (all ones for
 confirmed and written; `rst` ends it at once.
 
 The exit holds chunks and FINs of a stream whose open has not arrived (it left on a member that died) and takes them when it
-comes. Late frames of an ended stream get `rst`.
+comes. Late frames of an ended stream get `rst`. The entry opens every stream, so a chunk or FIN of a stream it does not
+have is always late, however long ago it ended: it answers `rst` (an exit left holding a stream the entry reset, as at a
+flip of epochs, would otherwise send its chunks again on every member and bury each for owing them).
 
 ## Members' health
 
@@ -85,20 +118,77 @@ and the entry logs `trunk: paused <duration>`.
 ## Datagrams
 
 A flow is one client UDP association (entry: one client address on one listened port; exit: one socket to the loopback port).
-Every datagram goes as a dgram frame on the 2 members carrying least; no ack, no resend. The receiver drops copies by `seq`
-in a window of 1024. A flow ends after 2 minutes unused.
+Every datagram goes as a dgram frame on every wire of its flow's set (Wires): on each wire on as many of its members as the
+set says, no ack, no resend. All copies carry the flow's one `seq`; the receiver takes the first and drops the others by
+`seq` in a window of 1024, whichever wire brought it. On a wire the members go round: each copy goes on the member of that
+wire that sent last the longest ago, so a TCP member's resend holds up one datagram in N, not every one. A flow ends after 2
+minutes unused.
 
-A flow whose sender already copies its datagrams goes on one member: Hikkari v1.02 sends a call over both its channels, and a
-second copy on the trunk would make four of every packet. The entry chooses per listened port (the hub sets one copy on ports
-that reach the exit's Hikkari relay). The exit answers a flow as the entry sends it: on one member until a copy of the flow's
-datagrams arrives, then on 2.
+The copies on a flow's main wire are its own: 2 by default, one for a flow whose sender already copies its datagrams
+(Hikkari v1.02 sends a call over both its channels, and a second copy on the trunk would make four of every packet). The
+entry chooses per listened port (the hub sets one copy on ports that reach the exit's Hikkari relay). Such a port still gets
+the set of two fates: the client's own copy goes inside its stream channel, TCP to the entry, and under a cut of UDP it
+comes 95–166 ms late; it guards the client's leg, not the trunk's.
+
+The exit answers a flow on every wire its datagrams came on in the last second; with none in that second, on the wire of the
+latest. On each wire it answers on one member, and on 2 once a copy comes on that wire of a datagram that wire already
+brought (the entry's copies there, not another wire's).
+
+A member of the pool that carries dgram frames has Nagle off (`TCP_NODELAY`) at both ends: a voice copy is a small frame
+every 20 ms, and with Nagle the kernel holds it until the last one is acknowledged. Each end sets it on a member that is a
+TCP socket of its own; the entry's Chromium sets it on the pool's sockets, and the relay that hands the exit its members
+accepts them on Go's TCP, which sets it on every socket.
+
+### Copies on the pool
+
+A write into a pool's member costs much the same for one frame as for many: on the entry each is an HTTP/2 DATA frame, a
+TLS record, a `sendmsg` and a hand-over to Chromium's thread; on the exit the relay seals each write it is handed. So the
+pool may carry the datagrams' copies on members of their own, written a window at a time (hikkari-client
+`plans/2026-11-15-pool-copy-coalescing.md`). The wire's bytes do not change: a window is dgram frames one after another on
+the member's stream, as any frames are, each with its stream, `seq` and port.
+
+The entry sets K members of copies (the brain's `copies`, 4 of the pool's 32 by default; 0 is none, and copies go round
+every member as above). A member of copies carries datagrams and its own pings and pongs, and a stream's frame only when no
+other member is up. The copies of one window, W from the first of them (4 ms by default), all go on one member of copies
+and leave in one write once the window is over, or sooner once they hold 16 KiB; the next window goes on the next member
+of copies up. A member of copies that goes down leaves at the next window, and the member up that owes least takes its
+place, so a copy never waits for a new connection. Any other frame on a member ends its window: what waits goes at once.
+
+The exit holds its answers the same way, for its own window (the brain's `copy window`, 4 ms by default, 0 none), on a
+member the entry never sent a stream's frame on (an open, a chunk, a FIN, an ack): the answers go where the flow's
+datagrams came, so on the entry's members of copies.
 
 A flow to port 0 is the trunk's own call (`call.go`): the exit sends every datagram straight back, with no socket, as it
-came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, a datagram every 20 ms, and
-reports each minute of the wall clock: sent, answered within 2 s, round trips, and the pauses between answers a call hears
-(over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with their time). Neither end counts the call
-among its clients' flows and datagrams, and it never keeps a retired session open. An exit older than this answers nothing on
-port 0: the call reports every datagram lost.
+came (one copy, or 2 once a copy arrives). The entry keeps one call with one copy and one with 2, both of the voice class on
+its set (Wires), and one held to each wire, a datagram every 20 ms, and reports each minute of the wall clock: sent, answered within 2 s, round trips,
+and the pauses between answers a call hears (over 60 ms and over 150 ms, the longest, the silence in all, the 5 longest with
+their time). Neither end counts the call among its clients' flows and datagrams, and it never keeps a retired session open.
+An exit older than this answers nothing on port 0: the call reports every datagram lost.
+
+A call's datagram is its frame number (u64, big endian), then 8 bytes of the exit's stamp and 8 of its map, sent as zeros,
+then padding to 64 bytes. Before it answers (`echo.go`), the exit writes into them its wall clock when the datagram arrived
+(unix ns, u64) and which of the flow's last 64 frame numbers it has had (u64: bit i is frame n-i, n this datagram's; a frame
+64 or more older than the newest one had is had alone). A datagram on port 0 shorter than 24 bytes, or whose stamp and map
+are not zeros (another user of the echo), goes back as it came. The calls the entry keeps side by side tick together and number
+their frames as one: frame n leaves on every wire at the same moment. An exit older than the stamp answers the zeros back,
+and the entry hears no direction from it.
+
+### What a listener hears
+
+The entry hears each minute as a listener with a jitter buffer would (`hearing.go`, hikkari-client
+`plans/2026-11-15-live-udp-two-fates.md`, раздел 4). A listener plays frame n at the best one-way delay of the minute plus
+its buffer; a frame that came later, or never, is a hole. Up is a listener at the exit: the delay is the exit's stamp less
+the entry's send, a frame the exit's map says it had but whose answer was lost counts in time (its delay is not known), a
+frame no answer told of is lost. Down is a listener at the entry, over the frames the exit had: the delay is the answer's
+arrival less the exit's stamp. The two clocks are apart: taking the minute's best delay off every frame's takes their offset
+with it. Each direction is heard with three buffers at once, 40, 60 and 100 ms (an application's own is not known and moves
+by itself): holes (their share of the frames judged), runs of 2 holes or more (a syllable swallowed: one frame of 20 ms is
+hidden by the codec), and bad seconds (3 holes or more and at least 6% of the second's frames: a robot voice).
+
+A set of wires (the voice class over two fates) is heard from the calls held to its wires, with no datagram more: a frame is
+in time if it came in time on one of them, against the best delay of the set. The set is the one at the moment each frame
+left. For each other wire of the set the entry also reports how much later its copy came than the copy on the set's first
+(the pool's behind the datagrams'), up and down, at p50, p95 and the most, over the frames both brought.
 
 ## Observation
 
@@ -131,11 +221,31 @@ datagram, both ways; its hello is said again every 250 ms until answered, and th
 100 ms whether or not the last ping came back, owes progress from its oldest unanswered ping, a pong of any ping since
 then is its proof, and its stall limit is the member's limit plus 100 ms: datagrams lost one by one do not kill it.
 
-The entry routes two classes of traffic, each on a wire of its choice: voice (calls and other small live datagrams; by the
-port, as one copy is chosen today) and bulk (streams and every other datagram). A wire with no member that can carry the
-class is passed over for any member that can. The exit has no route: it answers a stream or a flow on the wire the entry
-last sent it on. The trunk's call can be pinned to one wire: then its datagrams go on that wire only, and are lost while it
-has no member, so the call hears the wire alone.
+Every wire has a fate: what must break on the path for it to lose a frame (hikkari-client
+`plans/2026-11-15-live-udp-two-fates.md`). `udp` is datagrams of IP on the path (the bare UDP wire, `h3dgram`, QUIC,
+salamander), `tcp` is streams TCP sends again (the pool). The hub sets it in the wire's knobs as it sets the shape; a wire
+that says none is `tcp` for the pool and `udp` for any other. The shape answers another question: which wires one rule
+against one form takes together. On the night of 14.11 the path lost 15–20% of every UDP datagram and almost no TCP segment;
+two copies on two members of one wire were lost together (5%), a copy on each fate lost almost nothing (0.3–0.8% heard
+holes at a 60 ms buffer, hikkari-client `plans/research/2026-11-15-voice-night-lab.md`).
+
+The entry routes three classes of traffic, by the listened port:
+
+- voice (calls and other small live datagrams): a set of wires of different fates at once. The route names the main wire,
+  where the flow's own copies go, and the entry adds one copy on the best wire of the other fate that has a member up; or
+  the route gives the whole set: up to 4 carries, each a wire, its copies (0 for the flow's) and how long after the
+  datagram they leave (a later copy on one wire misses the burst that took the first). TCP never carries voice alone while
+  a wire of fate `udp` has a member up: a set of the pool alone gets one copy on the best such wire. With no such wire up
+  the set is the pool alone, as any member.
+- video (a client's video and screen, too big to copy): one wire, the route's, or voice's main wire when the route names
+  none.
+- bulk (streams and every other datagram): one wire.
+
+A wire of a set, or the one wire of video or bulk, with no member up is passed over for the best wire of its fate that has
+one and is not in the set yet, else left out; a flow with no wire left goes on any member that can carry it. Between wires
+of one fate the best is the lowest id (owner's choice of 2026-11-15). The exit has no route: it answers a stream on the
+wire the entry last sent it on, a flow on its set as it hears it (Datagrams). The trunk's call can be pinned to one wire:
+then its datagrams go on that wire only, and are lost while it has no member, so the call hears the wire alone.
 
 The entry chooses the route every second (the selector). A wire is red when it has no member up, or when every member has
 owed progress for 500 ms while another wire proved the path alive in that time; a red wire is left at once. Every wire
@@ -143,10 +253,34 @@ owing together is a pause of the entry or a cut of the whole path: nothing is re
 left while every wire is red, or within 10 s of a pause of the entry's own (its session's clock or the selector's tick ran
 late): a box that was not run buries and owes on every wire, and which one comes back last is luck, not the wire. Such a
 wire is held; while it has no member up, its traffic goes on any member that can carry it. Otherwise the
-rank is slow: voice by its call over 10 minutes (red minutes plus pauses over 60 ms, then the round trip at p99), bulk by
-its 1 MiB downloads over an hour (failures, then the median speed, then CPU), and a wire takes a class from the one that
-carries it only when it is better by a margin (5 heard pauses; a quarter faster) for 5 minutes. Bulk goes only on wires
-that carry streams. For each class the chosen wire and the best other wire of another shape are kept warm.
+rank is slow. Bulk goes by its 1 MiB downloads over an hour (failures, then the median speed, then CPU), only on wires that
+carry streams, and a wire takes it from the one that carries it only when it is a quarter faster at as few failures for 5
+minutes.
+
+Voice goes on a set of two fates (hikkari-client `plans/2026-11-15-live-udp-two-fates.md`, раздел 5): the route gives the
+whole set, the best wire of fate `udp` as its main wire with the flow's copies, and the best wire of another fate with one
+copy. A wire is ranked for voice by what a listener heard of its own call (the call pinned to it) in its latest minute, up
+and down together at the 60 ms buffer (What a listener hears): fewer bad seconds, then fewer runs of 2 holes or more, then
+fewer holes, then the shorter round trip at p50, two round trips within 50 ms of each other being equal. A wire whose exit
+stamps nothing is ranked by what its call has: lost datagrams as holes, pauses over 60 ms as runs, over 150 ms as bad
+seconds. A wire not heard yet ranks below every wire heard. A wire better than the one in its place takes it once it has
+stayed better for 5 minutes; a red one is left at once for the next best wire of its fate. With no wire of fate `udp` to be
+had, the main wire is the best of the others, and a wire of fate `udp` takes it back as soon as it is not red: one fate is
+the fallback, not a rank.
+
+The set grows at once and shrinks slowly. Each second, 1 s after it ends, the entry hears the voice set's calls as one
+listener over that second's frames, against the best delays of every frame its calls still keep (the open minute and the
+one in its grace), at the 60 ms buffer; a second is bad as in What a listener hears. After 2 bad seconds of the last 5,
+voice gets one more copy on its main wire 10 ms after the first; it goes after 5 minutes with no bad second. A copy moves no
+traffic, so there is nothing to hold it against. The set heard is the two fates' calls, not the copies: the third copy does
+not hide the seconds that brought it.
+
+Video goes on one wire. Its rank is the bad seconds its call heard at a 200 ms buffer over the last minute, judged second by
+second as the set's, then the voice rank. It leaves its wire after 3 bad seconds of the last 5, for the best wire of another
+fate (of any fate when there is none), the next frame on the new wire; a better wire takes it after 5 minutes. Video has no
+copies: its frames left on the old wire may be lost.
+
+For each class the chosen wire and the best other wire of another shape are kept warm, and every wire of voice's set.
 
 The numbers are from the stand's night (11.11, 01:00–05:46 UTC, nekko-spb → unl1, the four candidate wires and the pool's
 own call side by side), to be checked against the stand's full day and the peak:
@@ -156,7 +290,8 @@ own call side by side), to be checked against the stand's full day and the peak:
   (the box not run on :x0) silenced every wire at once for 157–320 ms: nobody red. 1000 ms would miss the QUIC stalls
   and 22 of the pool's. A voice wire's death costs the call at most this long only if its other copy is lost too: the
   client's stream copy of a voice packet rides the bulk wire, of another shape.
-- Voice margin 5, hold 5 minutes. Replayed over the night's minutes: with the bare UDP wire present, margin 3 moved
+- Voice margin 5, hold 5 minutes (voice was one wire until 15.11; the set keeps the hold, the margin went with the
+  minutes ranked by pauses). Replayed over the night's minutes: with the bare UDP wire present, margin 3 moved
   voice twice in 4.6 h (to salamander for 9 minutes and back), margin 5 never, red minutes under voice 0 either way.
   Between QUIC and salamander alone, margin 3 and a 3-minute hold moved it 9 times, margin 5 and 5 minutes 3 times, and
   the minutes voice spent on a red minute were 7 and 6: moving between wires as good as each other buys nothing.
@@ -177,3 +312,69 @@ The bare UDP wire (`trunk/udpwire`): packet members, a UDP socket of its own per
 on the exit, a member per entry address. A datagram is a 12-byte random nonce and the frames of one write sealed with
 AES-256-GCM under HKDF-SHA256(trunk key, "hikkari trunk udp wire"). A datagram that opens under no trunk key is dropped
 without an answer.
+
+The Chromium QUIC wire (`h3dgram`, draft 2026-11-13, R6.2; hikkari-client `plans/2026-11-11-entry-hot-path-and-unit-economics.md`,
+"Труба на Rust"): packet members whose datagrams are HTTP Datagrams (RFC 9297) of a CONNECT-UDP request (RFC 9298) over
+HTTP/3, sent by Chromium's own QUIC stack on the entry, so the border sees what Chrome sends. Chromium uses the member's
+QUIC session as its session to a site (`SessionUsage::kDestination`: packets of 1250 B, Chrome's to any site since early
+2023), not as its session to an IP Protection proxy (`kProxy`: 1350 B, which a Chrome with ML-KEM sends to no one but
+Google's proxies): owner's choice of 2026-11-14 (hikkari-client `plans/research/2026-11-14-h3dgram-wire-shape-research.md`).
+The usage is a knob of the entry's wire (`destination` by default, `proxy`); nothing else on the wire differs, and the exit
+takes both. A member is
+one QUIC connection (TLS 1.3, ALPN `h3`, the exit's UDP port) carrying one CONNECT-UDP request: `:method CONNECT`,
+`:protocol connect-udp`, `:scheme https`, `:path /.well-known/masque/udp/{host}/{port}/` (any target: the exit is the
+trunk's end and opens nothing to it), and `proxy-authorization: Bearer <token>`, where the token is HKDF-SHA256(trunk key,
+"hikkari trunk h3dgram wire"), 32 bytes in lower-case hex. Datagrams must be on in both QUIC (RFC 9221) and HTTP/3
+(`SETTINGS_H3_DATAGRAM` 1). The exit answers a request with a known token `200` with `capsule-protocol: ?1`; any other
+request on the connection is answered `404` as a site would, and a connection that never asks a CONNECT-UDP with a known
+token carries nothing of the trunk. Capsules on the request stream are read and dropped.
+
+An HTTP Datagram is the request stream's quarter stream id (varint), context id 0 (varint) and the frames of one write as
+they are, not sealed: QUIC's TLS already keeps them, and the token proved the trunk key. A datagram with another context id,
+or one for a stream that is no member, is dropped. The frames of one datagram are at most what Chromium guarantees one HTTP
+Datagram of the member holds, whatever its packet number's length (R6.3): 1194 B in packets of 1250 B (`destination`),
+1294 B in packets of 1350 B (`proxy`), that is the packet less a long header with the version, the exit's 16-byte and
+Chromium's 8-byte connection ids, a 2-byte length and a 4-byte packet number, the 16-byte tag, the DATAGRAM frame's type
+and the HTTP Datagram's 2-byte head. Chromium resets the request stream (and with it the member) on a datagram over the
+room it has now, so neither end writes one over that limit. Live datagrams of clients (voice, games) fit; a client's own
+QUIC packets do not: QUIC's Initial is 1200 B at least (RFC 9000, 14.1), Chrome's packets are 1250–1350 B.
+
+A frame over the room is cut, not carried by another wire (owner's choice of 2026-11-14: what crosses the border is one
+shape, Chromium's to a site, and a flow stays on its member's wire). The sender cuts the frame's bytes into `count`
+pieces (2 to 4, as even as they go), each a frag frame: `id` the sender's count of cut frames on this member (u16,
+wrapping), `index` from 0, and the piece. All pieces of a frame go on the same member, in order, each in a datagram that
+holds it, glued with other frames like any frame; they wait and age in the member's scheduler as any frame does, so one
+dropped there loses the frame. The receiver puts a frame together per member by `id` from its `count` pieces, and reads
+it as the one frame it must be (a dgram frame; anything else is dropped as a torn frame would be). A member keeps at most
+8 frames being put together; a frame not whole 150 ms after its first piece, or pushed out by a ninth, is lost and
+counted. A piece seen twice is dropped. A frame that 4 pieces do not hold is dropped and counted, as udpwire drops a write
+over its datagram. Only this wire's members cut frames: every other wire's datagram holds any client's.
+
+The entry opens its members itself, not the brain (R6.3): one Chromium engine per wire, a CONNECT-UDP tunnel per member,
+each in a network partition of its own, so no two members share a QUIC connection. A member's UDP socket is the entry's,
+as a pool member's TCP socket is: bound from a port of the wire's book of source ports, connected to the exit and given
+to the engine's UDP dialer, which refuses every other socket Chromium asks for; a dead member's port rests in the book
+as a stream member's does. A tunnel closed under the member is its death (gone), as a closed socket is; a member dead by
+its health closes its tunnel. Either way the entry opens a new member within the spread.
+
+The member's end is its connection's: the request stream ending, the connection closing or the member dying by its health
+closes both, and the entry opens a new member with a new connection. The exit's QUIC connection ids are random, 16 bytes.
+
+How each end sends on a member's connection (the exit down, R6.2b; the entry up, R6.3): as the datagram channel of v1.05 (spec/v1.md, "the datagram channel
+is a pipe"), since the wire carries only live datagrams whose senders run congestion control of their own. QUIC's window is
+fixed by memory (64 MiB in flight, no pacing); the guard of v1.05 with its thresholds judges each half second of the
+connection's sending from QUIC's own counts (bytes sent, lost and acknowledged, packets sent; the smoothed round trip for
+the line's queue) and holds the connection to a rate only on real loss. The frames wait in the connection's scheduler, not
+in QUIC's queue: the member's own frames (pings, pongs, the hello's answer, which goes in a datagram of its own) first,
+then the flows' frames by deficit round robin, 1500 B a turn, over 32 buckets by stream id (a flow shares its bucket with
+the flows of the same stream id modulo 32). Right before a datagram is made, a frame that waited over 150 ms is dropped,
+the oldest first, and so is the oldest of a bucket holding 64 frames; each is counted stale. Up the entry does the same
+above Chromium's own sender, which it cannot replace: the member's frames wait in the entry's scheduler of the same rules,
+the guard judges each half second from the counts Chromium's network thread copies for it (bytes and packets sent,
+packets lost, the smoothed round trip; lost bytes are the lost packets at the connection's mean packet), and a datagram
+goes into the tunnel only while the guard lets it. The guard is the same at both ends, with the same thresholds, but for
+one rule of the entry's alone: a half second of at least 100 packets whose smoothed round trip is 50 ms over the least
+the connection has seen turns the limit on as loss does. Chromium's sender under the entry's guard keeps loss under the
+tenth while the line's queue stays full, and that queue is the trunk's own; on a line a user shares with others, as the
+client's and the relay's, the queue is often another's, and limiting by it starves live traffic (owner's choice of
+2026-11-14).

@@ -28,6 +28,30 @@ type testWire struct {
 	out, in  atomic.Int64 // bytes the entry wrote / read on this wire's members
 	dials    atomic.Int64
 	lossPerK atomic.Int64 // packet wire: datagrams lost per 1000, each way
+	// gilbert is a packet wire's loss to the exit by Gilbert's model, as
+	// netem's gemodel: from good to bad with p, back with r, in bad every
+	// datagram lost (fates_test.go).
+	gilbert struct {
+		sync.Mutex
+		p, r float64
+		bad  bool
+	}
+}
+
+// gilbertLost says whether the next datagram to the exit is lost.
+func (w *testWire) gilbertLost() bool {
+	g := &w.gilbert
+	g.Lock()
+	defer g.Unlock()
+	if g.p == 0 {
+		return false
+	}
+	if g.bad {
+		g.bad = rand.Float64() >= g.r
+	} else {
+		g.bad = rand.Float64() < g.p
+	}
+	return g.bad
 }
 
 type wireHarness struct {
@@ -146,7 +170,7 @@ func packetPipe(w *testWire) (net.Conn, net.Conn) {
 	done := make(chan struct{})
 	var once sync.Once
 	shut := func() { once.Do(func() { close(done) }) }
-	return &packetEnd{in: ba, out: ab, done: done, shut: shut, w: w}, &packetEnd{in: ab, out: ba, done: done, shut: shut, w: w}
+	return &packetEnd{in: ba, out: ab, done: done, shut: shut, w: w, toExit: true}, &packetEnd{in: ab, out: ba, done: done, shut: shut, w: w}
 }
 
 type packetEnd struct {
@@ -155,6 +179,7 @@ type packetEnd struct {
 	done     chan struct{}
 	shut     func()
 	w        *testWire
+	toExit   bool // the entry's end
 }
 
 func (p *packetEnd) Write(b []byte) (int, error) {
@@ -164,6 +189,9 @@ func (p *packetEnd) Write(b []byte) (int, error) {
 	default:
 	}
 	if l := p.w.lossPerK.Load(); l > 0 && rand.Int64N(1000) < l {
+		return len(b), nil
+	}
+	if p.toExit && p.w.gilbertLost() {
 		return len(b), nil
 	}
 	select {
@@ -254,8 +282,9 @@ func TestStreamMovesOffACutWire(t *testing.T) {
 }
 
 // TestVoiceOnAPacketWire: a lossy packet wire carries the voice class; it
-// keeps its members through lost datagrams, and the pool carries none of the
-// call.
+// keeps its members through lost datagrams, and the pool, of the other fate,
+// carries a copy of each one: what the packet wire lost comes back anyway
+// (fates.go).
 func TestVoiceOnAPacketWire(t *testing.T) {
 	h := newWireHarness(t, Config{}, 2, 0, 2)
 	udp, pool := h.wires[testUDP], h.wires[PoolWire]
@@ -264,19 +293,19 @@ func TestVoiceOnAPacketWire(t *testing.T) {
 	var got atomic.Int64
 	f := h.entry.Session().OpenFlowWith(4000, FlowOptions{Copies: 1, Class: ClassVoice, Pin: AnyWire}, func([]byte) { got.Add(1) }, nil)
 	defer f.Close()
-	p0 := pool.out.Load()
+	u0, p0 := udp.out.Load(), pool.out.Load()
 	payload := bytes.Repeat([]byte{0xa5}, 160)
 	for i := 0; i < 300; i++ {
 		f.Send(payload)
 		time.Sleep(5 * time.Millisecond)
 	}
 	time.Sleep(200 * time.Millisecond)
-	// 3% lost each way: about 6% of the round trips.
-	if n := got.Load(); n < 250 || n > 300 {
+	// 3% lost each way on the packet wire, none on the pool.
+	if n := got.Load(); n != 300 {
 		t.Fatalf("%d of 300 came back", n)
 	}
-	if p := pool.out.Load() - p0; p > 300*20 {
-		t.Fatalf("the pool carried %d bytes of the call", p)
+	if u, p := udp.out.Load()-u0, pool.out.Load()-p0; u < 300*160 || p < 300*160 {
+		t.Fatalf("the packet wire carried %d bytes of the call, the pool %d: want a copy on each", u, p)
 	}
 	if st := h.entry.Session().Stats(); st.MembersStall != 0 {
 		t.Fatalf("lost datagrams buried packet members: %+v", st)

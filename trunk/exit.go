@@ -39,6 +39,7 @@ func NewExit(cfg Config, local Local) *Exit {
 // carries the member until it dies. A t1 hello is a pool member; a t2 one
 // says its wire and form (wires.go), and is answered in kind.
 func (x *Exit) ServeMember(conn io.ReadWriteCloser) error {
+	noDelay(conn)
 	timer := time.AfterFunc(helloTimeout, func() { conn.Close() })
 	// One reader for the hello and the frames after it: a packet member's
 	// hello is a datagram that must be read whole.
