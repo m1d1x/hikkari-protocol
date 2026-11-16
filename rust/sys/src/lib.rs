@@ -529,3 +529,29 @@ pub fn recv_dgram(fd: i32, buf: &mut [u8]) -> io::Result<Option<usize>> {
         _ => Err(e),
     }
 }
+
+/// A connected pair of AF_UNIX datagram sockets, both non-blocking: one
+/// message is one datagram either way. A library thread that carries a
+/// tunnel's datagrams (cronet's CONNECT-UDP tunnel) gets one end, the loop
+/// reads and writes the other in batches like any UDP socket. Each end's
+/// send buffer is `buf` bytes, so a burst the other side is slow to take
+/// waits there instead of being dropped at once.
+pub fn dgram_pair(buf: usize) -> io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0i32; 2];
+    let r = unsafe {
+        libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0, fds.as_mut_ptr())
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: socketpair gave two descriptors nobody else owns.
+    let (a, b) = unsafe { (std::os::fd::OwnedFd::from_raw_fd(fds[0]), std::os::fd::OwnedFd::from_raw_fd(fds[1])) };
+    let v = buf.min(i32::MAX as usize) as libc::c_int;
+    for fd in [a.as_raw_fd(), b.as_raw_fd()] {
+        unsafe {
+            libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, &v as *const _ as *const _, 4);
+        }
+    }
+    Ok((a, b))
+}
