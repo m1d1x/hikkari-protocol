@@ -271,7 +271,7 @@ impl Pipe {
         let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, marks, .. } = self;
         let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
         let sess = *sess;
-        let Link { inb, in_n, out, h, up_at, .. } = &mut links[li];
+        let Link { inb, in_n, out, h, up_at, epoch, .. } = &mut links[li];
         let mut joined = false;
         let mut at = 0;
         while at < *in_n {
@@ -285,6 +285,7 @@ impl Pipe {
                 Frame::Hello => {
                     if let Some(hl) = frame::read_hello(&inb[..*in_n], at) {
                         epochs.push((sess, hl.epoch));
+                        *epoch = hl.epoch;
                     }
                     if !h.up {
                         h.join(now);
@@ -316,7 +317,7 @@ impl Pipe {
                     t.down_pkts += 1;
                     t.down_bytes += len as u64;
                     *moved += 1;
-                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now, sess);
+                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now, sess, *epoch);
                 }
                 // The exit's process is being replaced (session.rs).
                 Frame::Drain => *drains |= 1u32 << sess,

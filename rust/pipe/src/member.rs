@@ -34,6 +34,9 @@ pub struct Member {
     /// Up, its pings, its debt: spec/trunk.md, "Members' health".
     pub h: Health,
     pub hello_at: u64,
+    /// The exit's epoch its last hello said (zero before the first): the
+    /// process whose answers it carries (data.rs deliver).
+    pub epoch: [u8; 8],
     /// Without a brain: when a member taken down gets its new socket (0:
     /// not waiting for one).
     pub renew_at: u64,
@@ -80,6 +83,7 @@ impl Member {
             fd,
             h: Health::new(true),
             hello_at: 0,
+            epoch: [0; 8],
             renew_at: 0,
             out: vec![0; SLOT * BATCH],
             out_n: 0,
