@@ -104,6 +104,14 @@ type Pipe struct {
 	// more.
 	drained     chan struct{}
 	drainedOnce sync.Once
+
+	// receivers is the pipe's latest word on the receivers and when it
+	// came; activeIP the active receiver's address once the brain moved
+	// the entry off the one its wires were given (receivers_linux.go):
+	// the brain's new members dial it on their wire's port.
+	receivers   Receivers
+	receiversAt time.Time
+	activeIP    netip.Addr
 }
 
 // listenConf is a client port as the brain gave it, to give it again to
@@ -552,6 +560,15 @@ func (p *Pipe) read() {
 			if p.cfg.OnObserved != nil {
 				p.cfg.OnObserved(o)
 			}
+		case pReceivers:
+			r, err := parseReceivers(m)
+			if err != nil {
+				p.cfg.Logf("%v", err)
+				continue
+			}
+			p.mu.Lock()
+			p.receivers, p.receiversAt = r, time.Now()
+			p.mu.Unlock()
 		case pClients, pStats:
 			select {
 			case p.answers <- append([]byte(nil), m...):
@@ -584,7 +601,13 @@ func (p *Pipe) renew(id trunk.WireID, index int) {
 	if wc == nil || wc.w.H3 != nil || index >= len(wc.members) {
 		return
 	}
-	c, err := dialMember(wc.w.Exit)
+	exit := wc.w.Exit
+	p.mu.Lock()
+	if p.activeIP.IsValid() {
+		exit = netip.AddrPortFrom(p.activeIP, exit.Port())
+	}
+	p.mu.Unlock()
+	c, err := dialMember(exit)
 	if err != nil {
 		p.cfg.Logf("pipectl: wire %d member %d: %v", id, index, err)
 		return

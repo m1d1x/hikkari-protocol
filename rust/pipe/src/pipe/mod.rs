@@ -44,7 +44,7 @@ use std::net::{SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
 
 use generation::Older;
-use session::Sess;
+use session::{Receiver, Sess};
 use tcp::{TcpListen, Why};
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
@@ -146,6 +146,8 @@ pub struct Pipe {
     sessions: Vec<Sess>,
     cur: u8,
     next: Option<u8>,
+    /// The receivers on standby (session.rs): the brain's B_RECEIVER.
+    receivers: Vec<Receiver>,
     drains: u32,
     /// The exits' epochs the members' hellos said this turn, by session
     /// (session.rs saw_epochs).
@@ -223,6 +225,7 @@ impl Pipe {
             sessions: vec![Sess::new(now)],
             cur: 0,
             next: None,
+            receivers: Vec::new(),
             drains: 0,
             epochs: Vec::new(),
             marks: Vec::new(),
@@ -301,7 +304,7 @@ impl Pipe {
             w.exit = Some(a.exit);
             if let Some((sni, roots, usage)) = &a.h3 {
                 let f = h3::Form { exit: a.exit, sni: sni.clone(), roots: roots.clone(), usage: *usage, ports: a.ports, token: key };
-                p.h3s.push(h3::H3::new(a.wire, f).map_err(io::Error::other)?);
+                p.h3s.push(h3::H3::new(a.wire, 0, f).map_err(io::Error::other)?);
                 w.h3 = true;
                 w.glue_max = a.glue_max.min(h3::frames_max(*usage));
             }
@@ -536,7 +539,7 @@ impl Pipe {
                 dgrams,
                 w.t.up_pkts as f64 / dgrams.max(1) as f64
             );
-            if let Some(h) = self.h3s.iter().find(|h| h.id == w.id).filter(|_| w.h3 && w.sess == self.cur) {
+            if let Some(h) = self.h3s.iter().find(|h| h.id == w.id && h.rx == w.rx).filter(|_| w.h3 && w.sess == self.cur) {
                 s += &h.stats();
                 let now = now_ns();
                 let stale: u64 = w.members.iter().filter_map(|m| m.sched.as_ref()).map(|q| q.n.stale).sum();

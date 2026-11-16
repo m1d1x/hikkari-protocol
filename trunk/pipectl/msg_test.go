@@ -165,3 +165,35 @@ func TestStatsGolden(t *testing.T) {
 		t.Fatalf("stats %+v, want %+v", s, want)
 	}
 }
+
+// TestReceiversGolden: the brain writes a receiver and the active one, and
+// reads the receivers, in the bytes of rust/pipe/src/ctl.rs
+// speaks_the_brains_receivers.
+func TestReceiversGolden(t *testing.T) {
+	b, err := putReceiver(1, netip.MustParseAddr("10.0.0.2"), 8)
+	if err != nil || hex.EncodeToString(b) != "11010a00000208" {
+		t.Fatalf("receiver %x %v", b, err)
+	}
+	if b, _ := putReceiver(1, netip.Addr{}, 0); hex.EncodeToString(b) != "11010000000000" {
+		t.Fatalf("a receiver taken away %x", b)
+	}
+	if _, err := putReceiver(1, netip.MustParseAddr("::1"), 0); err == nil {
+		t.Fatal("an IPv6 receiver taken")
+	}
+	if got := hex.EncodeToString(putActive(1)); got != "1201" {
+		t.Fatalf("active %s", got)
+	}
+	m, _ := hex.DecodeString("8a0001010a0000020203060578000000000808ffffffff")
+	r, err := parseReceivers(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Receivers{Active: 0, Standby: []ReceiverTick{{Rx: 1, IP: netip.MustParseAddr("10.0.0.2"), Wires: []WireTick{
+		{ID: 3, Members: 6, Up: 5, ProofAgo: 120 * time.Millisecond}, {ID: 0, Members: 8, Up: 8, ProofAgo: -1}}}}}
+	if !reflect.DeepEqual(r, want) {
+		t.Fatalf("receivers %+v, want %+v", r, want)
+	}
+	if _, err := parseReceivers(m[:len(m)-1]); err == nil {
+		t.Fatal("torn receivers read")
+	}
+}

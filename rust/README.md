@@ -266,6 +266,8 @@ Brain → pipe:
 | `tcp_listen` | a client port of streams (one listening TCP socket): id, the exit's loopback port; every connection accepted is a stream on the pools (R4.2) |
 | `stats` | the counters of the brain's minute line, now: answered by `stats` |
 | `clients` | the leg client → entry of the minute, now: the pipe reads every client's TCP socket (`tcp_info`) and answers `clients` |
+| `receiver` | a receiver on standby (hikkari-client plans/2026-11-16-second-receiver.md): rx, its IPv4 address on the active receiver's ports, how many members its pools keep (0: as many as the active one's); 0.0.0.0 takes it away. The pipe keeps it warm: a session of its own with every wire and pool the current one has, its members the pipe's own, carrying nothing (`session.rs`) |
+| `active` | rx: the receiver that carries everything from now. Its standby session becomes the current one; what the old receiver's sessions carry is cut at once (clients dial again and land on rx), and the old receiver goes on standby. The brain dials the bare UDP wires' new members to rx's address from now (`pipectl` `SetActive`) |
 | `pool` | a wire of stream members the pipe dials itself from its book of source ports: id, form (plain TCP to the exit's member port, or Chromium's CONNECT to its relay), members, their stall, the book's range, the exit; for Chromium the relay's domain, the trunk key, libcronet's path and PEM roots (empty: the system's). The same pool again changes only the stall; a new form, exit or number of members brings the members up anew, no stream reset (R4.2) |
 
 Pipe → brain:
@@ -280,6 +282,7 @@ Pipe → brain:
 | `drained` | a pipe draining carries nothing more: no client's flow, no stream |
 | `stats` | the answer to the brain's `stats`: clients' streams opened and reset, chunks sent again, client bytes up and down, the pool's dead ports and kills, the pipe's pauses in all, the pool's members' round trips at p50, p90 and the most (the Go entry's minute line, trunk Stats) |
 | `observed` | a report of a tester's stream or flow (spec/trunk.md, "Observation"), at the exit's mark and at its end: the trunk's counters for it (bytes, chunks, sent again, members that carried and died owing it, the longest wait for a confirmation, datagrams and copies, how it ended) and a stream's client TCP; the pipe's hellos say it reads observe frames (`CAP_OBSERVE`) |
+| `receivers` | after each tick while there is a receiver on standby: the active receiver, and each on standby with its address and, per wire and pool, members, up and when one last heard its exit; the brain moves the entry by it |
 | `clients` | the answer to the brain's `clients`: client sockets open and closed in the minute, the sockets that sent, segments sent to clients and sent again (`tcpi_segs_out`, `tcpi_total_retrans`, a socket read each minute and once more as it closes), the round trips of the sockets that sent at p50 and p90; no client named, as the Go entry's `clients tcp` line |
 
 A client port must be bound for IPv4 (`udp4`, `tcp4`): the pipe reads clients' addresses as `sockaddr_in` and refuses

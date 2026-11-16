@@ -94,6 +94,7 @@ impl Pipe {
             for li in 0..members {
                 self.redial(wi, li, now);
             }
+            self.receivers_stale();
             return Ok(());
         };
         self.swires[wi].stall_ns = stall_ns;
@@ -117,6 +118,8 @@ impl Pipe {
                 self.redial(wi, li, now);
             }
         }
+        // The receivers on standby take the active one's pools anew.
+        self.receivers_stale();
         Ok(())
     }
 

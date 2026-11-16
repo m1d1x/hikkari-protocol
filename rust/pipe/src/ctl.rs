@@ -7,7 +7,7 @@
 
 use crate::route::Route;
 
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -26,6 +26,8 @@ pub const B_STATS: u8 = 0x0f; // the counters of the brain's minute line, now (a
 pub const B_CLIENTS: u8 = 0x0e; // the leg client → entry of the minute, now (answered by P_CLIENTS)
 pub const B_COPIES: u8 = 0x10; // members u8, window_us u32: the pool's members of copies and their window (copies.rs); 0 members: none
 pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots (rest)
+pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver on standby at ip, the active one's ports (0.0.0.0: taken away)
+pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -37,6 +39,7 @@ pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no clie
 pub const P_OBSERVED: u8 = 0x88; // a report of a tester's stream or flow: see put_observed
 pub const P_STATS: u8 = 0x89; // see put_stats
 pub const P_CLIENTS: u8 = 0x87; // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (NONE_MS: none)
+pub const P_RECEIVERS: u8 = 0x8a; // active u8, n u8 + n × (rx u8, ip [4], k u8 + k × (wire u8, members u8, up u8, proof_ago_ms u32)): see put_receivers
 
 /// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
 pub const FORM_UDP: u8 = 1;
@@ -86,6 +89,8 @@ pub enum Msg<'a> {
     Copies { members: u8, window_us: u32 },
     Clients,
     Stats,
+    Receiver { rx: u8, ip: std::net::Ipv4Addr, pool_members: u8 },
+    Active { rx: u8 },
 }
 
 /// A wire of stream members (B_POOL): its members, their stall and source
@@ -177,6 +182,12 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_COPIES if m.len() == 6 => Msg::Copies { members: r.u8()?, window_us: r.u32()? },
         B_CLIENTS if m.len() == 1 => Msg::Clients,
         B_STATS if m.len() == 1 => Msg::Stats,
+        B_RECEIVER if m.len() == 7 => {
+            let rx = r.u8()?;
+            let ip: [u8; 4] = r.take(4)?.try_into().ok()?;
+            Msg::Receiver { rx, ip: ip.into(), pool_members: r.u8()? }
+        }
+        B_ACTIVE if m.len() == 2 => Msg::Active { rx: r.u8()? },
         _ => return None,
     })
 }
@@ -409,6 +420,37 @@ pub fn put_clients(out: &mut [u8], m: &crate::streams::LegMinute) -> usize {
     37
 }
 
+/// A receiver on standby in a tick (P_RECEIVERS): its wires and pools as
+/// (id, members, up, proof_ago_ms); none before its session is open.
+pub struct ReceiverTick {
+    pub rx: u8,
+    pub ip: std::net::Ipv4Addr,
+    pub wires: Vec<(u8, u8, u8, u32)>,
+}
+
+/// P_RECEIVERS: the active receiver, then each one on standby. out must
+/// hold 3 + Σ (6 + 7 × its wires).
+pub fn put_receivers(out: &mut [u8], active: u8, rs: &[ReceiverTick]) -> usize {
+    out[0] = P_RECEIVERS;
+    out[1] = active;
+    out[2] = rs.len() as u8;
+    let mut at = 3;
+    for r in rs {
+        out[at] = r.rx;
+        out[at + 1..at + 5].copy_from_slice(&r.ip.octets());
+        out[at + 5] = r.wires.len() as u8;
+        at += 6;
+        for &(id, members, up, proof) in &r.wires {
+            out[at] = id;
+            out[at + 1] = members;
+            out[at + 2] = up;
+            out[at + 3..at + 7].copy_from_slice(&proof.to_le_bytes());
+            at += 7;
+        }
+    }
+    at
+}
+
 pub fn put_dgram(out: &mut [u8], tag: u32, payload: &[u8]) -> usize {
     out[0] = P_DGRAM;
     out[1..5].copy_from_slice(&tag.to_le_bytes());
@@ -436,7 +478,27 @@ mod tests {
     const STATS_GOLDEN: &str = "8901000000000000000200000000000000030000000000000004000000000000000500000000000000060000000700000000000000080000000000000010270000204e000030750000";
     const OBSERVED_GOLDEN: &str = "88efcdab90785634120101fb200f2700000700000000000000080000000000000009000000000000000a000000000000000b0c0000000d000000000000000000000000000000000000000000000000000000010110270000e803000003000000010000000200000040000000c8000000c9000000";
     const CLIENTS_GOLDEN: &str = "870c00000003000000090000005abc000000000000250000000000000060470000e8ee0000";
+    /// receiverGolden: receiver 1 at 10.0.0.2, 8 pool members; activeGolden:
+    /// receiver 1; receiversGolden: active 0, receiver 1 at 10.0.0.2 with
+    /// wire 3 (6 members, 5 up, proof 120 ms ago) and pool 0 (8, 8, none).
+    const RECEIVER_GOLDEN: &str = "11010a00000208";
+    const ACTIVE_GOLDEN: &str = "1201";
+    const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
+
+    #[test]
+    fn speaks_the_brains_receivers() {
+        match parse(&unhex(RECEIVER_GOLDEN)) {
+            Some(Msg::Receiver { rx, ip, pool_members }) => assert_eq!((rx, ip, pool_members), (1, "10.0.0.2".parse().unwrap(), 8)),
+            _ => panic!("not a receiver"),
+        }
+        assert!(matches!(parse(&unhex(ACTIVE_GOLDEN)), Some(Msg::Active { rx: 1 })));
+        assert!(parse(&unhex("11010a000002")).is_none(), "a torn receiver");
+        let rs = [ReceiverTick { rx: 1, ip: "10.0.0.2".parse().unwrap(), wires: vec![(3, 6, 5, 120), (0, 8, 8, NONE_MS)] }];
+        let mut out = [0u8; 64];
+        let n = put_receivers(&mut out, 0, &rs);
+        assert_eq!(out[..n], unhex(RECEIVERS_GOLDEN)[..]);
+    }
 
     #[test]
     fn parses_the_brains_pool_and_tcp_port() {

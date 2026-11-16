@@ -114,10 +114,11 @@ impl Pipe {
             }
         }
         l.drop_sock(ports);
-        // Only the session that takes everything new replaces its members
-        // (session.rs); the brain hears the current session's.
+        // Only the session that takes everything new and the receivers' on
+        // standby replace their members (session.rs); the brain hears the
+        // current session's.
         let sess = self.swires[wi].sess;
-        if self.taker() == Some(sess) {
+        if self.renew_mask() & (1 << sess) != 0 {
             self.renew(wi, li, now);
         }
         // A stall is judged on a member up (its health took it down a moment

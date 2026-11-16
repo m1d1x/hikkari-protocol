@@ -37,13 +37,14 @@ impl Pipe {
         }
         let mut next = self.step_sessions(now).min(self.clock_at).min(self.h3_members(now));
         let alone = self.ctl.is_none();
-        let (cur, taker) = (self.cur, self.taker());
+        let (cur, renews) = (self.cur, self.renew_mask());
         let Pipe { wires, judge, tok, events, sessions, dirty, h3s, .. } = self;
         for w in wires.iter_mut() {
             // The brain hears and renews the current session's members; the
             // members of one coming up are the pipe's own (session.rs), and
-            // only the session that takes everything new replaces any.
-            let (brains, replaces) = (!alone && w.sess == cur, taker == Some(w.sess));
+            // only the session that takes everything new and the receivers'
+            // on standby (session.rs) replace any.
+            let (brains, replaces) = (!alone && w.sess == cur, renews & (1 << w.sess) != 0);
             for (mi, m) in w.members.iter_mut().enumerate() {
                 if m.renew_at != 0 {
                     if now >= m.renew_at && w.h3 {
@@ -94,7 +95,7 @@ impl Pipe {
                             // port rests, and the pipe opens a new one
                             // whatever the brain (h3.rs).
                             if w.h3 {
-                                if let Some(h) = h3s.iter_mut().find(|h| h.id == w.id) {
+                                if let Some(h) = h3s.iter_mut().find(|h| h.id == w.id && h.rx == w.rx) {
                                     h.give_back(m.port, true, now);
                                 }
                                 m.set_tunnel(None, 0);

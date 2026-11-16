@@ -69,9 +69,11 @@ pub(super) struct Form {
     pub token: [u8; h3dgram::TOKEN],
 }
 
-/// One QUIC wire's engine, book and opening member.
+/// One QUIC wire's engine, book and opening member, to one receiver.
 pub(super) struct H3 {
     pub id: u8,
+    /// The receiver its tunnels reach (session.rs, receivers).
+    pub rx: u8,
     pub form: Form,
     auth: String,
     starting: Option<Starting>,
@@ -91,11 +93,12 @@ pub(super) struct H3 {
 
 impl H3 {
     /// A wire's engine starting (off the loop) for form f.
-    pub fn new(id: u8, f: Form) -> Result<H3, String> {
+    pub fn new(id: u8, rx: u8, f: Form) -> Result<H3, String> {
         let book = Book::new(f.ports.0, f.ports.1, ports::DEAD_FOR_NS).map_err(|e| format!("wire {id}: {e}"))?;
         let proxy = Proxy { sni: f.sni.clone(), addr: f.exit, roots: f.roots.clone() };
         Ok(H3 {
             id,
+            rx,
             auth: h3dgram::authorization(&f.token),
             starting: Some(TunnelEngine::start_off_loop(proxy, true)),
             engine: None,
@@ -203,7 +206,7 @@ impl Pipe {
         if self.h3s.is_empty() {
             return u64::MAX;
         }
-        let (cur, taker, brains) = (self.cur, self.taker(), self.ctl.is_some());
+        let (cur, renews, brains) = (self.cur, self.renew_mask(), self.ctl.is_some());
         let Pipe { h3s, wires, events, dirty, .. } = self;
         let mut next = u64::MAX;
         for h in h3s.iter_mut() {
@@ -219,7 +222,7 @@ impl Pipe {
                     h.dialing = None;
                     h.failed += 1;
                     eprintln!("hk-pipe: wire {}: Chromium took no socket for a member's tunnel in 1 s", h.id);
-                    if let Some(m) = wires.iter_mut().find(|w| w.id == h.id && w.sess == s && w.h3).and_then(|w| w.members.get_mut(mi)) {
+                    if let Some(m) = wires.iter_mut().find(|w| w.id == h.id && w.rx == h.rx && w.sess == s && w.h3).and_then(|w| w.members.get_mut(mi)) {
                         h.book.release(m.port);
                         m.set_tunnel(None, 0);
                         m.renew_at = now + spread();
@@ -227,10 +230,10 @@ impl Pipe {
                     }
                 }
             }
-            let id = h.id;
-            for w in wires.iter_mut().filter(|w| w.id == id && w.h3) {
+            let (id, rx) = (h.id, h.rx);
+            for w in wires.iter_mut().filter(|w| w.id == id && w.rx == rx && w.h3) {
                 next = next.min(closed_tunnels(h, w, cur, brains, events, dirty, now));
-                if h.dialing.is_some() || taker != Some(w.sess) {
+                if h.dialing.is_some() || renews & (1 << w.sess) == 0 {
                     continue;
                 }
                 let Some(e) = &engine else { continue };
@@ -304,15 +307,16 @@ impl Pipe {
         let Some(sess) = self.taker() else {
             return Err(format!("wire {id}: the pipe drains, it takes no new member"));
         };
+        let rx = self.sessions[sess as usize].rx;
         hikkari_cronet::load((!m.cronet.is_empty()).then_some(m.cronet))?;
         let usage = if m.usage == ctl::USAGE_PROXY { Usage::Proxy } else { Usage::Destination };
         let roots = (!m.roots.is_empty()).then(|| m.roots.to_string());
         let f = Form { exit: m.exit, sni: m.sni.to_string(), roots, usage, ports: m.ports, token: key };
         let now = sys::now_ns();
-        if !self.h3s.iter().any(|h| h.id == id && h.form == f) {
-            let h = H3::new(id, f)?;
-            self.h3s.retain(|h| h.id != id);
-            for w in self.wires.iter_mut().filter(|w| w.id == id && w.h3) {
+        if !self.h3s.iter().any(|h| h.id == id && h.rx == rx && h.form == f) {
+            let h = H3::new(id, rx, f)?;
+            self.h3s.retain(|h| !(h.id == id && h.rx == rx));
+            for w in self.wires.iter_mut().filter(|w| w.id == id && w.rx == rx && w.h3) {
                 for m in w.members.iter_mut() {
                     m.set_tunnel(None, 0);
                     m.renew_at = 0;
@@ -328,6 +332,7 @@ impl Pipe {
             None => {
                 let mut w = Wire::new(id, key, dead_ms.max(1) as u64 * 1_000_000);
                 w.sess = sess;
+                w.rx = rx;
                 w.h3 = true;
                 w.exit = Some(m.exit);
                 self.wires.push(w);
@@ -336,7 +341,7 @@ impl Pipe {
         };
         let (wires, h3s) = (&mut self.wires, &mut self.h3s);
         let w = &mut wires[at];
-        let h = h3s.iter_mut().find(|h| h.id == id).expect("pushed above");
+        let h = h3s.iter_mut().find(|h| h.id == id && h.rx == rx).expect("pushed above");
         w.glue_ns = glue_us as u64 * 1000;
         let fmax = frames_max(usage);
         w.glue_max = (glue_max as usize).clamp(64, fmax);
@@ -352,6 +357,8 @@ impl Pipe {
         while w.members.len() < m.members as usize {
             w.members.push(crate::member::Member::plain(&key, fmax));
         }
+        // The receivers on standby take the active one's wires anew.
+        self.receivers_stale();
         self.dirty = true;
         Ok(())
     }

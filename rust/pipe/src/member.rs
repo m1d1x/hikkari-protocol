@@ -312,6 +312,9 @@ pub struct Wire {
     /// The session its members join (the pipe's session.rs): a wire has
     /// members in each session the pipe has, one Wire per session.
     pub sess: u8,
+    /// The receiver its members reach (the pipe's session.rs, receivers):
+    /// a QUIC wire's engine is its id's and its receiver's.
+    pub rx: u8,
     pub glue_ns: u64,
     pub glue_max: usize,
     /// Its members' stall (trunk Config.Stall): the brain's dead_ms.
@@ -338,6 +341,7 @@ impl Wire {
         Wire {
             id,
             sess: 0,
+            rx: 0,
             glue_ns: 0,
             glue_max: 0,
             stall_ns,

@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 8
+const Version = 9
 
 // Brain → pipe.
 const (
@@ -48,6 +48,9 @@ const (
 	bPool      = 0x0d // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots
 	bClients   = 0x0e // the leg client → entry of the minute, now (answered by pClients)
 	bStats     = 0x0f // the counters of the minute line, now (answered by pStats)
+	// receiver and active: the receivers (rust/pipe/src/pipe/session.rs).
+	bReceiver = 0x11 // rx u8, ip [4], pool_members u8: a receiver on standby at ip on the active one's ports (0.0.0.0: taken away)
+	bActive   = 0x12 // rx u8: the receiver that carries everything from now
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -59,15 +62,16 @@ const (
 
 // Pipe → brain.
 const (
-	pHello    = 0x81 // ver u16, pid u32
-	pTick     = 0x82
-	pMember   = 0x83 // wire u8, index u8, up u8, why u8
-	pDgram    = 0x84 // tag u32, payload
-	pError    = 0x85 // text
-	pDrained  = 0x86 // a pipe draining carries nothing more
-	pStats    = 0x89 // see parseStats
-	pObserved = 0x88 // a report of a tester's stream or flow: see parseObserved
-	pClients  = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
+	pHello     = 0x81 // ver u16, pid u32
+	pTick      = 0x82
+	pMember    = 0x83 // wire u8, index u8, up u8, why u8
+	pDgram     = 0x84 // tag u32, payload
+	pError     = 0x85 // text
+	pDrained   = 0x86 // a pipe draining carries nothing more
+	pStats     = 0x89 // see parseStats
+	pObserved  = 0x88 // a report of a tester's stream or flow: see parseObserved
+	pClients   = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
+	pReceivers = 0x8a // active u8, n u8 + n × (rx u8, ip [4], k u8 + k × (wire u8, members u8, up u8, proof_ago_ms u32)): see parseReceivers
 )
 
 // FormUDP is the bare UDP wire (trunk/udpwire): the brain dials its members.
@@ -385,6 +389,68 @@ func parseTick(m []byte) (Tick, error) {
 		t.Wires = append(t.Wires, w)
 	}
 	return t, nil
+}
+
+// putReceiver is a receiver on standby (ip invalid: taken away), its pools
+// keeping poolMembers (0: as many as the active one's).
+func putReceiver(rx byte, ip netip.Addr, poolMembers int) ([]byte, error) {
+	if poolMembers < 0 || poolMembers > 255 {
+		return nil, fmt.Errorf("pipectl: receiver %d: %d pool members, 0-255", rx, poolMembers)
+	}
+	var a [4]byte
+	if ip.IsValid() {
+		if !ip.Is4() {
+			return nil, fmt.Errorf("pipectl: receiver %d: %s is not IPv4", rx, ip)
+		}
+		a = ip.As4()
+	}
+	return append([]byte{bReceiver, rx}, a[0], a[1], a[2], a[3], byte(poolMembers)), nil
+}
+
+func putActive(rx byte) []byte { return []byte{bActive, rx} }
+
+// Receivers is the pipe's word on the receivers after each tick: the active
+// one, and each on standby with its wires and pools (ID, Members, Up and
+// ProofAgo of a WireTick; none before its session is open).
+type Receivers struct {
+	Active  byte
+	Standby []ReceiverTick
+}
+
+// ReceiverTick is one receiver on standby.
+type ReceiverTick struct {
+	Rx    byte
+	IP    netip.Addr
+	Wires []WireTick
+}
+
+func parseReceivers(m []byte) (Receivers, error) {
+	if len(m) < 3 {
+		return Receivers{}, errTorn
+	}
+	r := Receivers{Active: m[1]}
+	at := 3
+	for i := 0; i < int(m[2]); i++ {
+		if len(m) < at+6 {
+			return Receivers{}, errTorn
+		}
+		t := ReceiverTick{Rx: m[at], IP: netip.AddrFrom4([4]byte(m[at+1 : at+5]))}
+		k := int(m[at+5])
+		at += 6
+		if len(m) < at+7*k {
+			return Receivers{}, errTorn
+		}
+		for j := 0; j < k; j++ {
+			b := m[at:]
+			t.Wires = append(t.Wires, WireTick{ID: trunk.WireID(b[0]), Members: int(b[1]), Up: int(b[2]), ProofAgo: ms(binary.LittleEndian.Uint32(b[3:]))})
+			at += 7
+		}
+		r.Standby = append(r.Standby, t)
+	}
+	if at != len(m) {
+		return Receivers{}, errTorn
+	}
+	return r, nil
 }
 
 // Clients is a minute of the leg client → entry over every client's TCP

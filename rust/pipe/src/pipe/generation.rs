@@ -83,6 +83,7 @@ impl Pipe {
             return Err("drain: the pipe drains already".into());
         }
         self.drop_next();
+        self.drop_standbys();
         let mut s = SeqPacket::new(self.fds.remove(0), 0);
         let mut sent = true;
         let keys: Vec<u64> = self.flows.client_keys().collect();

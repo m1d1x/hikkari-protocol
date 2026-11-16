@@ -101,6 +101,9 @@ impl Pipe {
                 self.set_copies(members, window_us);
                 return Ok(());
             }
+            // The receivers (session.rs).
+            Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
+            Some(Msg::Active { rx }) => return self.set_active(rx),
             Some(Msg::Unwire { id }) => self.unpool(id),
             Some(Msg::Wire { h3: Some(_), .. }) => {
                 // The QUIC wire's strings point into the message buffer.
@@ -115,7 +118,8 @@ impl Pipe {
             _ => {}
         }
         let (cur, taker) = (self.cur, self.taker());
-        let Pipe { msg, fds, wires, swires, flows, route, later, listens, dirty, gro, moved, gone, h3s, .. } = self;
+        let taker_rx = taker.map_or(0, |s| self.sessions[s as usize].rx);
+        let Pipe { msg, fds, wires, swires, flows, route, later, listens, dirty, gro, moved, gone, h3s, receivers, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
         };
@@ -160,12 +164,13 @@ impl Pipe {
                 // A QUIC wire of the same id in this session goes: the id
                 // is the bare UDP wire's now.
                 wires.retain(|w| !(w.id == id && w.sess == sess && w.h3));
-                h3s.retain(|h| wires.iter().any(|w| w.id == h.id && w.h3));
+                h3s.retain(|h| wires.iter().any(|w| w.id == h.id && w.rx == h.rx && w.h3));
                 let at = match wires.iter().position(|w| w.id == id && w.sess == sess) {
                     Some(i) => i,
                     None => {
                         let mut w = Wire::new(id, key, health::STALL);
                         w.sess = sess;
+                        w.rx = taker_rx;
                         wires.push(w);
                         wires.len() - 1
                     }
@@ -198,12 +203,15 @@ impl Pipe {
                         None => w.members.push(Member::new(Some(s), &key)),
                     }
                 }
+                // The receivers on standby take the active one's wires anew.
+                receivers.iter_mut().for_each(|r| r.stale = true);
                 *dirty = true;
             }
             Msg::Unwire { id } => {
                 wires.retain(|w| w.id != id);
                 h3s.retain(|h| h.id != id);
                 gone.retain(|g| g.id != id);
+                receivers.iter_mut().for_each(|r| r.stale = true);
                 *dirty = true;
             }
             Msg::Route(r) => *route = *r,
@@ -223,7 +231,9 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Clients | Msg::Stats => unreachable!("taken above"),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } => {
+                unreachable!("taken above")
+            }
             Msg::Member { wire, index } => {
                 if fds.len() != 1 {
                     return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
@@ -378,5 +388,15 @@ impl Pipe {
         }
         let len = ctl::put_tick(&mut self.out, &p, &ticks[..n]);
         c.send(&self.out[..len]);
+        // The receivers on standby, after the active one's tick: the brain
+        // moves the entry by them (session.rs).
+        if !self.receivers.is_empty() {
+            let rs = self.standby_ticks(now);
+            let active = self.sessions[self.cur as usize].rx;
+            let len = ctl::put_receivers(&mut self.out, active, &rs);
+            if let Some(c) = &mut self.ctl {
+                c.send(&self.out[..len]);
+            }
+        }
     }
 }
