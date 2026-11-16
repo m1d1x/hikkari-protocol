@@ -85,13 +85,27 @@ impl Pipe {
         self.drop_next();
         let mut s = SeqPacket::new(self.fds.remove(0), 0);
         let mut sent = true;
+        // Its own flows' addresses by the listen's id, and those the older
+        // pipes that still drain through it keep (owner keys name the id
+        // already): the newer pipe hands their datagrams here, which hands
+        // them on (read_newer).
         let keys: Vec<u64> = self.flows.client_keys().collect();
-        for chunk in keys.chunks(OWN_MAX) {
+        let mut addrs: Vec<(u8, SocketAddrV4)> = keys
+            .iter()
+            .map(|&key| {
+                let (li, a) = split(key);
+                (self.listens[li].id, a)
+            })
+            .collect();
+        addrs.extend(self.owners.keys().map(|&k| {
+            let (listen, a) = split(k);
+            (listen as u8, a)
+        }));
+        for chunk in addrs.chunks(OWN_MAX) {
             self.out[0] = handoff::OWN;
             let mut at = 1;
-            for &key in chunk {
-                let (li, a) = split(key);
-                at += handoff::put_addr(&mut self.out[at..at + ADDR], self.listens[li].id, a);
+            for &(listen, a) in chunk {
+                at += handoff::put_addr(&mut self.out[at..at + ADDR], listen, a);
             }
             sent &= s.send(&self.out[..at]);
         }
@@ -172,6 +186,13 @@ impl Pipe {
             let Some(Msg::Dgram { listen, addr, payload }) = handoff::parse(&self.msg[..n]) else { continue };
             let Some(li) = self.listens.iter().position(|l| l.id == listen) else { continue };
             let sa = sys::sockaddr(addr);
+            // A flow of an older pipe that drains through this one goes on
+            // to it.
+            if let Some(&o) = self.owners.get(&owner_key(listen, &sa)) {
+                let p = payload.to_vec();
+                forward(&mut self.older[o as usize], &mut self.out, listen, &sa, &p, p.len().max(1));
+                continue;
+            }
             let key = client_key(li, &sa);
             if self.flows.find(key).is_none() {
                 // Ended here: the address is the new pipe's, with this
@@ -220,6 +241,14 @@ impl Pipe {
                     if self.owners.get(&ok) == Some(&(i as u32)) {
                         self.owners.remove(&ok);
                     }
+                    // A draining pipe opens no flow: the newer one does,
+                    // which this pipe told the older one kept the address.
+                    if let Some(ns) = &mut self.newer {
+                        let head = handoff::put_head(&mut self.out, handoff::FREE, listen, addr);
+                        self.out[head..head + payload.len()].copy_from_slice(payload);
+                        ns.send(&self.out[..head + payload.len()]);
+                        continue;
+                    }
                     let Some(li) = self.listens.iter().position(|l| l.id == listen) else { continue };
                     if payload.is_empty() {
                         continue;
@@ -246,9 +275,15 @@ impl Pipe {
                 let n = handoff::put_head(&mut self.out, handoff::FREE, self.listens[li].id, a);
                 s.send(&self.out[..n]);
             }
-            if !self.drained && self.flows.clients == 0 && self.streams.open == 0 {
+            // An older pipe still there drains through this one (it hands
+            // it the older one's datagrams and addresses): were this pipe to
+            // end under it, the older one would read the clients again
+            // beside the newest (read_newer). It ends first: it began to
+            // drain first.
+            let older = self.older.iter().any(|o| o.sock.is_some());
+            if !self.drained && self.flows.clients == 0 && self.streams.open == 0 && !older {
                 self.drained = true;
-                eprintln!("hk-pipe: drained: no flow, no stream");
+                eprintln!("hk-pipe: drained: no flow, no stream, no older generation");
                 if let Some(c) = &mut self.ctl {
                     c.send(&[ctl::P_DRAINED]);
                 }
