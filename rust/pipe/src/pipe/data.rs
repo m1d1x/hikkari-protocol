@@ -86,11 +86,12 @@ impl Pipe {
                                 w.t.down_pkts += 1;
                                 w.t.down_bytes += len as u64;
                                 *moved += 1;
-                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess);
+                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess, m.epoch);
                             }
                             Frame::Hello => {
                                 if let Some(h) = frame::read_hello(p, at) {
                                     epochs.push((sess, h.epoch));
+                                    m.epoch = h.epoch;
                                 }
                                 if !m.h.up {
                                     m.h.join(now);
@@ -124,6 +125,7 @@ impl Pipe {
                             // `h3dgram`): the frame once whole is the one dgram it
                             // must be, sent out of where it was put together.
                             Frame::Frag { id, index, count, off, len } => {
+                                let epoch = m.epoch;
                                 let r = m.reasm.get_or_insert_with(|| Box::new(Reasm::new()));
                                 if let Some(whole) = r.piece(now, id, index, count, &p[off..off + len]) {
                                     match frame::next_frame(whole, 0) {
@@ -131,7 +133,7 @@ impl Pipe {
                                             w.t.down_pkts += 1;
                                             w.t.down_bytes += len as u64;
                                             *moved += 1;
-                                            deliver(flows, listens, ctl, out, &whole[off..off + len], stream, seq, now, sess);
+                                            deliver(flows, listens, ctl, out, &whole[off..off + len], stream, seq, now, sess, epoch);
                                         }
                                         _ => *bad += 1,
                                     }
@@ -175,12 +177,25 @@ impl Pipe {
 /// (spec/trunk.md, "Datagrams"), as is one whose flow ended here, and one
 /// from another session than its flow's (a brain's call moved to the new
 /// one: the exit's old process still answers what it had).
+///
+/// `epoch` is the exit's process the member's hello named: each process
+/// numbers a flow's answers from its own count, so an answer of another
+/// process than the last one's starts the window anew. Two processes that
+/// answered the same flow (an older generation that took the wires back
+/// beside the newest, unl1 16.11) left the window at the higher count, and
+/// the live one's answers fell under it as old, every one, until a reload.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64, sess: u8) {
+pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64, sess: u8, epoch: [u8; 8]) {
     let Some((f, counts)) = flows.with_counts(stream) else { return };
     if f.sess != sess {
         return;
+    }
+    if epoch != f.replay_epoch && epoch != [0; 8] {
+        if f.replay_epoch != [0; 8] {
+            f.replay = Default::default();
+        }
+        f.replay_epoch = epoch;
     }
     let echo = f.echo();
     if f.replay.seen(seq) {

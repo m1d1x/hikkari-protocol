@@ -48,8 +48,11 @@ pub struct Flow {
     pub pin: u8,
     pub port: u16,
     pub copies: u8,
-    /// The copies of its answers already seen.
+    /// The copies of its answers already seen, and the exit's epoch of the
+    /// process that numbered them (zero before the first answer): each
+    /// process numbers its answers anew.
     pub replay: Replay,
+    pub replay_epoch: [u8; 8],
     /// When it last sent a datagram or got one that was not a copy.
     pub used: u64,
     /// The session it goes on (the pipe's session.rs): the one that took
@@ -64,7 +67,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn new(dest: Dest, class: u8, pin: u8, port: u16, copies: u8, now: u64) -> Flow {
-        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
+        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), replay_epoch: [0; 8], used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
     }
 
     /// The trunk's own call, not a client's: neither end counts it among its

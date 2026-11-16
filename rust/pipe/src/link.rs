@@ -119,6 +119,9 @@ pub struct Link {
     pub port: u16,
     /// When the exit's hello came on its connection (0: not yet).
     pub up_at: u64,
+    /// The exit's epoch its hello said (zero before it): the process whose
+    /// answers it carries (data.rs deliver).
+    pub epoch: [u8; 8],
     /// The wait before its next dial beyond the spread, and its stalls in a
     /// row (trunk Entry.slot: backoff, stalls).
     pub backoff_ns: u64,
@@ -156,6 +159,7 @@ impl Link {
             renew_at: 0,
             port: 0,
             up_at: 0,
+            epoch: [0; 8],
             backoff_ns: 0,
             stalls: 0,
         }
