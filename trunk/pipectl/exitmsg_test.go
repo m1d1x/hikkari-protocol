@@ -1,0 +1,129 @@
+package pipectl
+
+import (
+	"encoding/hex"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/m1d1x/hikkari-protocol/trunk"
+)
+
+// The same bytes as rust/exit/src/ctl.rs WIRE_GOLDEN, TICK_GOLDEN and
+// POOL_GOLDEN. The
+// wire's keys there are 0xaa and 0xbb repeated: the brain sends udpwire.Key
+// of each trunk key, so the test sets them past the derivation.
+const (
+	exitWireGolden = "030201e8030000b0042c013075000002aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	exitTickGolden = "82ffffffff01000000390500000200000004000000030000001300000014000000050000000000000006000000000000000700000000000000080000000000000009000000000000000a000000000000000b000000000000000c000000000000000d000000000000000e000000000000000f00000000000000100000000000000011000000000000001200000000000000150000000000000016000000000000001700000000000000180000000000000019000000000000001a000000000000001b000000000000001c000000000000001d000000000000001e000000000000001f000000000000002000000000000000"
+	exitPoolGolden = "0b2c0130750000"
+	// rust/exit/src/ctl.rs H3_WIRE_GOLDEN: wire 6, one token (set to 0xcc
+	// past the derivation), the files /c.pem and /k.pem.
+	exitH3WireGolden = "030602e8030000b0042c013075000001cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc06002f632e70656d06002f6b2e70656d"
+)
+
+func TestExitGolden(t *testing.T) {
+	b, err := putExitWire(ExitWire{ID: 2, Form: FormUDP, Glue: time.Millisecond, GlueMax: 1200, Stall: 300 * time.Millisecond, Quiet: 30 * time.Second,
+		Keys: []string{"k1-0123456789abcdefghijkl", "k2-0123456789abcdefghijkl"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := 16
+	for i := range 64 {
+		b[head+i] = 0xaa
+		if i >= 32 {
+			b[head+i] = 0xbb
+		}
+	}
+	if got := hex.EncodeToString(b); got != exitWireGolden {
+		t.Fatalf("exit wire %s, want %s", got, exitWireGolden)
+	}
+	if _, err := putExitWire(ExitWire{ID: 2, Form: FormUDP}); err == nil {
+		t.Fatal("a wire with no key taken")
+	}
+	h3 := ExitWire{ID: 6, Form: FormH3Dgram, Glue: time.Millisecond, GlueMax: 1200, Stall: 300 * time.Millisecond, Quiet: 30 * time.Second,
+		Keys: []string{"k1-0123456789abcdefghijkl"}, CertFile: "/c.pem", KeyFile: "/k.pem"}
+	b, err = putExitWire(h3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 32 {
+		b[16+i] = 0xcc
+	}
+	if got := hex.EncodeToString(b); got != exitH3WireGolden {
+		t.Fatalf("exit h3dgram wire %s, want %s", got, exitH3WireGolden)
+	}
+	h3.KeyFile = ""
+	if _, err := putExitWire(h3); err == nil {
+		t.Fatal("a QUIC wire without its key's file taken")
+	}
+	if got := putExitCopies(4 * time.Millisecond); !reflect.DeepEqual(got, []byte{xCopies, 0xa0, 0x0f, 0, 0}) {
+		t.Fatalf("exit copies % x", got)
+	}
+	if got := putExitPorts([]uint16{8443, 80}); !reflect.DeepEqual(got, []byte{xPorts, 2, 0, 0xfb, 0x20, 0x50, 0}) {
+		t.Fatalf("ports % x", got)
+	}
+	if got := hex.EncodeToString(putExitPool(300*time.Millisecond, 30*time.Second)); got != exitPoolGolden {
+		t.Fatalf("exit pool %s, want %s", got, exitPoolGolden)
+	}
+	m, _ := hex.DecodeString(exitTickGolden)
+	tk, err := parseExitTick(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ExitTick{PauseAgo: -1, Pauses: 1, LateMax: 1337 * time.Microsecond, Sessions: 2, Members: 4, Flows: 3,
+		Links: 19, Streams: 20,
+		Joined: 5, Silent: 6, Quiet: 7, Gone: 8, DgramsOut: 9, DgramsIn: 10, DgramsCopy: 11, FlowsIdle: 12, Refused: 13,
+		WIn: 14, WOut: 15, FramesOut: 16, Bad: 17, Dropped: 18,
+		StreamsOpened: 21, StreamsFin: 22, ResetPeer: 23, ResetLocal: 24, Hit: 25, Resent: 26, Up: 27, Down: 28,
+		Early: 29, EarlyDropped: 30, RefusedStreams: 31, LinkDgrams: 32}
+	if tk != want {
+		t.Fatalf("exit tick %+v, want %+v", tk, want)
+	}
+	if _, err := parseExitTick(m[:len(m)-1]); err == nil {
+		t.Fatal("a torn exit tick read")
+	}
+}
+
+// The same bytes as rust/exit/src/ctl.rs OBSERVED_GOLDEN, LOCAL_GOLDEN and
+// MARK_GOLDEN.
+const (
+	exitObservedGolden = "8888776655443322110100bb01dc050000000400000000000000080000000000000300000000000000010000000000000002010000002800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	exitLocalGolden    = "870102419c000102030405060708090a0b0c0d0e0f07000000"
+	exitMarkGolden     = "0f01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa090000000807060504030201"
+)
+
+func TestExitObservationGolden(t *testing.T) {
+	m, _ := hex.DecodeString(exitObservedGolden)
+	o, err := parseObserved(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := trunk.Report{ID: 0x1122334455667788, Kind: trunk.ObsStream, Phase: trunk.PhaseMark, Port: 443, Age: 1500 * time.Millisecond,
+		Up: 1024, Down: 2048, Chunks: 3, Resent: 1, Carriers: 2, Deaths: 1, MaxWait: 40 * time.Millisecond}
+	if !reflect.DeepEqual(o.Report, want) || o.HaveTCP {
+		t.Fatalf("the exit's observed %+v (tcp %v), want %+v", o.Report, o.HaveTCP, want)
+	}
+	m, _ = hex.DecodeString(exitLocalGolden)
+	l, err := parseExitLocal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sid trunk.SessionID
+	for i := range sid {
+		sid[i] = byte(i)
+	}
+	if l != (ExitLocal{Open: true, Kind: trunk.ObsFlow, Port: 40001, Session: sid, Stream: 7}) {
+		t.Fatalf("the exit's local %+v", l)
+	}
+	if _, err := parseExitLocal(m[:len(m)-1]); err == nil {
+		t.Fatal("a torn local read")
+	}
+	var aa trunk.SessionID
+	for i := range aa {
+		aa[i] = 0xaa
+	}
+	if got := hex.EncodeToString(putExitMark(trunk.ObsStream, aa, 9, 0x0102030405060708)); got != exitMarkGolden {
+		t.Fatalf("exit mark %s, want %s", got, exitMarkGolden)
+	}
+}

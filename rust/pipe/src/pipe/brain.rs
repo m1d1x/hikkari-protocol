@@ -1,0 +1,402 @@
+//! The brain's messages (ctl.rs) and what the pipe tells the brain: member
+//! events at once, a tick of every wire a second.
+
+use std::io;
+use std::os::fd::AsRawFd;
+
+use hikkari_sys::{self as sys, now_ns, SendBatch};
+use hikkari_trunk::health;
+use hikkari_trunk::udpwire::OVERHEAD;
+
+use super::session::{add_counts, counted};
+use crate::link::NO_SESSION;
+use super::{ms, Listen, Pipe};
+use crate::carry::carry;
+use crate::ctl::{self, Msg, PipeTick, WireTick, ANY_WIRE, NONE_MS};
+use crate::flow::{Dest, Flow};
+use crate::member::{Member, Wire, SLOT};
+
+impl Pipe {
+    /// The brain's messages, all there are; false once the brain is gone.
+    pub(super) fn read_brain(&mut self) -> bool {
+        if self.ctl.is_none() || !self.poll.readable(0) {
+            return true;
+        }
+        loop {
+            self.fds.clear();
+            let r = self.ctl.as_mut().unwrap().recv(&mut self.msg, &mut self.fds);
+            match r {
+                Ok(None) => return true,
+                Ok(Some(0)) => return false,
+                Ok(Some(n)) => {
+                    if let Err(e) = self.handle(n) {
+                        self.error(&e);
+                    }
+                    for fd in self.fds.drain(..) {
+                        sys::close_fd(fd); // sockets the message did not take
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => self.error(&e.to_string()),
+                Err(_) => return false,
+            }
+        }
+    }
+
+    pub(super) fn error(&mut self, e: &str) {
+        let mut b = Vec::with_capacity(1 + e.len());
+        b.push(ctl::P_ERROR);
+        b.extend_from_slice(e.as_bytes());
+        if let Some(c) = &mut self.ctl {
+            c.send(&b);
+        }
+    }
+
+    /// One message of n bytes in self.msg, its sockets in self.fds (what it
+    /// takes it removes from there).
+    fn handle(&mut self, n: usize) -> Result<(), String> {
+        // A handoff's socket, whichever end: the generations' part.
+        match ctl::parse(&self.msg[..n]) {
+            Some(Msg::Drain) => return self.drain(),
+            Some(Msg::Adopt) => return self.adopt(),
+            // The streams' part (pool.rs).
+            Some(Msg::TcpListen { id, to }) => {
+                if self.fds.len() != 1 {
+                    return Err(format!("tcp listen {id}: {} sockets, want 1", self.fds.len()));
+                }
+                let fd = sys::tcp_from_fd(self.fds.remove(0)).map_err(|e| format!("tcp listen {id}: {e}"))?;
+                self.tcp_listen(id, to, fd);
+                return Ok(());
+            }
+            Some(Msg::Pool(_)) => {
+                // The pool's strings point into the message buffer.
+                let msg = std::mem::take(&mut self.msg);
+                let res = match ctl::parse(&msg[..n]) {
+                    Some(Msg::Pool(p)) => self.set_pool(&p),
+                    _ => unreachable!("parsed as a pool above"),
+                };
+                self.msg = msg;
+                return res;
+            }
+            // The leg client → entry of the minute (streams.rs Leg).
+            Some(Msg::Clients) => {
+                let m = crate::streams::Leg::minute(&mut self.streams);
+                if let Some(c) = &mut self.ctl {
+                    let mut b = [0u8; 40];
+                    let k = ctl::put_clients(&mut b, &m);
+                    c.send(&b[..k]);
+                }
+                return Ok(());
+            }
+            // The counters of the brain's minute line (ctl::Stats).
+            Some(Msg::Stats) => {
+                let s = self.stats_now();
+                if let Some(c) = &mut self.ctl {
+                    let mut b = [0u8; ctl::STATS_LEN];
+                    let k = ctl::put_stats(&mut b, &s);
+                    c.send(&b[..k]);
+                }
+                return Ok(());
+            }
+            Some(Msg::Copies { members, window_us }) => {
+                self.set_copies(members, window_us);
+                return Ok(());
+            }
+            // The receivers (session.rs).
+            Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
+            Some(Msg::Active { rx }) => return self.set_active(rx),
+            Some(Msg::Unwire { id }) => self.unpool(id),
+            Some(Msg::Wire { h3: Some(_), .. }) => {
+                // The QUIC wire's strings point into the message buffer.
+                let msg = std::mem::take(&mut self.msg);
+                let res = match ctl::parse(&msg[..n]) {
+                    Some(Msg::Wire { id, glue_us, glue_max, dead_ms, key, h3: Some(h), .. }) => self.set_h3(id, glue_us, glue_max, dead_ms, key, &h),
+                    _ => unreachable!("parsed as a QUIC wire above"),
+                };
+                self.msg = msg;
+                return res;
+            }
+            _ => {}
+        }
+        let (cur, taker) = (self.cur, self.taker());
+        let taker_rx = taker.map_or(0, |s| self.sessions[s as usize].rx);
+        let Pipe { msg, fds, wires, swires, flows, route, later, listens, dirty, gro, moved, gone, h3s, receivers, .. } = self;
+        let Some(m) = ctl::parse(&msg[..n]) else {
+            return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
+        };
+        let now = now_ns();
+        match m {
+            Msg::Hello { ver } => {
+                if ver != ctl::VERSION {
+                    return Err(format!("brain speaks version {ver}, the pipe {}", ctl::VERSION));
+                }
+            }
+            Msg::Listen { id, class, to, copies } => {
+                if fds.len() != 1 {
+                    return Err(format!("listen {id}: {} sockets, want 1", fds.len()));
+                }
+                let sock = sys::udp_from_fd(fds.remove(0)).map_err(|e| e.to_string())?;
+                sys::tune(&sock, *gro).map_err(|e| format!("listen {id}: {e}"))?;
+                let l = Listen { id, sock, class, to, copies, down: SendBatch::new() };
+                match listens.iter_mut().find(|l| l.id == id) {
+                    Some(old) => *old = l,
+                    None => listens.push(l),
+                }
+                *dirty = true;
+            }
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, key, .. } => {
+                if form != ctl::FORM_UDP {
+                    return Err(format!("wire {id}: form {form} is not one the pipe carries"));
+                }
+                if id == ANY_WIRE {
+                    return Err("wire 255 is no wire".into());
+                }
+                // New members join the session that takes everything new
+                // (session.rs); a pipe draining itself takes none.
+                let Some(sess) = taker else {
+                    return Err(format!("wire {id}: the pipe drains, it takes no new member"));
+                };
+                let mut socks = Vec::with_capacity(fds.len());
+                for fd in fds.drain(..) {
+                    let s = sys::udp_from_fd(fd).map_err(|e| e.to_string())?;
+                    sys::tune(&s, false).map_err(|e| format!("wire {id}: {e}"))?;
+                    socks.push(s);
+                }
+                // A QUIC wire of the same id in this session goes: the id
+                // is the bare UDP wire's now.
+                wires.retain(|w| !(w.id == id && w.sess == sess && w.h3));
+                h3s.retain(|h| wires.iter().any(|w| w.id == h.id && w.rx == h.rx && w.h3));
+                let at = match wires.iter().position(|w| w.id == id && w.sess == sess) {
+                    Some(i) => i,
+                    None => {
+                        let mut w = Wire::new(id, key, health::STALL);
+                        w.sess = sess;
+                        w.rx = taker_rx;
+                        wires.push(w);
+                        wires.len() - 1
+                    }
+                };
+                let w = &mut wires[at];
+                // A session coming up dials its own members where the
+                // brain's go.
+                if let Some(Ok(std::net::SocketAddr::V4(a))) = socks.first().map(|s| s.peer_addr()) {
+                    w.exit = Some(a);
+                }
+                w.glue_ns = glue_us as u64 * 1000;
+                w.glue_max = (glue_max as usize).clamp(64, SLOT - OVERHEAD);
+                w.stall_ns = dead_ms.max(1) as u64 * 1_000_000;
+                // New sockets (or a new key) start the members over; a member
+                // keeps its counters. A member given its own socket again
+                // (the brain changed the wire's count, not its members) goes
+                // on as it was: up, glued, nothing to say again.
+                let rekey = w.key != key;
+                w.key = key;
+                w.members.truncate(socks.len());
+                for (i, s) in socks.into_iter().enumerate() {
+                    match w.members.get_mut(i) {
+                        Some(m) if !rekey && m.fd >= 0 && sys::same_socket(m.fd, s.as_raw_fd()) => {}
+                        Some(m) => {
+                            m.set_sock(Some(s));
+                            if rekey {
+                                m.rekey(&key);
+                            }
+                        }
+                        None => w.members.push(Member::new(Some(s), &key)),
+                    }
+                }
+                // The receivers on standby take the active one's wires anew.
+                receivers.iter_mut().for_each(|r| r.stale = true);
+                *dirty = true;
+            }
+            Msg::Unwire { id } => {
+                wires.retain(|w| w.id != id);
+                h3s.retain(|h| h.id != id);
+                gone.retain(|g| g.id != id);
+                receivers.iter_mut().for_each(|r| r.stale = true);
+                *dirty = true;
+            }
+            Msg::Route(r) => *route = *r,
+            Msg::Open { tag, class, pin, port, copies } => {
+                let mut f = Flow::new(Dest::Brain { tag }, class, pin, port, copies, now);
+                f.sess = cur;
+                flows.open(tag, f)?;
+            }
+            Msg::Dgram { tag, payload } => {
+                let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
+                    return Ok(()); // closed under it
+                };
+                carry(wires, swires, route, later, f, id, payload, now);
+                if !f.echo() {
+                    n.out += 1;
+                }
+                *moved += 1;
+            }
+            Msg::Close { tag } => flows.close(tag),
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } => {
+                unreachable!("taken above")
+            }
+            Msg::Member { wire, index } => {
+                if fds.len() != 1 {
+                    return Err(format!("member {wire}/{index}: {} sockets, want 1", fds.len()));
+                }
+                // The QUIC wire's members are the pipe's own (h3.rs).
+                let Some(m) = wires.iter_mut().find(|w| w.id == wire && w.sess == cur && !w.h3).and_then(|w| w.members.get_mut(index as usize)) else {
+                    return Err(format!("member {wire}/{index}: no such member"));
+                };
+                // Only a member down of the session that replaces its
+                // members takes it (session.rs): one of a session handing
+                // over to the next, or retired, comes back to no one, and a
+                // socket that comes after a takeover finds a member of the
+                // new session up. The socket left in fds is closed.
+                if taker != Some(cur) || m.fd >= 0 || m.renew_at != 0 {
+                    return Ok(());
+                }
+                let s = sys::udp_from_fd(fds.remove(0)).map_err(|e| e.to_string())?;
+                sys::tune(&s, false).map_err(|e| e.to_string())?;
+                m.set_sock(Some(s));
+                *dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Member events go to the brain at once, and a tick after them: the
+    /// selector reads a wire's members from ticks, and need not wait for the
+    /// next second to see one gone.
+    pub(super) fn send_events(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let tick = self.ctl.is_some();
+        for e in std::mem::take(&mut self.events) {
+            match &mut self.ctl {
+                Some(c) => {
+                    let mut b = [0u8; 8];
+                    let n = ctl::put_member(&mut b, e.wire, e.index, e.up, e.why);
+                    c.send(&b[..n]);
+                }
+                None => eprintln!("hk-pipe: wire {} member {} {} (why {})", e.wire, e.index, if e.up { "up" } else { "down" }, e.why),
+            }
+        }
+        if tick {
+            self.send_tick(now_ns());
+        }
+    }
+
+    /// The counters of the brain's minute line now (ctl::Stats).
+    fn stats_now(&self) -> ctl::Stats {
+        let n = &self.streams.n;
+        let (dead, kills) = self.ports.dead_now();
+        let mut rtts: Vec<u64> = Vec::new();
+        // The pools are the stream wires (StreamWire): their members up.
+        for w in self.swires.iter().filter(|w| w.sess == self.cur) {
+            rtts.extend(w.links.iter().filter(|l| l.h.up && l.h.rtt > 0).map(|l| l.h.rtt));
+        }
+        rtts.sort_unstable();
+        // The Go entry's rttAt: the q-th percentile is the ceil(len*q/100)-th.
+        let at = |q: usize| {
+            let i = (rtts.len() * q).div_ceil(100).max(1);
+            (rtts[i - 1] / 1000).min(u32::MAX as u64 - 1) as u32
+        };
+        ctl::Stats {
+            opened: n.opened,
+            reset: n.reset_peer + n.reset_local,
+            resent: n.resent,
+            up: n.up,
+            down: n.down,
+            dead_ports: dead as u32,
+            port_kills: kills,
+            paused_ms: self.judge.paused / 1_000_000,
+            rtt_us: (!rtts.is_empty()).then(|| (at(50), at(90), at(100))),
+        }
+    }
+
+    pub(super) fn send_tick(&mut self, now: u64) {
+        let p = PipeTick {
+            pause_ago_ms: if self.judge.resumed == 0 { NONE_MS } else { ms(now - self.judge.resumed) },
+            pauses: self.judge.pauses,
+            late_max_us: (self.late_max / 1000).min(u32::MAX as u64) as u32,
+            flows: self.flows.clients,
+            dgrams_out: self.flows.n.out,
+            dgrams_in: self.flows.n.delivered,
+            dgrams_copy: self.flows.n.copies,
+            flows_idle: self.flows.n.idle,
+            retired: self.sessions.iter().filter(|s| s.live && s.retired_at != 0).count() as u8,
+            coming: self.next.is_some(),
+            streams: self.streams.open as u32,
+        };
+        self.late_max = 0;
+        let Some(c) = &mut self.ctl else { return };
+        let mut ticks = [WireTick::default(); 32];
+        let mut n = 0;
+        // The current session's wires, with what every session counted on
+        // each (session.rs: the brain sees the current one alone).
+        for w in self.wires.iter().filter(|w| w.sess == self.cur).take(ticks.len()) {
+            let mut t = counted(w);
+            for o in self.wires.iter().filter(|o| o.id == w.id && o.sess != w.sess) {
+                add_counts(&mut t, &counted(o));
+            }
+            for g in self.gone.iter().filter(|g| g.id == w.id) {
+                add_counts(&mut t, g);
+            }
+            t.members = w.members.len() as u8;
+            t.up = w.up() as u8;
+            t.owed_ms = 0;
+            t.rtt_us = 0;
+            let mut first = true;
+            for m in w.members.iter().filter(|m| m.h.up) {
+                let owed = ms(m.h.owed(&self.judge, now));
+                t.owed_ms = if first { owed } else { t.owed_ms.min(owed) };
+                first = false;
+                if m.h.rtt > 0 {
+                    let us = (m.h.rtt / 1000) as u32;
+                    t.rtt_us = if t.rtt_us == 0 { us } else { t.rtt_us.min(us) };
+                }
+            }
+            t.proof_ago_ms = if w.proof == 0 { NONE_MS } else { ms(now - w.proof) };
+            ticks[n] = t;
+            n += 1;
+        }
+        // The current session's pools, as wires: the selector reads the
+        // pool's members as any wire's.
+        for w in self.swires.iter().filter(|w| w.sess == self.cur) {
+            if n == ticks.len() {
+                break;
+            }
+            let mut t = w.t;
+            for o in self.swires.iter().filter(|o| o.id == w.id && o.sess != w.sess && o.sess != NO_SESSION) {
+                add_counts(&mut t, &o.t);
+            }
+            for g in self.gone.iter().filter(|g| g.id == w.id) {
+                add_counts(&mut t, g);
+            }
+            t.members = w.links.len() as u8;
+            t.up = w.up() as u8;
+            let (mut owed, mut rtt) = (None::<u32>, 0u32);
+            for l in w.links.iter().filter(|l| l.h.up) {
+                let o = ms(l.h.owed(&self.judge, now));
+                owed = Some(owed.map_or(o, |x| x.min(o)));
+                if l.h.rtt > 0 {
+                    let us = (l.h.rtt / 1000) as u32;
+                    rtt = if rtt == 0 { us } else { rtt.min(us) };
+                }
+            }
+            t.owed_ms = owed.unwrap_or(0);
+            t.rtt_us = rtt;
+            t.proof_ago_ms = if w.proof == 0 { NONE_MS } else { ms(now - w.proof) };
+            ticks[n] = t;
+            n += 1;
+        }
+        let len = ctl::put_tick(&mut self.out, &p, &ticks[..n]);
+        c.send(&self.out[..len]);
+        // The receivers on standby, after the active one's tick: the brain
+        // moves the entry by them (session.rs).
+        if !self.receivers.is_empty() {
+            let rs = self.standby_ticks(now);
+            let active = self.sessions[self.cur as usize].rx;
+            let len = ctl::put_receivers(&mut self.out, active, &rs);
+            if let Some(c) = &mut self.ctl {
+                c.send(&self.out[..len]);
+            }
+        }
+    }
+}

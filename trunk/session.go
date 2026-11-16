@@ -183,9 +183,10 @@ type Session struct {
 	peerObserve bool
 	reports     chan Report
 	obsDropped  atomic.Int64
-	// route is the entry's: which wire each class goes on (wires.go). The
-	// exit has none: it answers on the wire the entry last used.
+	// route is the entry's: which wires each class goes on (wires.go). The
+	// exit has none: it answers on the wires the entry used (fates.go).
 	route Route
+	fate  fateState
 
 	joined, stalls, broken, resent       atomic.Int64
 	pauses                               atomic.Int64
@@ -1204,7 +1205,11 @@ func (s *Session) ackedLocked(f frame) {
 func (s *Session) dataLocked(m *member, f frame) {
 	st := s.streams[f.stream]
 	if st == nil {
-		if _, done := s.closed[f.stream]; done {
+		// The entry opens every stream: one it does not have ended here,
+		// however long ago (closedMemory is only the exit's guard against
+		// reopening). Unanswered, the exit would send the chunk again on
+		// every member and bury each by its stall.
+		if _, done := s.closed[f.stream]; done || s.local == nil {
 			m.send(appendRst(nil, f.stream), true)
 		} else {
 			s.holdEarlyLocked(f)
@@ -1268,6 +1273,9 @@ func (s *Session) finLocked(m *member, f frame) {
 		if _, done := s.closed[f.stream]; done {
 			// It finished here already: the FIN was ours to confirm.
 			m.send(appendAck(nil, f.stream, f.off, f.off, ackFin, noGot), true)
+		} else if s.local == nil {
+			// A stream the entry no longer knows (dataLocked).
+			m.send(appendRst(nil, f.stream), true)
 		} else {
 			s.holdEarlyLocked(f)
 		}
