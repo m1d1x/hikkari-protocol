@@ -58,16 +58,17 @@ type Move struct {
 	Err          error
 }
 
-// RunReceivers judges the pipe's receivers once a tick until ctx ends and
-// moves the entry (SetActive) when the judge says so; at says each
+// RunReceivers judges the pipe's receivers every judgeEvery until ctx ends,
+// their proofs aged by the time since the pipe said them (so a receiver is
+// dead DeadAfter after its last proof, not at the next tick), and moves the
+// entry (SetActive) when the judge says so; at says each
 // receiver's address by rx (the active one's included), onMove hears every
 // move. A receiver the pipe does not report has no address here and is
 // never moved to.
 func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove func(Move)) {
 	var j Judge
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(judgeEvery)
 	defer t.Stop()
-	var seen time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -78,10 +79,19 @@ func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove 
 		}
 		rs, rsAt := p.Receivers()
 		tick, tickAt := p.Tick()
-		if rsAt.IsZero() || !rsAt.After(seen) || time.Since(tickAt) > 2*time.Second {
-			continue // nothing new from the pipe: never judge an old word
+		now := time.Now()
+		// The pipe says both once a second: an older word is a pipe (or a
+		// brain) not run, and the judge holds.
+		if rsAt.IsZero() || now.Sub(tickAt) > staleWord || now.Sub(rsAt) > staleWord {
+			continue
 		}
-		seen = rsAt
+		tick.Wires = aged(tick.Wires, now.Sub(tickAt))
+		standby := make([]ReceiverTick, len(rs.Standby))
+		for i, r := range rs.Standby {
+			r.Wires = aged(r.Wires, now.Sub(rsAt))
+			standby[i] = r
+		}
+		rs.Standby = standby
 		p.mu.Lock()
 		resumed := p.resumed
 		p.mu.Unlock()
@@ -89,7 +99,7 @@ func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove 
 		if !resumed.IsZero() {
 			paused = time.Since(resumed)
 		}
-		v := j.Step(time.Now(), tick, rs, paused)
+		v := j.Step(now, tick, rs, paused)
 		if !v.Move {
 			continue
 		}
@@ -102,4 +112,24 @@ func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove 
 			onMove(Move{From: rs.Active, To: v.To, FromIP: at[rs.Active], ToIP: ip, Why: v.Why, Err: err})
 		}
 	}
+}
+
+const (
+	// judgeEvery is how often RunReceivers judges: a move comes within it of
+	// DeadAfter.
+	judgeEvery = 100 * time.Millisecond
+	// staleWord is how old the pipe's word may be for the judge to read it.
+	staleWord = 2500 * time.Millisecond
+)
+
+// aged is wires with their proofs older by d: what the pipe said d ago.
+func aged(wires []WireTick, d time.Duration) []WireTick {
+	out := make([]WireTick, len(wires))
+	for i, w := range wires {
+		if w.ProofAgo >= 0 {
+			w.ProofAgo += d
+		}
+		out[i] = w
+	}
+	return out
 }

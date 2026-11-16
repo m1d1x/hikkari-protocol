@@ -391,10 +391,11 @@ func TestTheBrainMovesOffADeadReceiverByItself(t *testing.T) {
 	k.hangUp()
 	sent, back, gap := k.heard()
 	t.Logf("moved %v after the receiver died (%s); the call: %d sent, %d back, longest pause %v", took, m.Why, sent, back, gap)
-	if took > DeadAfter+3*time.Second {
-		t.Errorf("moved %v after the death, want within %v", took, DeadAfter+3*time.Second)
+	// The members' Quiet (1 s) and a judge's step past DeadAfter.
+	if took > DeadAfter+time.Second {
+		t.Errorf("moved %v after the death, want within %v", took, DeadAfter+time.Second)
 	}
-	if gap > DeadAfter+3*time.Second {
+	if gap > DeadAfter+1500*time.Millisecond {
 		t.Errorf("the call paused %v", gap)
 	}
 	select {

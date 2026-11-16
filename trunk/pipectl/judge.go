@@ -2,9 +2,10 @@ package pipectl
 
 // judge.go: when the entry moves to another receiver (hikkari-client
 // plans/2026-11-16-second-receiver.md, "Где живёт переключение"). The rule
-// reads what the pipe says each second, the active receiver's wires in its
-// tick and each standby's in its receivers, and nothing else: a receiver is
-// heard while one of its wires heard its exit within DeadAfter. The entry
+// reads what the pipe says, the active receiver's wires in its tick and
+// each standby's in its receivers, their proofs aged by the time since the
+// pipe said them, and nothing else: a receiver is heard while one of its
+// wires heard its exit within DeadAfter. The entry
 // moves when the active one is not heard and a standby is, to the standby
 // with the most members up; it holds while the pipe or the brain paused (a
 // pause makes every proof old at once, as the selector's own-pause rule of
@@ -16,9 +17,12 @@ import "time"
 
 const (
 	// DeadAfter is how long a receiver goes unheard before it is dead: past
-	// the members' Quiet (1 s) and a member's stall, short of what a client
-	// waits before it gives up on its connection.
-	DeadAfter = 3 * time.Second
+	// the members' Quiet (1 s), so a receiver's own pause of a second does
+	// not move everyone; every second more is a second of every client's
+	// traffic standing (the owner's choice of 16.11 over 3 s). A move only
+	// ever goes to a receiver heard, so a cut of the whole path moves no
+	// one whatever DeadAfter is.
+	DeadAfter = 1500 * time.Millisecond
 	// Settle is how long the entry holds after a move: the new receiver's
 	// members prove themselves, and two moves never come back to back.
 	Settle = 5 * time.Second

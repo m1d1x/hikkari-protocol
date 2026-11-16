@@ -30,6 +30,8 @@ func TestTheJudgeMovesOnlyOffADeadReceiverToAHeardOne(t *testing.T) {
 	}{
 		{"active heard", heard(4, 100*time.Millisecond), warm, -1, false},
 		{"active's members down, proof 1 s old: dying, not dead", heard(0, time.Second), warm, -1, false},
+		{"active's members down, proof just short of DeadAfter", heard(0, DeadAfter-time.Millisecond), warm, -1, false},
+		{"active's members down, proof DeadAfter old", heard(0, DeadAfter), warm, -1, true},
 		{"active unheard 3 s, standby heard", heard(0, 3*time.Second), warm, -1, true},
 		{"active unheard, a pause of the entry's own 1 s ago", heard(0, 3*time.Second), warm, time.Second, false},
 		{"active unheard, standby unheard too: the whole path", heard(0, 3*time.Second),
@@ -54,8 +56,8 @@ func TestTheJudgeMovesOnlyOffADeadReceiverToAHeardOne(t *testing.T) {
 	if v := j.Step(t0, Tick{Wires: never}, warm, -1); v.Move {
 		t.Fatalf("moved off a receiver never heard at once: %s", v.Why)
 	}
-	if v := j.Step(t0.Add(2*time.Second), Tick{Wires: never}, warm, -1); v.Move {
-		t.Fatalf("moved off a receiver never heard after 2 s: %s", v.Why)
+	if v := j.Step(t0.Add(DeadAfter-time.Millisecond), Tick{Wires: never}, warm, -1); v.Move {
+		t.Fatalf("moved off a receiver never heard just short of DeadAfter: %s", v.Why)
 	}
 	v := j.Step(t0.Add(DeadAfter), Tick{Wires: never}, warm, -1)
 	if !v.Move || v.To != 1 {
@@ -63,7 +65,7 @@ func TestTheJudgeMovesOnlyOffADeadReceiverToAHeardOne(t *testing.T) {
 	}
 	// Settle: the new active one, not heard yet, is not left at once.
 	back := Receivers{Active: 1, Standby: []ReceiverTick{standby(0, 4, 100*time.Millisecond)}}
-	if v := j.Step(t0.Add(DeadAfter+time.Second), Tick{Wires: heard(0, 4*time.Second)}, back, -1); v.Move {
+	if v := j.Step(t0.Add(DeadAfter+time.Second), Tick{Wires: heard(0, Settle)}, back, -1); v.Move {
 		t.Fatalf("moved again 1 s after a move: %s", v.Why)
 	}
 
