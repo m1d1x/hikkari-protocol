@@ -345,3 +345,61 @@ func echoOpen(c net.Conn, size int) error {
 	_, err := io.ReadFull(c, b)
 	return err
 }
+
+// TestTheBrainMovesOffADeadReceiverByItself: RunReceivers under a call and
+// a stream; receiver 0 dies and nobody says anything. The entry is on
+// receiver 1 within DeadAfter and a second or two of members' deaths and
+// ticks, a new stream goes through it byte for byte, and the call comes
+// back.
+func TestTheBrainMovesOffADeadReceiverByItself(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a, b, wp, pp := twoReceivers(t, ctx)
+	p, voice, streams := receiversPipe(t, a, b, wp, pp)
+	moves := make(chan Move, 4)
+	go p.RunReceivers(ctx, map[byte]netip.Addr{0: a.ip, 1: b.ip}, func(m Move) { moves <- m })
+	k := newCaller(t, voice)
+	k.call()
+	time.Sleep(2 * time.Second)
+	select {
+	case m := <-moves:
+		t.Fatalf("moved with both receivers alive: %+v", m)
+	default:
+	}
+
+	a.kill()
+	died := time.Now()
+	var m Move
+	select {
+	case m = <-moves:
+	case <-time.After(DeadAfter + 4*time.Second):
+		t.Fatal("no move off the dead receiver")
+	}
+	took := time.Since(died)
+	if m.Err != nil || m.From != 0 || m.To != 1 || m.ToIP != b.ip {
+		t.Fatalf("the move %+v, want 0 → 1 at %s", m, b.ip)
+	}
+	fresh, err := net.Dial("tcp", streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := echoed(fresh, 1<<20, nil); err != nil {
+		t.Fatalf("a new stream after the move: %v", err)
+	}
+	time.Sleep(time.Second)
+	k.hangUp()
+	sent, back, gap := k.heard()
+	t.Logf("moved %v after the receiver died (%s); the call: %d sent, %d back, longest pause %v", took, m.Why, sent, back, gap)
+	if took > DeadAfter+3*time.Second {
+		t.Errorf("moved %v after the death, want within %v", took, DeadAfter+3*time.Second)
+	}
+	if gap > DeadAfter+3*time.Second {
+		t.Errorf("the call paused %v", gap)
+	}
+	select {
+	case m := <-moves:
+		t.Errorf("a second move %+v", m)
+	default:
+	}
+}

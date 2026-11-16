@@ -9,6 +9,7 @@ package pipectl
 // receiver is red and when to move is the brain's.
 
 import (
+	"context"
 	"fmt"
 	"net/netip"
 	"time"
@@ -46,4 +47,59 @@ func (p *Pipe) Receivers() (Receivers, time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.receivers, p.receiversAt
+}
+
+// Move is a move of the entry the judge made: from one receiver to another,
+// their addresses, why, and what SetActive said.
+type Move struct {
+	From, To     byte
+	FromIP, ToIP netip.Addr
+	Why          string
+	Err          error
+}
+
+// RunReceivers judges the pipe's receivers once a tick until ctx ends and
+// moves the entry (SetActive) when the judge says so; at says each
+// receiver's address by rx (the active one's included), onMove hears every
+// move. A receiver the pipe does not report has no address here and is
+// never moved to.
+func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove func(Move)) {
+	var j Judge
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	var seen time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.done:
+			return
+		case <-t.C:
+		}
+		rs, rsAt := p.Receivers()
+		tick, tickAt := p.Tick()
+		if rsAt.IsZero() || !rsAt.After(seen) || time.Since(tickAt) > 2*time.Second {
+			continue // nothing new from the pipe: never judge an old word
+		}
+		seen = rsAt
+		p.mu.Lock()
+		resumed := p.resumed
+		p.mu.Unlock()
+		paused := time.Duration(-1)
+		if !resumed.IsZero() {
+			paused = time.Since(resumed)
+		}
+		v := j.Step(time.Now(), tick, rs, paused)
+		if !v.Move {
+			continue
+		}
+		ip, ok := at[v.To]
+		if !ok {
+			continue
+		}
+		err := p.SetActive(v.To, ip)
+		if onMove != nil {
+			onMove(Move{From: rs.Active, To: v.To, FromIP: at[rs.Active], ToIP: ip, Why: v.Why, Err: err})
+		}
+	}
 }
