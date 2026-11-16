@@ -36,11 +36,12 @@ const MAX_OLDER: usize = 64;
 
 /// An older generation this exit adopted: its end of the handoff socket
 /// (None once it is gone), whether its list of addresses is whole, and the
-/// generation its connection ids name.
+/// generations its connection ids name: its own and those of the older
+/// ones that still drain through it.
 pub(super) struct Older {
     sock: Option<SeqPacket>,
     all: bool,
-    gen: Option<u8>,
+    gens: Vec<u8>,
 }
 
 /// The exit's place among its generations.
@@ -83,10 +84,10 @@ impl Gens {
         self.owners.get(&owner_key(wire, addr)).map(|&o| o as usize)
     }
 
-    /// The older generation whose connection ids name gen, if it is still
-    /// there.
+    /// The older generation whose connection ids name gen (its own, or an
+    /// older one's that drains through it), if it is still there.
     pub fn older_of_gen(&self, gen: u8) -> Option<usize> {
-        self.older.iter().position(|o| o.sock.is_some() && o.gen == Some(gen))
+        self.older.iter().position(|o| o.sock.is_some() && o.gens.contains(&gen))
     }
 
     /// A datagram (or QUIC packet) from addr on wire `wire` to the older
@@ -114,6 +115,11 @@ impl Gens {
 #[inline]
 fn owner_key(wire: u8, addr: &sys::sockaddr_in) -> u64 {
     ((wire as u64) << 48) | sys::addr_key(addr)
+}
+
+/// The wire and the address of an owner_key.
+fn owner_addr(k: u64) -> (u8, SocketAddrV4) {
+    ((k >> 48) as u8, SocketAddrV4::new(((k >> 16) as u32).into(), k as u16))
 }
 
 pub(super) fn v4(s: &sys::sockaddr_in) -> SocketAddrV4 {
@@ -168,13 +174,22 @@ impl Exit {
         if let Some(fd) = self.pool.as_ref().and_then(|p| p.fd.as_ref()) {
             self.tcp.del(std::os::fd::AsRawFd::as_raw_fd(fd));
         }
+        // The generations and the addresses of the older exits that still
+        // drain through this one go to the newer with its own: their
+        // datagrams and packets come here, which hands them on (handed).
         let mut sent = s.send(&[handoff::GEN, self.gens.gen]);
-        let addrs: Vec<(u8, SocketAddrV4)> = self
+        for o in self.gens.older.iter().filter(|o| o.sock.is_some()) {
+            for &g in &o.gens {
+                sent &= s.send(&[handoff::GEN, g]);
+            }
+        }
+        let mut addrs: Vec<(u8, SocketAddrV4)> = self
             .peers
             .iter()
             .filter(|p| p.live && matches!(self.wires[p.wire].form, Form::Udp(_)))
             .map(|p| (self.wires[p.wire].id, v4(&p.addr)))
             .collect();
+        addrs.extend(self.gens.owners.keys().map(|&k| owner_addr(k)));
         for chunk in addrs.chunks(OWN_MAX) {
             let out = &mut self.gens.out;
             out[0] = handoff::OWN;
@@ -213,7 +228,7 @@ impl Exit {
         if fds.len() != 1 {
             return Err(format!("exit: adopt: {} sockets, want 1", fds.len()));
         }
-        let o = Older { sock: Some(SeqPacket::new(fds.remove(0), 0)), all: false, gen: None };
+        let o = Older { sock: Some(SeqPacket::new(fds.remove(0), 0)), all: false, gens: Vec::new() };
         let owners = &self.gens.owners;
         // A slot of an older exit gone and owning nothing is used again.
         match (0..self.gens.older.len()).find(|&i| self.gens.older[i].sock.is_none() && !owners.values().any(|&v| v as usize == i)) {
@@ -266,12 +281,21 @@ impl Exit {
         self.msg = msg;
     }
 
-    /// A datagram the newer generation read for this exit: on the bare UDP
-    /// wire one of an address it no longer holds goes back with it.
+    /// A datagram the newer generation read for this exit: one of an older
+    /// generation that drains through this exit goes on to it; on the bare
+    /// UDP wire one of an address no exit here holds goes back with it.
     fn handed(&mut self, wire: u8, from: sys::sockaddr_in, d: &mut [u8], now: u64) {
         let Some(wi) = self.wires.iter().position(|w| w.id == wire) else { return };
-        if self.wires[wi].h3().is_some() {
+        if let Some(h) = self.wires[wi].h3() {
+            if let Some(o) = h.owner(d).and_then(|g| self.gens.older_of_gen(g)) {
+                self.gens.forward(o, wire, &from, d);
+                return;
+            }
             self.h3_packet(wi, from, d, now);
+            return;
+        }
+        if let Some(o) = self.gens.owner_of(wire, &from) {
+            self.gens.forward(o, wire, &from, d);
             return;
         }
         if self.peer_of(super::wire::peer_key(wi, &from)).is_none() {
@@ -292,14 +316,18 @@ impl Exit {
                 Ok(Some(n)) if n > 0 => n,
                 _ => {
                     // Gone: every address it held is this exit's.
-                    self.gens.older[i] = Older { sock: None, all: true, gen: None };
+                    self.gens.older[i] = Older { sock: None, all: true, gens: Vec::new() };
                     self.gens.owners.retain(|_, o| *o as usize != i);
                     self.dirty = true;
                     break;
                 }
             };
             match handoff::parse(&msg[..n]) {
-                Some(Msg::Gen { gen }) => self.gens.older[i].gen = Some(gen),
+                Some(Msg::Gen { gen }) => {
+                    if !self.gens.older[i].gens.contains(&gen) {
+                        self.gens.older[i].gens.push(gen);
+                    }
+                }
                 Some(Msg::Own { addrs }) => {
                     for (wire, a) in handoff::addrs(addrs) {
                         self.gens.owners.insert(owner_key(wire, &sys::sockaddr(a)), i as u32);
@@ -314,6 +342,13 @@ impl Exit {
                     let k = owner_key(wire, &from);
                     if self.gens.owners.get(&k) == Some(&(i as u32)) {
                         self.gens.owners.remove(&k);
+                    }
+                    // A draining exit takes no address: the newer one does,
+                    // which this exit told it the older one kept.
+                    if self.gens.newer.is_some() {
+                        let p = msg[HEAD..n].to_vec();
+                        self.gens.free(wire, &from, &p);
+                        continue;
                     }
                     if payload.is_empty() {
                         continue;
@@ -343,13 +378,22 @@ impl Exit {
     }
 
     /// Once a second: a draining exit that carries nothing more (no
-    /// client's flow, no stream) tells the brain, once.
+    /// client's flow, no stream, no older generation draining through it)
+    /// tells the brain, once. An older one still there reads the wires
+    /// through this exit (it forwards that one's datagrams and lets its
+    /// addresses go on to the newer): were this exit to end under it, the
+    /// older one's end of the handoff socket would close, and it would take
+    /// the wires back beside the newest (read_newer). It ends first: its
+    /// relay's drain limit runs out before this one's.
     pub(super) fn check_drained(&mut self) {
         if self.gens.newer.is_none() || self.gens.drained || self.flows.clients != 0 || self.streams.open != 0 {
             return;
         }
+        if self.gens.older.iter().any(|o| o.sock.is_some()) {
+            return;
+        }
         self.gens.drained = true;
-        eprintln!("hk-exit: drained: no flow, no stream");
+        eprintln!("hk-exit: drained: no flow, no stream, no older generation");
         if let Some(c) = &mut self.ctl {
             c.send(&[ctl::P_DRAINED]);
         }
