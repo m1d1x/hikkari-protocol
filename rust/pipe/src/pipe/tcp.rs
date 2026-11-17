@@ -250,6 +250,7 @@ impl Pipe {
                 match sock.read(&mut l.inb[l.in_n..]) {
                     Io::Done(k) => {
                         l.in_n += k;
+                        l.last_in = now;
                         if !self.link_frames(wi, li, now) {
                             self.link_down(wi, li, gone(&self.swires[wi].links[li]), now);
                             break;
@@ -533,22 +534,36 @@ impl Pipe {
         next
     }
 
-    /// The pool's proof kept fresh (spec/trunk.md, "Members' health"): when
-    /// none of the wire's members proved anything for KEEP_PROOF and none
-    /// owes a ping, the idle member that sent least lately pings now. An
-    /// idle member pings on its own only a second after its last send, so
-    /// an idle pool's proof was up to 2 s old, and the brain could tell a
-    /// pool cut from a pool at rest only after 4 s (pipectl judge.go,
-    /// PoolDeadAfter of 17.11). A pool carrying anything proves itself by
-    /// its confirmations and pings nothing more; at rest it costs a ping
-    /// every KEEP_PROOF for the whole pool, whatever its members.
+    /// The pool's proof kept fresh at rest (spec/trunk.md, "Members'
+    /// health"): when none of the wire's members proved anything for
+    /// KEEP_PROOF, none owes a ping and the pool is at rest, the idle member
+    /// that sent least lately pings now. An idle member pings on its own
+    /// only a second after its last send, so an idle pool's proof was up to
+    /// 2 s old, and the brain could tell a pool cut from a pool at rest only
+    /// after 4 s (pipectl judge.go, PoolDeadAfter of 17.11).
+    ///
+    /// At rest: no member carries a chunk of ours unconfirmed, has frames
+    /// waiting to go, or heard the exit within KEEP_PROOF. A pool carrying
+    /// anything is proved by its confirmations, or plainly heard, and its
+    /// proof going stale there is a queue, not a cut: a ping then waits in
+    /// that queue past its member's stall and buries the member. On 17.11
+    /// 19:05–19:33 UTC a keeper without this rule raised the people's pool's
+    /// stalls outside the hub's rounds from about 4 an hour to about 13. At
+    /// rest it costs a ping every KEEP_PROOF for the whole pool, whatever its
+    /// members.
     fn keep_proof(&mut self, wi: usize, now: u64) {
         let Pipe { swires, tok, .. } = self;
         let w = &mut swires[wi];
         if w.proof != 0 && now.saturating_sub(w.proof) < KEEP_PROOF {
             return;
         }
-        if w.links.iter().any(|l| l.sock.is_some() && l.h.up && l.h.pinging()) {
+        let at_rest = w.links.iter().filter(|l| l.sock.is_some() && l.h.up).all(|l| {
+            !l.h.pinging()
+                && l.h.busy_since == 0
+                && !l.out.pending()
+                && now.saturating_sub(l.last_in) >= KEEP_PROOF
+        });
+        if !at_rest {
             return;
         }
         let idle = w

@@ -126,6 +126,9 @@ pub struct Link {
     /// row (trunk Entry.slot: backoff, stalls).
     pub backoff_ns: u64,
     pub stalls: u32,
+    /// When bytes last came on its connection (0: never): the pool keeper
+    /// pings none while the exit is sending on it (tcp.rs keep_proof).
+    pub last_in: u64,
 }
 
 /// How a dial went.
@@ -162,6 +165,7 @@ impl Link {
             epoch: [0; 8],
             backoff_ns: 0,
             stalls: 0,
+            last_in: 0,
         }
     }
 
