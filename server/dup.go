@@ -185,7 +185,7 @@ func (h *DupHub) attach(ctx context.Context, key, group string, id dup.Session, 
 	defer h.mu.Unlock()
 	s := h.sessions[k]
 	if s == nil {
-		sock, err := net.ListenUDP("udp", nil)
+		sock, err := ListenExit(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -298,7 +298,7 @@ func (l *dupLeg) stop() {
 type dupSession struct {
 	hub  *DupHub
 	id   dupKey
-	sock *net.UDPConn
+	sock *ExitSocket
 
 	mu       sync.Mutex
 	legs     map[*dupLeg]struct{}
@@ -360,7 +360,7 @@ func (s *dupSession) up(ctx context.Context, f dup.Frame, via dup.Via) {
 			s.names.Store(ap, f.Addr)
 		}
 	}
-	_, _ = s.sock.WriteToUDPAddrPort(f.Payload, ap)
+	_, _ = s.sock.WriteTo(f.Payload, ap)
 }
 
 // down numbers every answer once and queues it on the legs of its lane. A
@@ -370,67 +370,63 @@ func (s *dupSession) up(ctx context.Context, f dup.Frame, via dup.Via) {
 // by the whole-lane legs, or by every leg while only voice legs are left (a
 // client re-attaches its stream carrier to the whole lane when its datagram
 // carrier dies).
-func (s *dupSession) down() {
-	b := make([]byte, 65535)
-	for {
-		n, from, err := s.sock.ReadFromUDPAddrPort(b)
-		if err != nil {
-			return
-		}
-		from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
-		src := M.SocksaddrFromNetIP(from)
-		if name, ok := s.names.Load(from); ok {
-			src = name.(M.Socksaddr)
-		}
-		voiceSized := dup.IsVoiceSized(n)
-		s.mu.Lock()
-		s.downSeq++
-		seq := s.downSeq
-		s.timer.Reset(s.hub.idle)
-		var voice, whole []*dupLeg
-		voiceDatagram := false
-		for leg := range s.legs {
-			if leg.voice() {
-				voice = append(voice, leg)
-				_, isPacket := leg.c.(*packetCarrier)
-				voiceDatagram = voiceDatagram || isPacket
-			} else {
-				whole = append(whole, leg)
-			}
-		}
-		s.mu.Unlock()
-		var lane []*dupLeg
-		switch {
-		case voiceSized && voiceDatagram:
-			lane = voice
-		case voiceSized:
-			lane = append(voice, whole...)
-		case len(whole) > 0:
-			lane = whole
-		default:
-			lane = voice
-		}
-		frame, err := dup.Append(nil, dup.Frame{Kind: dup.KindPacket, Session: s.id.id, Seq: seq, Addr: src, Payload: b[:n]})
-		if err != nil {
-			continue
-		}
-		var fullDatagram, fullStream int64
-		for _, leg := range lane {
-			if leg.put(frame) {
-				if leg.c.via() == dup.ViaDatagram {
-					fullDatagram++
-				} else {
-					fullStream++
-				}
-			}
-		}
-		if fullDatagram+fullStream > 0 {
-			s.mu.Lock()
-			s.fullDatagram += fullDatagram
-			s.fullStream += fullStream
-			s.mu.Unlock()
+func (s *dupSession) down() { s.sock.Read(s.answer) }
+
+// answer numbers and queues one answer of the exit socket.
+func (s *dupSession) answer(b []byte, from netip.AddrPort) bool {
+	src := M.SocksaddrFromNetIP(from)
+	if name, ok := s.names.Load(from); ok {
+		src = name.(M.Socksaddr)
+	}
+	voiceSized := dup.IsVoiceSized(len(b))
+	s.mu.Lock()
+	s.downSeq++
+	seq := s.downSeq
+	s.timer.Reset(s.hub.idle)
+	var voice, whole []*dupLeg
+	voiceDatagram := false
+	for leg := range s.legs {
+		if leg.voice() {
+			voice = append(voice, leg)
+			_, isPacket := leg.c.(*packetCarrier)
+			voiceDatagram = voiceDatagram || isPacket
+		} else {
+			whole = append(whole, leg)
 		}
 	}
+	s.mu.Unlock()
+	var lane []*dupLeg
+	switch {
+	case voiceSized && voiceDatagram:
+		lane = voice
+	case voiceSized:
+		lane = append(voice, whole...)
+	case len(whole) > 0:
+		lane = whole
+	default:
+		lane = voice
+	}
+	frame, err := dup.Append(nil, dup.Frame{Kind: dup.KindPacket, Session: s.id.id, Seq: seq, Addr: src, Payload: b})
+	if err != nil {
+		return true
+	}
+	var fullDatagram, fullStream int64
+	for _, leg := range lane {
+		if leg.put(frame) {
+			if leg.c.via() == dup.ViaDatagram {
+				fullDatagram++
+			} else {
+				fullStream++
+			}
+		}
+	}
+	if fullDatagram+fullStream > 0 {
+		s.mu.Lock()
+		s.fullDatagram += fullDatagram
+		s.fullStream += fullStream
+		s.mu.Unlock()
+	}
+	return true
 }
 
 // detach removes a leg; the last one leaves the session the grace period.

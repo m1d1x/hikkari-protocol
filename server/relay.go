@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -32,7 +31,7 @@ func RelayPackets(ctx context.Context, client N.PacketConn, request uot.Request,
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	sock, err := net.ListenUDP("udp", nil)
+	sock, err := ListenExit(ctx)
 	if err != nil {
 		return err
 	}
@@ -46,27 +45,22 @@ func RelayPackets(ctx context.Context, client N.PacketConn, request uot.Request,
 
 	go func() {
 		defer cancel()
-		b := make([]byte, 65535)
-		for {
-			nr, from, err := sock.ReadFromUDPAddrPort(b)
-			if err != nil {
-				return
-			}
+		sock.Read(func(b []byte, from netip.AddrPort) bool {
 			timer.Reset(idle)
-			from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
 			dest := M.SocksaddrFromNetIP(from)
 			if name, ok := names.Load(from); ok {
 				dest = name.(M.Socksaddr)
 			}
-			packet := buf.NewSize(nr)
-			_, _ = packet.Write(b[:nr])
+			packet := buf.NewSize(len(b))
+			_, _ = packet.Write(b)
 			if err := client.WritePacket(packet, dest); err != nil {
-				return
+				return false
 			}
 			if count != nil {
-				count(0, nr)
+				count(0, len(b))
 			}
-		}
+			return true
+		})
 	}()
 
 	for {
@@ -96,7 +90,7 @@ func RelayPackets(ctx context.Context, client N.PacketConn, request uot.Request,
 			}
 		}
 		size := packet.Len()
-		_, err = sock.WriteToUDPAddrPort(packet.Bytes(), ap)
+		_, err = sock.WriteTo(packet.Bytes(), ap)
 		packet.Release()
 		if err == nil && count != nil {
 			count(size, 0)

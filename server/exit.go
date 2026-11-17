@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/m1d1x/hikkari-protocol/connect"
 	M "github.com/sagernet/sing/common/metadata"
 )
 
@@ -113,6 +114,5 @@ func (e *PolicyExit) DialTCP(ctx context.Context, dest M.Socksaddr) (net.Conn, e
 	if err != nil {
 		return nil, err
 	}
-	var d net.Dialer
-	return d.DialContext(ctx, "tcp", ap.String())
+	return connect.DialTCP(ctx, net.Dialer{}, ap)
 }
