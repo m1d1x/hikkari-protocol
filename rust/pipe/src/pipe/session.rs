@@ -390,9 +390,10 @@ impl Pipe {
     /// The brain's B_ACTIVE: receiver rx carries everything from now. Its
     /// standby session becomes the current one; the old receiver's sessions
     /// (the current one, a retired one, one coming up for its drain) are cut
-    /// and closed, their clients' streams and flows ended now; the old
-    /// receiver goes on standby at its address, its pools keeping as many
-    /// members as rx's did.
+    /// and closed, their clients' streams and flows ended now; rx's pools
+    /// take the brain's number of members; the old receiver goes on standby
+    /// at its address, its pools keeping as many members as rx's did on
+    /// standby.
     pub(super) fn set_active(&mut self, rx: u8) -> Result<(), String> {
         let old = self.cur;
         let old_rx = self.sessions[old as usize].rx;
@@ -424,6 +425,9 @@ impl Pipe {
             self.close_session(s);
         }
         eprintln!("hk-pipe: trunk: receiver {rx} is the active one; receiver {old_rx} cut: {streams} stream(s) and {flows} flow(s) ended");
+        // Its pools were a standby's: the active one carries everything on
+        // the brain's number of members.
+        self.pools_as_the_brain_gave(n, now);
         if let Some(ip) = old_ip {
             self.receivers.push(Receiver { rx: old_rx, ip, pool_members: members, sess: None, stale: true });
         }
