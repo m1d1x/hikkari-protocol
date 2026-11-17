@@ -183,7 +183,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		KeepAlive: 30 * time.Second,
 		DualStack: true,
 	}
-	h.dialContext = dialer.DialContext
+	h.dialContext = sourceDial(dialer)
 	h.httpTransport.DialContext = func(ctx context.Context, network string, address string) (net.Conn, error) {
 		return h.dialContextCheckACL(ctx, network, address)
 	}
