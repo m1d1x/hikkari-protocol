@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.7
-	github.com/m1d1x/hikkari-protocol v0.0.0-20261108154814-f7f2cb6cad66
+	github.com/m1d1x/hikkari-protocol v0.0.0-20261117194202-9920c1c25343
 	go.uber.org/zap v1.28.0
 	golang.org/x/net v0.60.0
 )
