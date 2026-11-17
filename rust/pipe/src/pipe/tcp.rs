@@ -32,6 +32,10 @@ pub(super) struct TcpListen {
 /// A stream member's hello must be answered within this of its dial
 /// (trunk helloTimeout, the exit's side of the same wait).
 const HELLO_WAIT: u64 = 5_000_000_000;
+/// How old a pool's latest proof may get before one of its idle members
+/// pings (keep_proof): with the members' clock of 25 ms and the round trip,
+/// an idle pool's proof stays under half a second.
+const KEEP_PROOF: u64 = 250_000_000;
 /// Chunks read from one client in one turn, at most: one busy client does
 /// not hold the others' turn.
 const READS_PER_TURN: usize = 64;
@@ -522,8 +526,43 @@ impl Pipe {
                     Verdict::Dead { quiet } => self.link_down(wi, li, Down::Stalled { quiet }, now),
                 }
             }
+            if clock {
+                self.keep_proof(wi, now);
+            }
         }
         next
+    }
+
+    /// The pool's proof kept fresh (spec/trunk.md, "Members' health"): when
+    /// none of the wire's members proved anything for KEEP_PROOF and none
+    /// owes a ping, the idle member that sent least lately pings now. An
+    /// idle member pings on its own only a second after its last send, so
+    /// an idle pool's proof was up to 2 s old, and the brain could tell a
+    /// pool cut from a pool at rest only after 4 s (pipectl judge.go,
+    /// PoolDeadAfter of 17.11). A pool carrying anything proves itself by
+    /// its confirmations and pings nothing more; at rest it costs a ping
+    /// every KEEP_PROOF for the whole pool, whatever its members.
+    fn keep_proof(&mut self, wi: usize, now: u64) {
+        let Pipe { swires, tok, .. } = self;
+        let w = &mut swires[wi];
+        if w.proof != 0 && now.saturating_sub(w.proof) < KEEP_PROOF {
+            return;
+        }
+        if w.links.iter().any(|l| l.sock.is_some() && l.h.up && l.h.pinging()) {
+            return;
+        }
+        let idle = w
+            .links
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.sock.is_some() && l.h.up && !l.h.pinging() && l.h.busy_since == 0)
+            .min_by_key(|(_, l)| l.h.last_send)
+            .map(|(li, _)| li);
+        let Some(li) = idle else { return };
+        let l = &mut w.links[li];
+        if let Some(t) = l.h.ping_now(now, tok) {
+            l.out.frame(9, |b| frame::put_ping(b, frame::F_PING, t));
+        }
     }
 
 }

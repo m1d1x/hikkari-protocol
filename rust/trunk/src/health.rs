@@ -206,6 +206,28 @@ impl Health {
     pub fn owed(&self, j: &Judge, now: u64) -> u64 {
         self.debt(j).map_or(0, |s| now.saturating_sub(s))
     }
+
+    /// It owes a ping's pong.
+    pub fn pinging(&self) -> bool {
+        self.ping != 0
+    }
+
+    /// A ping now, ahead of its KEEPALIVE, on a stream member up that owes
+    /// nothing (the pipe's pool keeper, spec/trunk.md "Members' health"):
+    /// the token to send, None when it owes something or is down. The ping
+    /// is owed and judged as any other.
+    pub fn ping_now(&mut self, now: u64, tok: &mut u64) -> Option<u64> {
+        if !self.up || self.packet || self.ping != 0 || self.busy_since != 0 {
+            return None;
+        }
+        *tok += 1;
+        self.ping = *tok;
+        self.ping_sent = now;
+        self.ping_last = *tok;
+        self.ping_last_sent = now;
+        self.last_send = now;
+        Some(*tok)
+    }
 }
 
 #[cfg(test)]
@@ -420,5 +442,35 @@ mod tests {
         assert_eq!(m.debt(&j), Some(1200 * MS));
         m.confirmed(&mut j, 1250 * MS, false);
         assert_eq!(m.debt(&j), None);
+    }
+
+    /// The pool keeper's ping: only on a stream member up that owes
+    /// nothing, owed and proved as a keepalive's, and it puts the member's
+    /// own keepalive a second off.
+    #[test]
+    fn ping_now_on_an_idle_stream_member() {
+        let mut j = Judge::new(1000 * MS);
+        let mut tok = 0;
+        let mut down = Health::new(false);
+        assert_eq!(down.ping_now(0, &mut tok), None, "a member down");
+        let mut packet = Health::new(true);
+        packet.join(0);
+        assert_eq!(packet.ping_now(0, &mut tok), None, "a packet member pings on its own every 100 ms");
+        let mut busy = Health::new(false);
+        busy.join(0);
+        busy.busy_since = 10 * MS;
+        assert_eq!(busy.ping_now(20 * MS, &mut tok), None, "a member that owes chunks");
+
+        let mut m = Health::new(false);
+        m.join(0);
+        let k = m.ping_now(250 * MS, &mut tok).expect("an idle member pings at once");
+        assert!(m.pinging());
+        assert_eq!(m.debt(&j), Some(250 * MS));
+        assert_eq!(m.ping_now(300 * MS, &mut tok), None, "one ping owed at a time");
+        assert!(m.pong(&mut j, k, 290 * MS));
+        assert!(!m.pinging());
+        assert_eq!(j.proof, 290 * MS);
+        assert_eq!(m.tick(&j, 300 * MS, 1200 * MS, &mut tok), Verdict::Fine, "its keepalive counts from this ping");
+        ping_of(m.tick(&j, 300 * MS, 1251 * MS, &mut tok));
     }
 }

@@ -463,7 +463,8 @@ func TestTheBrainMovesOffAReceiverWhosePoolDied(t *testing.T) {
 	go p.RunReceivers(ctx, map[byte]netip.Addr{0: a.ip, 1: b.ip}, func(m Move) { moves <- m })
 	k := newCaller(t, voice)
 	k.call()
-	// The pool carries nothing here: its proof is a ping's, a second apart.
+	// The pool carries nothing here: the pipe keeps its proof by a ping every
+	// 250 ms (keep_proof), and the judge sees it by the tick, once a second.
 	var idle time.Duration
 	for end := time.Now().Add(6 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
 		tick, at := p.Tick()
