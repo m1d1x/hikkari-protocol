@@ -12,8 +12,24 @@ package pipectl
 // 12.11), for Settle after a move, and when no receiver is heard (a cut of
 // the whole path: moving would cut everyone for nothing). It never moves
 // back on its own: a move is a cut for every client.
+//
+// The pool is judged on its own too (17.11, plans research
+// 2026-11-17-pool-reset-unl1-1351.md): it is the only wire that carries the
+// clients' streams, so an active receiver whose datagram wires are heard
+// and whose pool is not carries no client's TCP. The entry moves then as
+// for a dead receiver, to a standby whose pool is heard, by the same holds
+// and Settle: on 17.11 the pool to unl1 was cut and took 65 s to come back
+// while udp and h3dgram proved unl1 alive every second, and every client's
+// TCP stood that minute with a warm pool to ams3 at hand. The pool is
+// judged by PoolDeadAfter, not DeadAfter: a pool member pings only when it
+// has sent nothing for a second (trunk KEEPALIVE), so an idle pool's latest
+// proof is a second old and more, where a datagram wire's is 100 ms.
 
-import "time"
+import (
+	"time"
+
+	"github.com/m1d1x/hikkari-protocol/trunk"
+)
 
 const (
 	// DeadAfter is how long a receiver goes unheard before it is dead: past
@@ -26,6 +42,14 @@ const (
 	// Settle is how long the entry holds after a move: the new receiver's
 	// members prove themselves, and two moves never come back to back.
 	Settle = 5 * time.Second
+	// PoolDeadAfter is how long the pool goes unheard before it is dead
+	// while the receiver's other wires are heard. An idle pool proves itself
+	// by a ping a second after its last send (KEEPALIVE): its proof was up
+	// to 1.95 s old between two pings (TestTheBrainMovesOffAReceiverWhose
+	// PoolDied, a pool of 4 carrying nothing), and twice that is the margin.
+	// The pool's silences of 17.11 13:51 were 5.7 s first, then up to 12 s,
+	// back to back for a minute.
+	PoolDeadAfter = 4 * time.Second
 )
 
 // Judge decides moves between receivers. Its zero value is ready.
@@ -33,8 +57,8 @@ type Judge struct {
 	movedAt time.Time
 	// silentSince is when the active receiver was first not heard, by rx: a
 	// receiver nobody has heard since the pipe started is dead only after
-	// DeadAfter of its own.
-	silentSince map[byte]time.Time
+	// DeadAfter of its own. poolSilentSince is the same for its pool alone.
+	silentSince, poolSilentSince map[byte]time.Time
 }
 
 // Verdict is a judge's answer: move to To, or hold, and why.
@@ -62,20 +86,44 @@ func membersUp(wires []WireTick) int {
 	return n
 }
 
+// poolOf is the pool among wires, nil when it has none.
+func poolOf(wires []WireTick) []WireTick {
+	for i, w := range wires {
+		if w.ID == trunk.PoolWire {
+			return wires[i : i+1]
+		}
+	}
+	return nil
+}
+
 // Step judges the pipe's latest tick and receivers at now. paused is how
 // long ago the pipe or the brain came back from a pause (negative: none).
 func (j *Judge) Step(now time.Time, tick Tick, rs Receivers, paused time.Duration) Verdict {
 	if j.silentSince == nil {
 		j.silentSince = map[byte]time.Time{}
+		j.poolSilentSince = map[byte]time.Time{}
 	}
-	if heardWithin(tick.Wires, DeadAfter) {
+	pool := poolOf(tick.Wires)
+	whole := heardWithin(tick.Wires, DeadAfter)
+	if whole {
 		delete(j.silentSince, rs.Active)
-		return Verdict{Why: "the active receiver is heard"}
 	}
-	since, ok := j.silentSince[rs.Active]
+	if pool == nil || heardWithin(pool, PoolDeadAfter) {
+		delete(j.poolSilentSince, rs.Active)
+		if whole {
+			return Verdict{Why: "the active receiver is heard"}
+		}
+	}
+	// What is unheard: the whole receiver, or, the rest of it heard, its
+	// pool, and with it every client's stream.
+	wires, silent, what, dead := tick.Wires, j.silentSince, "the active receiver", DeadAfter
+	if whole {
+		wires, silent, what, dead = pool, j.poolSilentSince, "the active receiver's pool", PoolDeadAfter
+	}
+	since, ok := silent[rs.Active]
 	if !ok {
 		since = now
-		j.silentSince[rs.Active] = now
+		silent[rs.Active] = now
 	}
 	switch {
 	case len(rs.Standby) == 0:
@@ -85,28 +133,38 @@ func (j *Judge) Step(now time.Time, tick Tick, rs Receivers, paused time.Duratio
 	case !j.movedAt.IsZero() && now.Sub(j.movedAt) < Settle:
 		return Verdict{Why: "settling after a move"}
 	}
-	// Dead: its youngest proof is DeadAfter old, or none came in DeadAfter
-	// of watching it (a pipe just started, a receiver dead from the start).
-	// Members down with a young proof are dying, not dead: the proof ages.
-	if age := proofAge(tick.Wires); age >= 0 && age < DeadAfter || age < 0 && now.Sub(since) < DeadAfter {
-		return Verdict{Why: "the active receiver not heard, not dead yet"}
+	// Dead: its youngest proof is dead old, or none came in dead of watching
+	// it (a pipe just started, a receiver dead from the start). Members down
+	// with a young proof are dying, not dead: the proof ages.
+	if age := proofAge(wires); age >= 0 && age < dead || age < 0 && now.Sub(since) < dead {
+		return Verdict{Why: what + " not heard, not dead yet"}
 	}
+	// A standby must be heard, and, when the pool is what died, its pool
+	// heard: moving to a receiver whose pool is dead carries no stream.
 	best, bestUp := -1, 0
 	for i, r := range rs.Standby {
-		if !heardWithin(r.Wires, DeadAfter) {
+		ws, within := r.Wires, DeadAfter
+		if whole {
+			ws, within = poolOf(r.Wires), PoolDeadAfter
+		}
+		if !heardWithin(ws, within) {
 			continue
 		}
-		if up := membersUp(r.Wires); best < 0 || up > bestUp {
+		if up := membersUp(ws); best < 0 || up > bestUp {
 			best, bestUp = i, up
 		}
 	}
 	if best < 0 {
+		if whole {
+			return Verdict{Why: "the active receiver's pool not heard, no standby's pool is: the whole path"}
+		}
 		return Verdict{Why: "no receiver is heard: the whole path"}
 	}
 	j.movedAt = now
 	delete(j.silentSince, rs.Active)
+	delete(j.poolSilentSince, rs.Active)
 	to := rs.Standby[best]
-	return Verdict{Move: true, To: to.Rx, Why: "the active receiver unheard for " + unheard(tick.Wires, now.Sub(since)).String()}
+	return Verdict{Move: true, To: to.Rx, Why: what + " unheard for " + unheard(wires, now.Sub(since)).String()}
 }
 
 // proofAge is the youngest proof of wires, negative when none ever heard.

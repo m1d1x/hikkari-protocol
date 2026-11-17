@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,6 +68,18 @@ func newReceiver(t *testing.T, ctx context.Context, ip netip.Addr, wirePort, poo
 // and pool close, and every member of the pool with them.
 func (r *receiver) kill() {
 	r.wire.Close()
+	r.pool.Close()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.conn {
+		c.Close()
+	}
+	r.conn = nil
+}
+
+// killPool takes the receiver's pool off the net and leaves its wire: TCP
+// to it cut, its datagrams heard (17.11 13:51, unl1).
+func (r *receiver) killPool() {
 	r.pool.Close()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -430,6 +443,70 @@ func TestTheBrainMovesOffADeadReceiverByItself(t *testing.T) {
 	}
 	if gap > DeadAfter+1500*time.Millisecond {
 		t.Errorf("the call paused %v", gap)
+	}
+	select {
+	case m := <-moves:
+		t.Errorf("a second move %+v", m)
+	default:
+	}
+}
+
+// TestTheBrainMovesOffAReceiverWhosePoolDied: the active receiver's pool
+// cut and its wire heard, the brain moves by itself as for a dead receiver,
+// and a new stream goes through the standby's pool.
+func TestTheBrainMovesOffAReceiverWhosePoolDied(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a, b, wp, pp := twoReceivers(t, ctx)
+	p, voice, streams := receiversPipe(t, a, b, wp, pp)
+	moves := make(chan Move, 4)
+	go p.RunReceivers(ctx, map[byte]netip.Addr{0: a.ip, 1: b.ip}, func(m Move) { moves <- m })
+	k := newCaller(t, voice)
+	k.call()
+	// The pool carries nothing here: its proof is a ping's, a second apart.
+	var idle time.Duration
+	for end := time.Now().Add(6 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		tick, at := p.Tick()
+		if pool := poolOf(tick.Wires); pool != nil && pool[0].ProofAgo >= 0 {
+			idle = max(idle, pool[0].ProofAgo+time.Since(at))
+		}
+	}
+	t.Logf("the idle pool's proof at its oldest: %v (PoolDeadAfter %v)", idle.Round(time.Millisecond), PoolDeadAfter)
+	select {
+	case m := <-moves:
+		t.Fatalf("moved with both receivers alive: %+v", m)
+	default:
+	}
+
+	a.killPool()
+	died := time.Now()
+	var m Move
+	select {
+	case m = <-moves:
+	case <-time.After(PoolDeadAfter + 4*time.Second):
+		t.Fatal("no move off the receiver whose pool died")
+	}
+	took := time.Since(died)
+	if m.Err != nil || m.From != 0 || m.To != 1 || m.ToIP != b.ip {
+		t.Fatalf("the move %+v, want 0 → 1 at %s", m, b.ip)
+	}
+	if !strings.HasPrefix(m.Why, "the active receiver's pool unheard for ") {
+		t.Fatalf("the move says %q, want the pool", m.Why)
+	}
+	fresh, err := net.Dial("tcp", streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := echoed(fresh, 1<<20, nil); err != nil {
+		t.Fatalf("a new stream after the move: %v", err)
+	}
+	time.Sleep(time.Second)
+	k.hangUp()
+	sent, back, gap := k.heard()
+	t.Logf("moved %v after the pool died (%s); the call: %d sent, %d back, longest pause %v", took, m.Why, sent, back, gap)
+	if took > PoolDeadAfter+time.Second {
+		t.Errorf("moved %v after the pool's death, want within %v", took, PoolDeadAfter+time.Second)
 	}
 	select {
 	case m := <-moves:
