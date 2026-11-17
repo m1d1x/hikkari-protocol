@@ -13,7 +13,9 @@ import (
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/observe"
 	"github.com/m1d1x/hikkari-protocol/wire/datagram"
+	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 )
 
 // A call is a flow of small packets at a steady rate (Opus: 20 ms frames, 50
@@ -268,10 +270,36 @@ func (d *dupConn) drain(leg *dupLeg) {
 // never waits for a carrier: a call's voice must not sit behind the video in
 // the same socket.
 func (d *dupConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	return d.write(p, M.SocksaddrFromNet(addr))
+}
+
+// dupConn speaks sing's packet interface itself. The core hands a packet to a
+// plain net.PacketConn as WriteTo(dest.UDPAddr()), and a named destination
+// has no IP: the name was lost on the client and the relay dropped every such
+// packet as addressed nowhere (17.11, the voice probe's series to
+// stun.cloudflare.com, 0 answers of 1500). The relay resolves names itself, at
+// the exit, so the name must reach it.
+var _ N.NetPacketConn = (*dupConn)(nil)
+
+func (d *dupConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	defer buffer.Release()
+	_, err := d.write(buffer.Bytes(), destination)
+	return err
+}
+
+func (d *dupConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	n, addr, err := d.ReadFrom(buffer.FreeBytes())
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	buffer.Truncate(n)
+	return M.SocksaddrFromNet(addr), nil
+}
+
+func (d *dupConn) write(p []byte, dest M.Socksaddr) (int, error) {
 	if d.ctx.Err() != nil {
 		return 0, net.ErrClosed
 	}
-	dest := M.SocksaddrFromNet(addr)
 	lanes := d.lanes.Load()
 	voiceSized := dup.IsVoiceSized(len(p))
 	d.mu.Lock()

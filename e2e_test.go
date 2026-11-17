@@ -21,7 +21,17 @@ import (
 // loopbackExit allows loopback: the default exit policy of a relay refuses it.
 type loopbackExit struct{}
 
+// loopbackName is a name the exit resolves to loopback, as a relay's exit
+// resolves the names clients send.
+const loopbackName = "echo.test"
+
 func (loopbackExit) Resolve(ctx context.Context, dest M.Socksaddr) (netip.AddrPort, error) {
+	if dest.Fqdn == loopbackName {
+		return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), dest.Port), nil
+	}
+	if !dest.Addr.IsValid() {
+		return netip.AddrPort{}, server.ErrRefused
+	}
 	return dest.AddrPort(), nil
 }
 func (loopbackExit) DialTCP(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {

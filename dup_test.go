@@ -14,6 +14,8 @@ import (
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/internal/testcert"
 	"github.com/m1d1x/hikkari-protocol/server"
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -311,6 +313,37 @@ func TestDuplicatedCall(t *testing.T) {
 		}
 		if sources, _ := echo.seen(); sources != 1 {
 			t.Fatalf("far end saw %d sources", sources)
+		}
+	})
+
+	// The core hands a packet to its outbound's conn through sing's packet
+	// interface; a plain net.PacketConn gets dest.UDPAddr(), which has no IP
+	// for a name. The name must reach the exit, which resolves it (17.11: the
+	// voice probe's series to stun.cloudflare.com got 0 answers of 1500).
+	t.Run("a named destination reaches the exit by its name", func(t *testing.T) {
+		echo := newSourceEcho(t)
+		defer echo.Close()
+		conn, err := c.ListenPacket(ctx, M.Socksaddr{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		core := bufio.NewPacketConn(conn)
+		to := M.Socksaddr{Fqdn: loopbackName, Port: uint16(echo.LocalAddr().(*net.UDPAddr).Port)}
+		for i := 0; i < 5; i++ {
+			if err := core.WritePacket(buf.As([]byte("named")), to); err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		answer := buf.NewPacket()
+		defer answer.Release()
+		from, err := core.ReadPacket(answer)
+		if err != nil {
+			t.Fatalf("no answer from a named destination: %v", err)
+		}
+		if string(answer.Bytes()) != "named" || from != to {
+			t.Fatalf("answer %q from %v, want %q from %v", string(answer.Bytes()), from, "named", to)
 		}
 	})
 
