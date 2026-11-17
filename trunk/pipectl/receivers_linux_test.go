@@ -334,6 +334,39 @@ func TestAMoveByHandCutsWhatTheOldReceiverCarriesAtOnce(t *testing.T) {
 	waitFor(t, 10*time.Second, "receiver 0 warm on standby", func() bool { return standbyUp(p, 0, 4, 2) })
 }
 
+// TestTheActiveReceiverKeepsTheBrainsPoolAcrossMoves: the brain's pool has 4
+// members, a receiver on standby keeps 2. After the entry moves to receiver
+// 1 its pool grows to the brain's 4 and receiver 0 on standby keeps 2; after
+// the move back, receiver 0's pool is 4 again. On 16.11 the people's entry
+// moved twice under P6 and stayed on 8 members of its 32 until a reload.
+func TestTheActiveReceiverKeepsTheBrainsPoolAcrossMoves(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a, b, wp, pp := twoReceivers(t, ctx)
+	p, _, streams := receiversPipe(t, a, b, wp, pp)
+	if err := p.SetActive(1, b.ip); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "receiver 1's pool at the brain's 4, receiver 0 warm with 2", func() bool {
+		return wireUp(p, trunk.PoolWire, 4) && standbyUp(p, 0, 4, 2)
+	})
+	c, err := net.Dial("tcp", streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := echoed(c, 4<<20, nil); err != nil {
+		t.Fatalf("a stream on receiver 1's grown pool: %v", err)
+	}
+	c.Close()
+	waitFor(t, 10*time.Second, "receiver 1 heard", func() bool { return standbyUp(p, 0, 4, 2) })
+	if err := p.SetActive(0, a.ip); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 10*time.Second, "receiver 0's pool at the brain's 4 again, receiver 1 warm with 2", func() bool {
+		return wireUp(p, trunk.PoolWire, 4) && standbyUp(p, 1, 4, 2)
+	})
+}
+
 // echoOpen sends size bytes on c and reads them back, leaving c open: a
 // stream alive when the entry moves.
 func echoOpen(c net.Conn, size int) error {

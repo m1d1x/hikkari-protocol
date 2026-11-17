@@ -173,6 +173,10 @@ pub struct Pipe {
     /// The pool's members of copies and their window, from the brain's
     /// B_COPIES, for every pool it sets (copies.rs).
     pool_copies: (usize, u64),
+    /// The brain's pools by id and their members (B_POOL): the active
+    /// receiver's pools keep as many, whichever receiver is active
+    /// (session.rs set_active); one on standby keeps its own (Receiver).
+    pool_members: Vec<(u8, usize)>,
     flows: Flows,
     tcp_listens: Vec<TcpListen>,
     swires: Vec<StreamWire>,
@@ -241,6 +245,7 @@ impl Pipe {
             route: Route::one(ANY_WIRE),
             later: Later::new(),
             pool_copies: (0, 0),
+            pool_members: Vec::new(),
             flows: Flows::new(),
             tcp_listens: Vec::new(),
             swires: Vec::new(),

@@ -77,6 +77,10 @@ impl Pipe {
         }
         let stall_ns = p.dead_ms.max(1) as u64 * 1_000_000;
         let members = p.members as usize;
+        match self.pool_members.iter_mut().find(|(i, _)| *i == id) {
+            Some(m) => m.1 = members,
+            None => self.pool_members.push((id, members)),
+        }
         let Some(wi) = self.swires.iter().position(|w| w.id == id && w.sess == sess) else {
             let mut w = StreamWire::new(id, reach, members, stall_ns);
             w.sess = sess;
@@ -121,6 +125,41 @@ impl Pipe {
         // The receivers on standby take the active one's pools anew.
         self.receivers_stale();
         Ok(())
+    }
+
+    /// Session s's pools take as many members as the brain gave each
+    /// (B_POOL): a receiver's standby session becomes the active one with
+    /// its standby pools (session.rs set_active). Members it has go on as
+    /// they are, the ones it lacks are dialed now; members past the brain's
+    /// number are taken down (what they carried goes again) and dropped.
+    pub(super) fn pools_as_the_brain_gave(&mut self, s: u8, now: u64) {
+        for wi in 0..self.swires.len() {
+            if self.swires[wi].sess != s {
+                continue;
+            }
+            let id = self.swires[wi].id;
+            let Some(&(_, members)) = self.pool_members.iter().find(|(i, _)| *i == id) else {
+                continue;
+            };
+            let had = self.swires[wi].links.len();
+            if had == members {
+                continue;
+            }
+            for li in members..had {
+                if self.swires[wi].links[li].sock.is_some() {
+                    self.link_down(wi, li, Down::Lost, now);
+                }
+            }
+            let w = &mut self.swires[wi];
+            w.links.truncate(members);
+            while w.links.len() < members {
+                w.links.push(Link::new());
+            }
+            for li in had..members {
+                self.redial(wi, li, now);
+            }
+            eprintln!("hk-pipe: pool {id}: {had} → {members} member(s), as the brain gave it");
+        }
     }
 
     /// The pool's members of copies and their window (B_COPIES), on every
