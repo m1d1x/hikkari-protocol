@@ -109,9 +109,11 @@ owes progress and proves none for max(300 ms, 4 × smoothed RTT) while another m
 dead: closed, its chunks sent again on the other members oldest first as they have room (256 KiB unconfirmed per member), its
 source port kept out of use for an hour, and a member on a new port opened within a second (replacements are spread over that
 second, so members that die together do not come back as one burst). An idle member is pinged every second. The pipe also
-keeps each pool's proof fresh: when none of its members proved progress for 250 ms and none owes a ping, the idle member that
-sent least lately pings at once, so a pool at rest is told from a pool cut within a couple of seconds (the brain moves off a
-receiver whose pool alone went unheard for 2 s) for a ping every 250 ms per pool, whatever its members.
+keeps each pool's proof fresh at rest: when none of its members proved progress for 250 ms, and none owes a ping, carries a
+chunk unconfirmed, has frames waiting to go or heard the exit in that time, the idle member that sent least lately pings at
+once, so a pool at rest is told from a pool cut within a couple of seconds (the brain moves off a receiver whose pool alone
+went unheard for 2 s) for a ping every 250 ms per pool, whatever its members. A pool carrying anything is proved by its
+confirmations; a ping into its queue would only wait past its member's stall and bury the member.
 
 When every member is silent at once, no member is to blame: the other end paused (a box starved of CPU by its neighbours) or
 the whole path did. Then members die only after Quiet: 1 s on the entry, 30 s on the exit, which cannot open members and waits
