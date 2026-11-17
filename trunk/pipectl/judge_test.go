@@ -107,7 +107,7 @@ func TestTheJudgeMovesOffAReceiverWhosePoolIsDeadWhileItsDatagramsLive(t *testin
 		move   bool
 	}{
 		{"both heard", receiverOf(young, 32, young), warm, -1, false},
-		{"idle pool, its proof 2 s old between two pings", receiverOf(young, 32, 2*time.Second), warm, -1, false},
+		{"idle pool, its proof 1.2 s old as the judge sees it", receiverOf(young, 32, 1200*time.Millisecond), warm, -1, false},
 		{"pool down, its proof 1 s old: dying", receiverOf(young, 0, time.Second), warm, -1, false},
 		{"pool down, its proof just short of PoolDeadAfter", receiverOf(young, 0, PoolDeadAfter-time.Millisecond), warm, -1, false},
 		{"pool down PoolDeadAfter, datagrams heard", receiverOf(young, 0, PoolDeadAfter), warm, -1, true},
@@ -138,7 +138,7 @@ func TestTheJudgeMovesOffAReceiverWhosePoolIsDeadWhileItsDatagramsLive(t *testin
 		t.Fatalf("moved off a pool never heard just short of PoolDeadAfter: %s", v.Why)
 	}
 	v := j.Step(t0.Add(PoolDeadAfter), Tick{Wires: never}, warm, -1)
-	if !v.Move || v.To != 1 || v.Why != "the active receiver's pool unheard for 4s" {
+	if !v.Move || v.To != 1 || v.Why != "the active receiver's pool unheard for 2s" {
 		t.Fatalf("after %v of a pool never heard: move %v to %d (%s)", PoolDeadAfter, v.Move, v.To, v.Why)
 	}
 	// Settle holds a pool dead on the new receiver too.

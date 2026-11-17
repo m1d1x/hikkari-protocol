@@ -21,9 +21,10 @@ package pipectl
 // and Settle: on 17.11 the pool to unl1 was cut and took 65 s to come back
 // while udp and h3dgram proved unl1 alive every second, and every client's
 // TCP stood that minute with a warm pool to ams3 at hand. The pool is
-// judged by PoolDeadAfter, not DeadAfter: a pool member pings only when it
-// has sent nothing for a second (trunk KEEPALIVE), so an idle pool's latest
-// proof is a second old and more, where a datagram wire's is 100 ms.
+// judged by PoolDeadAfter, not DeadAfter: the pipe keeps an idle pool's
+// proof under 250 ms and a round trip (its keep_proof), where a datagram
+// wire's is 100 ms, and the judge sees either only by the pipe's tick, once
+// a second.
 
 import (
 	"time"
@@ -43,13 +44,15 @@ const (
 	// members prove themselves, and two moves never come back to back.
 	Settle = 5 * time.Second
 	// PoolDeadAfter is how long the pool goes unheard before it is dead
-	// while the receiver's other wires are heard. An idle pool proves itself
-	// by a ping a second after its last send (KEEPALIVE): its proof was up
-	// to 1.95 s old between two pings (TestTheBrainMovesOffAReceiverWhose
-	// PoolDied, a pool of 4 carrying nothing), and twice that is the margin.
-	// The pool's silences of 17.11 13:51 were 5.7 s first, then up to 12 s,
-	// back to back for a minute.
-	PoolDeadAfter = 4 * time.Second
+	// while the receiver's other wires are heard. The pipe pings an idle
+	// pool every 250 ms (keep_proof) and says it once a second, so the judge
+	// saw an idle pool's proof up to 1.17 s old (TestTheBrainMovesOffA
+	// ReceiverWhosePoolDied, a pool of 4 carrying nothing); 2 s is that and
+	// 0.8 s more. Before keep_proof an idle pool pinged a second after its
+	// last send, its proof reached 1.95 s and the pool needed 4 s. The
+	// pool's silences of 17.11 13:51 were 5.7 s first, then up to 12 s, back
+	// to back for a minute.
+	PoolDeadAfter = 2 * time.Second
 )
 
 // Judge decides moves between receivers. Its zero value is ready.
