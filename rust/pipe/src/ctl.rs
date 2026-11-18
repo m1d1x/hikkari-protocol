@@ -7,7 +7,7 @@
 
 use crate::route::Route;
 
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -28,6 +28,7 @@ pub const B_COPIES: u8 = 0x10; // members u8, window_us u32: the pool's members 
 pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16, hi u16, exit ip [4] port u16; Chromium: sni u8+n, key u8+n, cronet u16+n, roots (rest)
 pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver on standby at ip, the active one's ports (0.0.0.0: taken away)
 pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
+pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -87,6 +88,7 @@ pub enum Msg<'a> {
     TcpListen { id: u8, to: u16 },
     Pool(Pool<'a>),
     Copies { members: u8, window_us: u32 },
+    Demand { hold_ms: u32 },
     Clients,
     Stats,
     Receiver { rx: u8, ip: std::net::Ipv4Addr, pool_members: u8 },
@@ -180,6 +182,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_TCP_LISTEN => Msg::TcpListen { id: r.u8()?, to: r.u16()? },
         B_POOL => Msg::Pool(pool(&mut r)?),
         B_COPIES if m.len() == 6 => Msg::Copies { members: r.u8()?, window_us: r.u32()? },
+        B_DEMAND if m.len() == 5 => Msg::Demand { hold_ms: r.u32()? },
         B_CLIENTS if m.len() == 1 => Msg::Clients,
         B_STATS if m.len() == 1 => Msg::Stats,
         B_RECEIVER if m.len() == 7 => {
@@ -475,6 +478,8 @@ mod tests {
     const TCP_LISTEN_GOLDEN: &str = "0c01fb20";
     /// copiesGolden: 4 members of copies, a window of 4 ms.
     const COPIES_GOLDEN: &str = "1004a00f0000";
+    /// trunk/pipectl msg_test.go demandGolden: a hold of 5 minutes.
+    const DEMAND_GOLDEN: &str = "13e0930400";
     const STATS_GOLDEN: &str = "8901000000000000000200000000000000030000000000000004000000000000000500000000000000060000000700000000000000080000000000000010270000204e000030750000";
     const OBSERVED_GOLDEN: &str = "88efcdab90785634120101fb200f2700000700000000000000080000000000000009000000000000000a000000000000000b0c0000000d000000000000000000000000000000000000000000000000000000010110270000e803000003000000010000000200000040000000c8000000c9000000";
     const CLIENTS_GOLDEN: &str = "870c00000003000000090000005abc000000000000250000000000000060470000e8ee0000";
@@ -524,6 +529,8 @@ mod tests {
         assert!(matches!(parse(&unhex(TCP_LISTEN_GOLDEN)), Some(Msg::TcpListen { id: 1, to: 8443 })));
         assert!(matches!(parse(&unhex(COPIES_GOLDEN)), Some(Msg::Copies { members: 4, window_us: 4000 })));
         assert!(parse(&unhex(COPIES_GOLDEN)[..5]).is_none(), "a torn B_COPIES");
+        assert!(matches!(parse(&unhex(DEMAND_GOLDEN)), Some(Msg::Demand { hold_ms: 300_000 })));
+        assert!(parse(&unhex(DEMAND_GOLDEN)[..4]).is_none(), "a torn B_DEMAND");
     }
 
     #[test]

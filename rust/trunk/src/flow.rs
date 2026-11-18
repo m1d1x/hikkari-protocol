@@ -67,6 +67,22 @@ impl Replay {
         self.bits[word] |= bit;
         false
     }
+
+    /// The newest seq seen (0: none yet).
+    #[inline]
+    pub fn top(&self) -> u32 {
+        self.top
+    }
+
+    /// Whether seq was seen, without marking it; one too old for the window
+    /// to tell is not.
+    #[inline]
+    pub fn has(&self, seq: u32) -> bool {
+        if seq == 0 || seq > self.top || self.top - seq >= WINDOW {
+            return false;
+        }
+        self.bits[((seq % WINDOW) / 64) as usize] & (1u64 << (seq % 64)) != 0
+    }
 }
 
 #[cfg(test)]

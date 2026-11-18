@@ -225,9 +225,9 @@ impl Exit {
                     self.t.link_dgrams += 1;
                     let l = &self.links.all[li];
                     let (s, m, wire) = (l.session, (li | LINK_SEEN, l.gen as u32), l.wire);
-                    self.flow_dgram(s, m, wire, stream, seq, port, &inb[off..off + len], now);
+                    self.flow_dgram(s, m, wire, stream, seq, port, &inb[off..off + len], now, false);
                 }
-                Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Other => {}
+                Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Copies | Frame::Other => {}
             }
             at = next;
         }
@@ -269,6 +269,7 @@ impl Exit {
         l.h.join(now);
         sess.link_join(li, wire);
         sess.observe |= h.epoch[0] & frame::CAP_OBSERVE != 0;
+        sess.copies |= h.epoch[0] & frame::CAP_COPIES != 0;
         t.links += 1;
         t.joined += 1;
         let (id, epoch) = (sess.id, sess.epoch);

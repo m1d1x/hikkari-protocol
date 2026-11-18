@@ -14,11 +14,18 @@ pub const F_DRAIN: u8 = 10;
 pub const F_OBSERVE: u8 = 11;
 /// A piece of a frame cut for a datagram that does not hold it (frag.rs).
 pub const F_FRAG: u8 = 12;
+/// The exit asks the entry for the voice class's copies of the other fate:
+/// it lost datagrams on a packet wire (demand.rs).
+pub const F_COPIES: u8 = 13;
 
 /// The entry's capabilities, the first byte of the epoch its hello sends
 /// (spec/trunk.md, "Frames": hello; trunk capObserve): it reads observe
 /// frames, so the exit sends it the marks of testers' streams and flows.
 pub const CAP_OBSERVE: u8 = 1;
+/// It reads copies frames (spec/trunk.md, "Copies on demand"), so the exit
+/// may ask it for copies; an entry that does not would drop the rest of the
+/// datagram or of the member's stream after one.
+pub const CAP_COPIES: u8 = 2;
 /// An observe frame's kinds (trunk ObsStream, ObsFlow).
 pub const OBS_STREAM: u8 = 1;
 pub const OBS_FLOW: u8 = 2;
@@ -42,7 +49,7 @@ pub fn hello_t1(out: &mut [u8], session: &[u8; 16]) -> usize {
     out[1..5].copy_from_slice(b"HKT1");
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0);
-    out[21] = CAP_OBSERVE;
+    out[21] = CAP_OBSERVE | CAP_COPIES;
     29
 }
 
@@ -94,7 +101,7 @@ pub fn hello_t2(out: &mut [u8], session: &[u8; 16], wire: u8) -> usize {
     out[1..5].copy_from_slice(b"HKT2");
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0); // the entry has no epoch; byte 0 is its capabilities
-    out[21] = CAP_OBSERVE;
+    out[21] = CAP_OBSERVE | CAP_COPIES;
     out[29] = wire;
     out[30] = KIND_PACKET;
     31
@@ -181,6 +188,13 @@ pub fn put_drain(out: &mut [u8]) -> usize {
     1
 }
 
+/// The exit's ask for copies (spec/trunk.md, "Copies on demand").
+#[inline]
+pub fn put_copies(out: &mut [u8]) -> usize {
+    out[0] = F_COPIES;
+    1
+}
+
 /// One frame read from a datagram's plaintext.
 pub enum Frame {
     Hello,
@@ -204,6 +218,8 @@ pub enum Frame {
     /// Piece `index` of `count` of the sender's cut frame `id`, its bytes at
     /// `off..off + len` (frag.rs).
     Frag { id: u16, index: u8, count: u8, off: usize, len: usize },
+    /// The exit lost datagrams on a packet wire: copies wanted (demand.rs).
+    Copies,
     Other,
 }
 
@@ -239,6 +255,7 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
         F_PING => Some((Frame::Ping(be64(fixed(8)? - 8)), b + 8)),
         F_PONG => Some((Frame::Pong(be64(fixed(8)? - 8)), b + 8)),
         F_DRAIN => Some((Frame::Drain, b)),
+        F_COPIES => Some((Frame::Copies, b)),
         F_OPEN => {
             let next = fixed(6)?;
             Some((Frame::Open { stream: be32(b), port: u16::from_be_bytes([p[b + 4], p[b + 5]]) }, next))
@@ -315,7 +332,7 @@ mod tests {
         let (f, next) = next_frame(&b[..n], 0).unwrap();
         assert!(matches!(f, Frame::Hello) && next == n);
         let h = read_hello(&b[..n], 0).unwrap();
-        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [CAP_OBSERVE, 0, 0, 0, 0, 0, 0, 0], Some((2, KIND_PACKET))), "the entry reads observe frames");
+        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [CAP_OBSERVE | CAP_COPIES, 0, 0, 0, 0, 0, 0, 0], Some((2, KIND_PACKET))), "the entry reads observe and copies frames");
         let m = put_hello(&mut b, &h.session, &[9; 8], h.t2);
         let go = [&[1u8][..], b"HKT2", &[7; 16], &[9; 8], &[2, 2]].concat();
         assert_eq!(&b[..m], &go[..]);

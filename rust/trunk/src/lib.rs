@@ -6,6 +6,7 @@
 //! first, and a test against the Go side.
 
 pub mod buf;
+pub mod demand;
 pub mod echo;
 pub mod flow;
 pub mod frag;
