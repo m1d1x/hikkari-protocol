@@ -303,6 +303,7 @@ type dupSession struct {
 	mu       sync.Mutex
 	legs     map[*dupLeg]struct{}
 	ledger   dup.Ledger
+	pauses   observe.PauseMeter
 	booked   bool   // counted in a period already
 	endedBy  string // why it ended, for its last period
 	unbook   func()
@@ -334,9 +335,11 @@ func (s *dupSession) absorb(leg *dupLeg) {
 // up sends the first copy of a client packet out of the exit socket.
 func (s *dupSession) up(ctx context.Context, f dup.Frame, via dup.Via) {
 	s.mu.Lock()
-	fresh := s.ledger.Accept(f.Seq, via, time.Now())
+	now := time.Now()
+	fresh := s.ledger.Accept(f.Seq, via, now)
 	if fresh {
 		s.timer.Reset(s.hub.idle)
+		s.pauses.Out(now, dup.IsVoiceSized(len(f.Payload)), via == dup.ViaStream)
 	}
 	s.mu.Unlock()
 	if !fresh {
@@ -382,6 +385,7 @@ func (s *dupSession) answer(b []byte, from netip.AddrPort) bool {
 	s.mu.Lock()
 	s.downSeq++
 	seq := s.downSeq
+	s.pauses.In(time.Now(), voiceSized)
 	s.timer.Reset(s.hub.idle)
 	var voice, whole []*dupLeg
 	voiceDatagram := false
@@ -488,6 +492,7 @@ func (s *dupSession) take(p *observe.Period) {
 		p.Dup.Ends.Add(s.endedBy)
 	}
 	s.ledger.Take(p.Dup)
+	s.pauses.Take(p)
 	p.Dup.FullDatagram += s.fullDatagram
 	p.Dup.FullStream += s.fullStream
 	s.fullDatagram, s.fullStream = 0, 0
