@@ -442,6 +442,31 @@ func TestReplay(t *testing.T) {
 	}
 }
 
+// TestReplayTellsACountBegunAnew: the other end forgot the flow after 2
+// minutes without its datagrams and counts it again from 1 (aezamsk1 18.11:
+// every call of the people's entry silent after 126 s with nothing down).
+func TestReplayTellsACountBegunAnew(t *testing.T) {
+	var r replay
+	for s := uint32(1); s <= 500; s++ {
+		if r.restarted(s) {
+			t.Fatalf("%d: the first count is no restart", s)
+		}
+		r.seen(s)
+	}
+	for s := uint32(501); s <= 5000; s++ {
+		r.seen(s)
+	}
+	if !r.seen(1) {
+		t.Fatal("unhelped, the window drops the new count as too old")
+	}
+	if !r.restarted(1) || !r.restarted(replaySize-1) {
+		t.Fatal("the new count's first window is a restart")
+	}
+	if r.restarted(replaySize) || r.restarted(4500) || r.restarted(0) {
+		t.Fatal("a late copy is no restart")
+	}
+}
+
 func dumpSession(t *testing.T, name string, s *Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
