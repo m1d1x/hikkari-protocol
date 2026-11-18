@@ -21,6 +21,8 @@ type Period struct {
 	Dup *Dup `json:"dup,omitempty"`
 	// Calls are the client's call detector's calls that ended in the period.
 	Calls *Calls `json:"calls,omitempty"`
+	// Pauses are the duplicated sessions' pauses of live UDP (v1.06).
+	Pauses *Pauses `json:"pauses,omitempty"`
 }
 
 // Ends counts ends by reason (EndEOF and the rest).
@@ -223,11 +225,17 @@ func (p *Period) merge(o *Period) {
 		}
 		p.Calls.Merge(o.Calls)
 	}
+	if o.Pauses != nil {
+		if p.Pauses == nil {
+			p.Pauses = &Pauses{}
+		}
+		p.Pauses.merge(o.Pauses)
+	}
 }
 
 // Empty reports whether the period counted nothing.
 func (p *Period) Empty() bool {
-	return p.TCP == nil && len(p.QUIC) == 0 && p.Tunnels == nil && p.Dup == nil && p.Calls == nil
+	return p.TCP == nil && len(p.QUIC) == 0 && p.Tunnels == nil && p.Dup == nil && p.Calls == nil && p.Pauses == nil
 }
 
 // A Source adds what it counted since its last take to p. It is called with

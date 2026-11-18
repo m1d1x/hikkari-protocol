@@ -87,6 +87,7 @@ type dupConn struct {
 	voiceErr     time.Time // last failed voice dial
 	mirrorErr    time.Time // last failed stream dial, or one running
 	det          detector
+	pauses       observe.PauseMeter
 	// Frames a carrier's queue had no room for, by the carrier's channel.
 	fullDatagram, fullStream int64
 
@@ -174,6 +175,7 @@ func (d *dupConn) take(p *observe.Period) {
 		p.Dup.Ends.Add(observe.EndEOF)
 	}
 	d.ledger.Take(p.Dup)
+	d.pauses.Take(p)
 	p.Dup.FullDatagram += d.fullDatagram
 	p.Dup.FullStream += d.fullStream
 	d.fullDatagram, d.fullStream = 0, 0
@@ -249,7 +251,9 @@ func (d *dupConn) write(p []byte, dest M.Socksaddr) (int, error) {
 	d.mu.Lock()
 	d.seq++
 	seq := d.seq
-	call := d.det.add(time.Now(), len(p), lanes)
+	now := time.Now()
+	call := d.det.add(now, len(p), lanes)
+	d.pauses.In(now, voiceSized)
 	d.mu.Unlock()
 	frame, err := dup.Append(nil, dup.Frame{Kind: dup.KindPacket, Session: d.id, Seq: seq, Addr: dest, Payload: p})
 	if err != nil {
@@ -498,9 +502,11 @@ func (d *dupConn) deliver(data []byte, via dup.Via) {
 		return
 	}
 	d.mu.Lock()
-	fresh := d.ledger.Accept(f.Seq, via, time.Now())
+	now := time.Now()
+	fresh := d.ledger.Accept(f.Seq, via, now)
 	if fresh {
 		d.det.answer()
+		d.pauses.Out(now, dup.IsVoiceSized(len(f.Payload)), via == dup.ViaStream)
 	}
 	d.mu.Unlock()
 	if !fresh {
