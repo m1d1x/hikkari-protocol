@@ -142,6 +142,11 @@ func (s *Session) dgramLocked(m *member, fr frame) {
 		s.flows[f.id] = f
 		go s.readFlow(f)
 	}
+	if f.replay.restarted(fr.seq) {
+		// The other end forgot the flow and counts it anew from 1
+		// (spec/trunk.md, "Datagrams").
+		f.replay = replay{}
+	}
 	dup := f.replay.seen(fr.seq)
 	if s.local != nil {
 		s.heardLocked(f, m.kind.wire, fr.seq, dup, time.Now()) // answers follow the entry's set
@@ -222,8 +227,20 @@ type replay struct {
 	bits [16]uint64
 }
 
+// replaySize is the replay window in sequence numbers.
+const replaySize = 1024
+
+// restarted is whether seq starts the other end's count of the flow anew:
+// one of a count's first seqs while the window stands a whole window past
+// it. The other end forgot the flow (2 minutes with none of its datagrams)
+// and opened it again under the same id from 1; a copy that late is none a
+// member still holds.
+func (r *replay) restarted(seq uint32) bool {
+	return seq != 0 && seq < replaySize && r.top >= seq+replaySize
+}
+
 func (r *replay) seen(seq uint32) bool {
-	const size = 1024
+	const size = replaySize
 	if seq == 0 {
 		return true
 	}

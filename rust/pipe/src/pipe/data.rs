@@ -205,6 +205,15 @@ pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Optio
         }
         f.replay_epoch = epoch;
     }
+    if f.replay.restarted(seq) {
+        // The same process opened the flow again: it forgot it after 2
+        // minutes without a datagram of it, while this end kept sending
+        // (a brain's call never ends, a client in a call does not stop).
+        // aezamsk1 18.11 16:27–16:29: 126 s with nothing down, every call
+        // of the people's entry heard nothing after, for hours.
+        f.replay = Default::default();
+        f.holes = Default::default();
+    }
     if packet {
         let lost = f.holes.arrived(seq, now);
         counts.demand.arrived(lost, now);
@@ -288,4 +297,36 @@ pub(super) fn take_client(
         at += step;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow::CLASS_VOICE;
+    use hikkari_trunk::flow::ECHO_PORT;
+
+    /// The exit forgot the brain's call after 2 minutes with nothing of it
+    /// and answers it again from 1, in the same process (aezamsk1 18.11
+    /// 16:27–16:29: every call of the people's entry heard nothing after).
+    #[test]
+    fn a_call_the_exit_counts_anew_is_heard_again() {
+        let mut fl = Flows::new();
+        fl.open(7, Flow::new(Dest::Brain { tag: 7 }, CLASS_VOICE, ANY_WIRE, ECHO_PORT, 1, 0)).unwrap();
+        let id = fl.tagged(7).unwrap();
+        let (mut ctl, mut out, epoch) = (None, [0u8; 2048], [1u8; 8]);
+        let mut take = |fl: &mut Flows, seq: u32| {
+            deliver(fl, &mut [], &mut ctl, &mut out, b"call", id, seq, 0, 0, epoch, false);
+        };
+        for seq in 1..=5000 {
+            take(&mut fl, seq);
+        }
+        let heard = |fl: &mut Flows| fl.with_counts(id).unwrap().0.obs.delivered;
+        assert_eq!(heard(&mut fl), 5000);
+        for seq in 1..=50 {
+            take(&mut fl, seq);
+        }
+        assert_eq!(heard(&mut fl), 5050, "the new count, from 1, is heard");
+        take(&mut fl, 50);
+        assert_eq!(heard(&mut fl), 5050, "a copy of the new count is a copy");
+    }
 }

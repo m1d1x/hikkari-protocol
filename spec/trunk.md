@@ -174,6 +174,13 @@ set says, no ack, no resend. All copies carry the flow's one `seq`; the receiver
 wire that sent last the longest ago, so a TCP member's resend holds up one datagram in N, not every one. A flow ends after 2
 minutes unused.
 
+One end may end a flow the other still keeps: when the way to it loses the flow's datagrams for 2 minutes while the other
+end goes on sending (the entry's own call never stops, nor does a client in a call). Its next datagram opens the flow again
+under the same id, and its count starts at 1. The receiver whose window stands a whole window (1024) past a `seq` below 1024
+takes it as that new count and starts its window anew: without this every datagram of the new count is too old to tell and
+dropped, for as long as the flow lives (aezamsk1 18.11: 126 s with nothing down, every call of the people's entry silent
+after).
+
 The copies on a flow's main wire are its own: 2 by default, one for a flow whose sender already copies its datagrams
 (Hikkari v1.02 sends a call over both its channels, and a second copy on the trunk would make four of every packet). The
 entry chooses per listened port (the hub sets one copy on ports that reach the exit's Hikkari relay). Such a port still gets

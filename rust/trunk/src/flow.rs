@@ -74,6 +74,19 @@ impl Replay {
         self.top
     }
 
+    /// Whether seq starts the other end's count of the flow anew: one of a
+    /// count's first seqs while the window stands a whole window past it.
+    /// The other end forgot the flow (2 minutes with none of its datagrams:
+    /// the way there lost them that long) and opened it again under the same
+    /// id from 1, in the same process; every answer of the new count falls
+    /// under the window as too old, for as long as this end keeps the flow.
+    /// A copy that late is none a member still holds: a thousand of the
+    /// flow's datagrams went since.
+    #[inline]
+    pub fn restarted(&self, seq: u32) -> bool {
+        seq != 0 && seq < WINDOW && self.top >= seq + WINDOW
+    }
+
     /// Whether seq was seen, without marking it; one too old for the window
     /// to tell is not.
     #[inline]
@@ -111,6 +124,25 @@ mod tests {
         assert!(!r.seen(9000), "far ahead, past the whole window, is new");
         assert!(r.seen(9000));
         assert!(!r.seen(8999), "a window cleared at a jump holds nothing old");
+    }
+
+    #[test]
+    fn a_count_begun_anew_is_told_from_a_late_copy() {
+        let mut r = Replay::default();
+        for s in 1..=500 {
+            assert!(!r.restarted(s), "{s}: the first count is no restart");
+            r.seen(s);
+        }
+        assert!(!r.restarted(1), "a window not yet a window past 1 tells nothing");
+        for s in 501..=5000 {
+            r.seen(s);
+        }
+        assert!(r.restarted(1), "the other end's new count, from 1");
+        assert!(r.restarted(WINDOW - 1), "its first window");
+        assert!(!r.restarted(WINDOW), "past a count's first window it is a late copy");
+        assert!(!r.restarted(4500), "a late one near the top is a copy, not a restart");
+        assert!(!r.restarted(0), "seq 0 is never sent");
+        assert!(r.seen(1), "unhelped, the window drops the new count as too old");
     }
 
     #[test]
