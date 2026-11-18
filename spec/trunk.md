@@ -42,6 +42,7 @@ Both ways, big-endian:
 | drain 10 | (exit to entry) |
 | observe 11 | kind u8 (1 stream, 2 flow), stream u32, id u64 (exit to entry) |
 | frag 12 | id u16, index u8, count u8, n u16, n bytes (packet members of the `h3dgram` wire only, "Wires") |
+| adopt 13, adopted 14 | a flow or stream the entry's new process takes from its old one ("An entry's own process replaced") |
 
 The entry's first frame on a member is hello with its session id (random per entry run) and a zero epoch; the exit answers
 hello with the same id and the epoch of its session (random per exit session). The entry has no epoch: the first byte of
@@ -64,10 +65,47 @@ cuts nothing either. The new process gets the same client sockets and opens a se
 accepting and stops reading the shared UDP sockets, and first tells the new one every client address its flows are for; the
 new one reads no client datagram before that list is whole. A datagram from such an address the new process hands to the
 old one, which carries it on its own session; the answers go out of the shared socket from the process that holds the flow.
-A flow stays with its process until it ends (2 minutes unused): then the old process lets the address go, and a datagram it
-was handed for a flow it no longer has goes back to the new one with it, which opens the flow itself. A stream stays with the
-process that accepted it. An old process that carries nothing more says so and leaves, at the latest after 30 minutes; one
-that is gone gives every address it held to the new one.
+A flow the old process ends (2 minutes unused) it lets go: it lets the address go, and a datagram it was handed for a flow
+it no longer has goes back to the new one with it, which opens the flow itself. An old process that carries nothing more
+says so and leaves, at the latest after 30 minutes; one that is gone gives every address it held to the new one.
+
+What the old process carries it hands over (owner's decision of 18.11: a rollout of the entry cuts no live flow; a
+call begun before it was cut 30 minutes later, 17.11 20:40:52). The flow or stream moves to the new process's session
+and keeps its end at the exit: the same socket to the relay, which sees nothing. The new process says when its session
+takes everything new (as above: a quarter of its pool, or 10 seconds); then the old one hands it, one by one:
+
+- a flow: its client address, its session's id, its stream id there, its port, class and copies, and the next `seq` it
+  would send. The new process sends `adopt` for it on a pool member of its own session, under a stream id of its own.
+  Until the exit answers it hands the flow's datagrams to the old process as before. On `adopted` it carries the flow
+  itself from that `seq` on and takes the address; the old process forgets the flow without ending it.
+- a stream with no FIN either way: the old process stops reading the client's connection and stops writing to it, waits
+  until the exit confirmed every byte it sent (`received` is `up`; a member's death resends as always), and hands the
+  connection itself (its descriptor), its session's id, its stream id, its port and class, `up` (bytes read from the
+  client) and `down` (bytes written to it). The new process sends `adopt`, and on `adopted` reads and writes the client's
+  connection from `up` and `down` on. A stream with a FIN, or one whose bytes are not confirmed in 5 seconds, stays with
+  the old process, as does anything the exit does not adopt.
+
+| Frame | Fields |
+| --- | --- |
+| adopt 13 | kind u8 (1 stream, 2 flow), session id [16], stream u32 (its id there), stream u32 (its id here), up u64, down u64 (entry to exit; 0 and 0 for a flow) |
+| adopted 14 | kind u8, stream u32 (its id here), ok u8 (exit to entry) |
+
+The exit adopts a flow or stream only of a session of its own process, and the old session's id is the proof: only the
+entry that opened that session knows it. It moves the flow, or the stream, under the new id into the session `adopt`
+came on, and answers there from then on; the old id goes on reaching it until the old session ends, so what the old
+process sent on it before it learned of the move is not lost. A flow's `seq` numbering and its answers' go on: the window
+of copies at each end takes the next ones as it took the ones before. A stream's `up` must be what the exit received;
+the exit sends again from `down` everything after it, which the old process never confirmed, and nothing the old
+process sent arrives after `adopt` (it waited for every byte to be confirmed). The answer is `ok` 0 for a kind it does
+not know, a session it does not have (the exit's process was replaced since: the old session is an older process's), an
+id the old session does not have, or a stream whose `up` is not what it received; then the old process keeps it, and
+the new one gives it back and says so. An entry whose `adopt` has no answer in 2 seconds sends it again on another
+member; adopting twice is adopting once. Neither end counts a flow or stream it handed over or adopted as cut.
+
+An exit that predates adopt takes it for a torn frame and drops the member. So an entry that may send it sets bit 2 in its
+hello's capabilities, and an exit that adopts answers such a member's hello, right after it, with `adopted` of kind 0
+(stream 0, ok 1). The entry sends `adopt` only on a session whose exit said so on some member; with an exit that never
+said it, the old process carries what it has as before.
 
 An exit's own process replaced (the Rust exit's `drain` and `adopt`, R6.4; the relay's generations, edge `handoff.go`)
 cuts nothing either, and is what sends the drain above. Every process of the exit holds the same sockets: each packet
