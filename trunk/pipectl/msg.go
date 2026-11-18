@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 9
+const Version = 10
 
 // Brain → pipe.
 const (
@@ -51,6 +51,9 @@ const (
 	// receiver and active: the receivers (rust/pipe/src/pipe/session.rs).
 	bReceiver = 0x11 // rx u8, ip [4], pool_members u8: a receiver on standby at ip on the active one's ports (0.0.0.0: taken away)
 	bActive   = 0x12 // rx u8: the receiver that carries everything from now
+	// demand: the voice class's copies on the pool on demand
+	// (rust/trunk/src/demand.rs, spec/trunk.md "Copies on demand").
+	bDemand = 0x13 // hold_ms u32: held this long after a loss; 0: copies always
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -208,6 +211,16 @@ func putCopies(c Copies) ([]byte, error) {
 		return nil, fmt.Errorf("pipectl: copies: %d members, window %v; want 0-255 and at most 1s", c.Members, c.Window)
 	}
 	return binary.LittleEndian.AppendUint32([]byte{bCopies, byte(c.Members)}, uint32(c.Window/time.Microsecond)), nil
+}
+
+// MaxDemandHold is the longest hold of copies on demand the pipe takes.
+const MaxDemandHold = time.Hour
+
+func putDemand(hold time.Duration) ([]byte, error) {
+	if hold < 0 || hold > MaxDemandHold {
+		return nil, fmt.Errorf("pipectl: copies on demand: hold %v; want 0 (always) to %v", hold, MaxDemandHold)
+	}
+	return binary.LittleEndian.AppendUint32([]byte{bDemand}, uint32(hold/time.Millisecond)), nil
 }
 
 func putTCPListen(id byte, to uint16) []byte {

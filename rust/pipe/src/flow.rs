@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use hikkari_sys::sockaddr_in;
+use hikkari_trunk::demand::{Demand, Holes};
 use hikkari_trunk::flow::{Replay, ECHO_PORT};
 
 use crate::observe::{FlowObs, Report, END_IDLE, END_LOCAL, END_NONE, PHASE_END, PHASE_MARK};
@@ -53,6 +54,9 @@ pub struct Flow {
     /// process numbers its answers anew.
     pub replay: Replay,
     pub replay_epoch: [u8; 8],
+    /// Its answers that came on packet wires, to tell their holes there
+    /// (hikkari_trunk::demand).
+    pub holes: Holes,
     /// When it last sent a datagram or got one that was not a copy.
     pub used: u64,
     /// The session it goes on (the pipe's session.rs): the one that took
@@ -67,7 +71,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn new(dest: Dest, class: u8, pin: u8, port: u16, copies: u8, now: u64) -> Flow {
-        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), replay_epoch: [0; 8], used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
+        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), replay_epoch: [0; 8], holes: Holes::default(), used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
     }
 
     /// The trunk's own call, not a client's: neither end counts it among its
@@ -90,6 +94,10 @@ pub struct Counts {
     pub copies: u64,
     /// Clients' flows ended unused (trunk EndIdle).
     pub idle: u64,
+    /// Whether the voice class's copies of the other fate go now
+    /// (hikkari_trunk::demand): the pipe's holes on packet wires and the
+    /// exit's asks hold them.
+    pub demand: Demand,
 }
 
 /// Every flow the pipe has open, by stream id, client address and the

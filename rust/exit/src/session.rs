@@ -34,6 +34,9 @@ pub struct Session {
     pub by_wire: Vec<(u8, Vec<Seen>)>,
     /// Its entry reads observe frames (its hello said frame::CAP_OBSERVE).
     pub observe: bool,
+    /// Its entry reads copies frames (its hello said frame::CAP_COPIES): the
+    /// exit asks it for copies on demand.
+    pub copies: bool,
     /// Since when it has had no member (0 while it has one).
     pub empty_since: u64,
     pub flows: HashMap<u32, usize>,
@@ -62,6 +65,7 @@ impl Session {
             links: Vec::new(),
             by_wire: Vec::new(),
             observe: false,
+            copies: false,
             empty_since: 0,
             flows: HashMap::with_capacity(256),
             streams: HashMap::new(),

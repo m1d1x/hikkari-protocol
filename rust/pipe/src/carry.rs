@@ -122,6 +122,23 @@ impl View<'_> {
         set
     }
 
+    /// The voice set without its wires of fate tcp while the copies on
+    /// demand are off (hikkari_trunk::demand); the set as it is when no other
+    /// wire of it is left, as TCP then carries voice alone anyway.
+    fn without_pool(&self, set: Set) -> Set {
+        let mut out = Set::default();
+        for &c in set.carries() {
+            if c.wire == ANY_WIRE || self.fate(c.wire) != FATE_TCP {
+                out.add(c);
+            }
+        }
+        if out.is_empty() {
+            set
+        } else {
+            out
+        }
+    }
+
     /// The set a flow's next datagram goes on, and whether it is held to it
     /// (trunk carriesLocked).
     fn carries(&self, r: &Route, f: &Flow) -> (Set, bool) {
@@ -214,12 +231,21 @@ impl Later {
 }
 
 /// Carries one datagram of flow `id` on every wire of its set, never sent
-/// again.
+/// again. `pool` says whether the voice class's copies of the other fate go
+/// now (hikkari_trunk::demand): always but while copies on demand are off.
 #[allow(clippy::too_many_arguments)]
-pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later: &mut Later, f: &mut Flow, id: u32, p: &[u8], now: u64) {
+pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later: &mut Later, f: &mut Flow, id: u32, p: &[u8], now: u64, pool: bool) {
     f.used = now;
     f.seq = f.seq.wrapping_add(1);
-    let (set, strict) = View { wires, swires, sess: f.sess, fates: &route.fates }.carries(route, f);
+    let (set, strict) = {
+        let view = View { wires, swires, sess: f.sess, fates: &route.fates };
+        let (set, strict) = view.carries(route, f);
+        if pool || f.class != CLASS_VOICE || strict {
+            (set, strict)
+        } else {
+            (view.without_pool(set), strict)
+        }
+    };
     // 0 is the trunk's default, as a Go flow opened with Copies 0.
     let own = if f.copies == 0 { COPIES } else { f.copies };
     let (mut sent, mut queued) = (0, false);

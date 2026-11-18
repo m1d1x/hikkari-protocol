@@ -42,6 +42,7 @@ use std::io;
 use std::net::{SocketAddrV4, UdpSocket};
 
 use hikkari_sys::{self as sys, now_ns, Epoll, Poll, RecvBatch, SeqPacket};
+use hikkari_trunk::demand::{Demand, SPAN_NS};
 use hikkari_trunk::flow::{FLOW_IDLE_NS, MAX_CARRIES};
 use hikkari_trunk::health::Judge;
 use hikkari_trunk::udpwire;
@@ -141,6 +142,12 @@ pub struct Exit {
     /// answers of a window go down in one write (spec/trunk.md, "Copies on
     /// the pool").
     copy_window_ns: u64,
+    /// Copies on demand (hikkari_trunk::demand): the holes of the flows'
+    /// seq on packet wires, judged always, and when the exit last asked an
+    /// entry that reads copies frames for them.
+    demand: Demand,
+    asked: u64,
+    asks: u64,
     tick_at: u64,
     stats_at: u64,
     moved: u64,
@@ -181,6 +188,9 @@ impl Exit {
             relay_buf: vec![0; 65535],
             dgram_buf: vec![0; crate::h3wire::DGRAM],
             copy_window_ns: 0,
+            demand: Demand::new(SPAN_NS),
+            asked: 0,
+            asks: 0,
             echo_buf: Vec::with_capacity(65535),
             wall_off: sys::wall_ns() as i64 - now as i64,
             gone: Vec::with_capacity(16),
@@ -239,6 +249,7 @@ impl Exit {
     /// tests take less.
     pub fn set_flow_idle(&mut self, idle_ns: u64) {
         self.flow_idle_ns = idle_ns.max(1);
+
     }
 
     /// Runs until the brain is gone (forever without one).
@@ -416,7 +427,7 @@ impl Exit {
         let calls: u64 = self.wires.iter().map(|w| w.socket_counts().1).sum();
         let t = &self.t;
         eprintln!(
-            "hk-exit: sessions={} members={} joined={} silent={} quiet={} gone={} flows={} idle={} dgrams={}/{} copies={} refused={} w_in={} w_out={} frames/dgram={:.2} sendmmsg={} pauses={} bad={} dropped={}",
+            "hk-exit: sessions={} members={} joined={} silent={} quiet={} gone={} flows={} idle={} dgrams={}/{} copies={} refused={} w_in={} w_out={} frames/dgram={:.2} sendmmsg={} pauses={} bad={} dropped={} demand={}/{}",
             self.sessions.live(),
             t.members,
             t.joined,
@@ -435,7 +446,9 @@ impl Exit {
             calls,
             self.pause.pauses,
             t.bad,
-            self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum::<u64>()
+            self.wires.iter().map(|w| w.socket_counts().0 + w.dropped).sum::<u64>(),
+            self.demand.lost,
+            self.asks
         );
         for (wi, w) in self.wires.iter().enumerate() {
             if let Form::H3(h) = &w.form {

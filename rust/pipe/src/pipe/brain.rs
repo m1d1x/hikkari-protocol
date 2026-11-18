@@ -101,6 +101,10 @@ impl Pipe {
                 self.set_copies(members, window_us);
                 return Ok(());
             }
+            Some(Msg::Demand { hold_ms }) => {
+                self.flows.n.demand.set_hold(hold_ms as u64 * 1_000_000);
+                return Ok(());
+            }
             // The receivers (session.rs).
             Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
             Some(Msg::Active { rx }) => return self.set_active(rx),
@@ -224,14 +228,15 @@ impl Pipe {
                 let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
                     return Ok(()); // closed under it
                 };
-                carry(wires, swires, route, later, f, id, payload, now);
+                let pool = n.demand.copies(now);
+                carry(wires, swires, route, later, f, id, payload, now, pool);
                 if !f.echo() {
                     n.out += 1;
                 }
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } => {
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } => {
                 unreachable!("taken above")
             }
             Msg::Member { wire, index } => {
