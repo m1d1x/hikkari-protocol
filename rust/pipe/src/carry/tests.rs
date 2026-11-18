@@ -78,7 +78,7 @@ fn route(voice: u8, bulk: u8) -> Route {
 fn send(ws: &mut [Wire], ps: &mut [StreamWire], r: &Route, f: &mut Flow, n: usize) -> Later {
     let mut later = Later::new();
     for _ in 0..n {
-        carry(ws, ps, r, &mut later, f, 4, b"hi", 10);
+        carry(ws, ps, r, &mut later, f, 4, b"hi", 10, true);
     }
     later
 }
@@ -94,6 +94,23 @@ fn voice_rides_two_fates() {
     assert_eq!((ws[0].t.up_pkts, ps[0].t.up_pkts, f.seq), (1, 1, 1), "one datagram on each wire, one seq");
     let (mut ws, mut ps) = (wires(&[(1, 3)], &[]), [pool(POOL, 4, &[])]);
     send(&mut ws, &mut ps, &route(1, POOL), &mut flow(CLASS_BULK, ANY_WIRE, 1), 1);
+    assert_eq!(carried(&ws, &ps), ["0/1×1"], "bulk on its one wire");
+}
+
+/// Copies on demand off (hikkari_trunk::demand): voice leaves the pool out
+/// while a wire of fate udp carries it, and keeps the pool when nothing else
+/// is up; the other classes are as they were.
+#[test]
+fn voice_leaves_the_pool_while_copies_on_demand_are_off() {
+    let (mut ws, mut ps) = (wires(&[(1, 3)], &[]), [pool(POOL, 4, &[])]);
+    let mut later = Later::new();
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_VOICE, ANY_WIRE, 2), 4, b"hi", 10, false);
+    assert_eq!(carried(&ws, &ps), ["1/1×1", "1/2×1"], "two copies on wire 1, none on the pool");
+    let (mut ws, mut ps) = (wires(&[(1, 1)], &[(1, 0)]), [pool(POOL, 2, &[])]);
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_VOICE, ANY_WIRE, 1), 4, b"hi", 10, false);
+    assert_eq!(carried(&ws, &ps), ["0/1×1"], "no wire of fate udp up: the pool alone, as before");
+    let (mut ws, mut ps) = (wires(&[(1, 3)], &[]), [pool(POOL, 4, &[])]);
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_BULK, ANY_WIRE, 1), 4, b"hi", 10, false);
     assert_eq!(carried(&ws, &ps), ["0/1×1"], "bulk on its one wire");
 }
 
@@ -219,7 +236,7 @@ fn nothing_up_drops_on_the_wire_it_wanted() {
 fn a_frame_on_a_stream_member_is_the_dgram_the_exit_reads() {
     let mut ps = [pool(POOL, 1, &[])];
     let mut later = Later::new();
-    carry(&mut [], &mut ps, &route(POOL, POOL), &mut later, &mut flow(CLASS_VOICE, POOL, 1), 9, b"voice", 10);
+    carry(&mut [], &mut ps, &route(POOL, POOL), &mut later, &mut flow(CLASS_VOICE, POOL, 1), 9, b"voice", 10, true);
     let b = ps[0].links[0].out.bytes();
     match frame::next_frame(b, 0) {
         Some((frame::Frame::Dgram { stream: 9, seq: 1, port: 443, off, len }, n)) => {
@@ -241,7 +258,7 @@ fn a_windows_copies_go_on_one_member_of_copies_held() {
     let mut f = flow(CLASS_BULK, ANY_WIRE, 1);
     let mut later = Later::new();
     for t in 0..20u64 {
-        carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 1_000 + t * 100_000);
+        carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 1_000 + t * 100_000, true);
     }
     let held = carried(&[], &ps);
     assert_eq!(held.len(), 1, "one member holds the window: {held:?}");
@@ -251,12 +268,12 @@ fn a_windows_copies_go_on_one_member_of_copies_held() {
     assert!(ps[0].links[li].out.due(4_001_000));
     // The next window, after its member's copies left: the next member.
     ps[0].links[li].out.clear();
-    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_002_000);
+    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_002_000, true);
     let next = ps[0].copies.at;
     assert!(next != li && ps[0].is_copy(next));
     // It dies: the next copy goes on a member up at once.
     ps[0].links[next].h.down();
-    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_003_000);
+    carry(&mut [], &mut ps, &r, &mut later, &mut f, 4, b"hi", 4_003_000, true);
     let after = ps[0].copies.at;
     assert!(after != next && ps[0].links[after].h.up && ps[0].is_copy(after));
     assert_eq!((0..8).filter(|&i| ps[0].is_copy(i)).count(), 4);

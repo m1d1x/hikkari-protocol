@@ -49,6 +49,7 @@ use session::{Receiver, Sess};
 use tcp::{TcpListen, Why};
 
 use hikkari_sys::{self as sys, now_ns, Poll, RecvBatch, SendBatch, SeqPacket};
+use hikkari_trunk::demand::Demand;
 use hikkari_trunk::flow::FLOW_IDLE_NS;
 use hikkari_trunk::health::{self, Judge};
 use hikkari_trunk::ports::{self, Book};
@@ -136,6 +137,9 @@ pub struct Alone {
     /// The pool's members of copies and their window (copies.rs; 0: none).
     pub copy_members: usize,
     pub copy_window_ns: u64,
+    /// The voice class's copies of the other fate on demand, held this long
+    /// after the last loss (hikkari_trunk::demand; 0: always, as before).
+    pub copies_on_demand_ns: u64,
 }
 
 pub struct Pipe {
@@ -353,6 +357,7 @@ impl Pipe {
                 let set = Set::of(&[Carry { wire: a.wire, copies: 0, after_ns: 0 }, Carry { wire: POOL_WIRE, copies: 1, after_ns: 0 }]);
                 p.route = Route { voice_set: set, ..Route::one(a.wire) };
             }
+            p.flows.n.demand = Demand::new(a.copies_on_demand_ns);
             let now = now_ns();
             for li in 0..a.tcp_members {
                 p.redial(0, li, now);
@@ -530,7 +535,7 @@ impl Pipe {
 
     fn log_stats(&self) {
         let mut s = format!(
-            "hk-pipe: flows={} idle={} dgrams={}/{} copies={} route=bulk:{},voice:{}+{} later_dropped={} pauses={} bad={}",
+            "hk-pipe: flows={} idle={} dgrams={}/{} copies={} route=bulk:{},voice:{}+{} later_dropped={} pauses={} bad={} demand={}/{}/{}",
             self.flows.clients,
             self.flows.n.idle,
             self.flows.n.out,
@@ -541,7 +546,10 @@ impl Pipe {
             self.route.voice_set.len(),
             self.later.dropped,
             self.judge.pauses,
-            self.bad
+            self.bad,
+            self.flows.n.demand.lost,
+            self.flows.n.demand.runs,
+            self.flows.n.demand.on_ns(now_ns()) / 1_000_000
         );
         for w in &self.wires {
             let dgrams = w.members.iter().map(|m| m.dgrams).sum::<u64>();

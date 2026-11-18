@@ -6,6 +6,7 @@
 //! goes to its flow, opened on its first one.
 
 use hikkari_sys::{self as sys, BATCH};
+use hikkari_trunk::demand;
 use hikkari_trunk::flow::ECHO_PORT;
 use hikkari_trunk::frag::Reasm;
 use hikkari_trunk::frame::{self, Frame, DGRAM_HEAD, F_PONG, KIND_PACKET, KIND_STREAMS};
@@ -173,6 +174,7 @@ impl Exit {
             t.members += 1;
             t.joined += 1;
             sess.observe |= h.epoch[0] & frame::CAP_OBSERVE != 0;
+            sess.copies |= h.epoch[0] & frame::CAP_COPIES != 0;
             if gens.told {
                 wires[peer.wire].glue(peer, Class::Own, 1, now, frame::put_drain);
             }
@@ -193,13 +195,27 @@ impl Exit {
             return;
         }
         let (s, m, wire_id) = (p.session, (pi, p.gen), p.wire_id);
-        self.flow_dgram(s, m, wire_id, stream, seq, port, payload, now);
+        self.flow_dgram(s, m, wire_id, stream, seq, port, payload, now, true);
+    }
+
+    /// Asks the entry of session s for copies (spec/trunk.md, "Copies on
+    /// demand"): on peer pi, whose wire lost, and on one stream member of
+    /// the session, which delivers it whatever the packet wire loses.
+    fn ask_copies(&mut self, s: usize, pi: usize, now: u64) {
+        self.asks += 1;
+        let w = self.peers[pi].wire;
+        self.wires[w].glue(&mut self.peers[pi], Class::Own, 1, now, frame::put_copies);
+        if let Some(&(slot, _)) = self.sessions.all[s].links.first() {
+            self.links.all[slot].out.frame(1, frame::put_copies);
+        }
     }
 
     /// A datagram of flow `stream` of session s that came on member m (a
-    /// peer, or a stream member: LINK_SEEN) of wire `wire_id`.
+    /// peer, or a stream member: LINK_SEEN) of wire `wire_id`; `packet` says
+    /// m is a packet wire's, whose holes in the flow's seq ask the entry for
+    /// copies on demand.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn flow_dgram(&mut self, s: usize, m: Seen, wire_id: u8, stream: u32, seq: u32, port: u16, payload: &[u8], now: u64) {
+    pub(super) fn flow_dgram(&mut self, s: usize, m: Seen, wire_id: u8, stream: u32, seq: u32, port: u16, payload: &[u8], now: u64, packet: bool) {
         let fi = match self.sessions.all[s].flows.get(&stream) {
             Some(&fi) => fi,
             None => {
@@ -216,6 +232,14 @@ impl Exit {
                 fi
             }
         };
+        if packet {
+            let lost = self.flows.all[fi].holes.arrived(seq, now);
+            let wanted = self.demand.arrived(lost, now);
+            if wanted && self.sessions.all[s].copies && now.saturating_sub(self.asked) >= demand::ASK_EVERY_NS {
+                self.asked = now;
+                self.ask_copies(s, m.0, now);
+            }
+        }
         let f = &mut self.flows.all[fi];
         // A datagram on the old id of an adopted flow (exit/adopt.rs): taken,
         // but the answers stay on the new session's members.

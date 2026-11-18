@@ -2,6 +2,7 @@ package pipectl
 
 import (
 	"net"
+	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
 )
@@ -59,6 +60,17 @@ func (p *Pipe) SetPool(w Pool) error {
 // (Copies), now and for every pool set after.
 func (p *Pipe) SetCopies(c Copies) error {
 	msg, err := putCopies(c)
+	if err != nil {
+		return err
+	}
+	return sendWith(p.conn, &p.wmu, msg)
+}
+
+// SetDemand sets the voice class's copies on the pool on demand
+// (spec/trunk.md, "Copies on demand"): held hold after a loss on a packet
+// wire, 0 is a copy of every datagram as before. No new process.
+func (p *Pipe) SetDemand(hold time.Duration) error {
+	msg, err := putDemand(hold)
 	if err != nil {
 		return err
 	}

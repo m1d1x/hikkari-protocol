@@ -42,11 +42,12 @@ Both ways, big-endian:
 | drain 10 | (exit to entry) |
 | observe 11 | kind u8 (1 stream, 2 flow), stream u32, id u64 (exit to entry) |
 | frag 12 | id u16, index u8, count u8, n u16, n bytes (packet members of the `h3dgram` wire only, "Wires") |
-| adopt 13, adopted 14 | a flow or stream the entry's new process takes from its old one ("An entry's own process replaced") |
+| copies 13 | (exit to entry; experiment, "Copies on demand") |
+| adopt 14, adopted 15 | a flow or stream the entry's new process takes from its old one ("An entry's own process replaced") |
 
 The entry's first frame on a member is hello with its session id (random per entry run) and a zero epoch; the exit answers
 hello with the same id and the epoch of its session (random per exit session). The entry has no epoch: the first byte of
-the one it sends carries its capabilities (bit 1: it reads observe frames), the rest is zero. An epoch that changes under a session means the
+the one it sends carries its capabilities (bit 1: it reads observe frames; bit 2: it reads copies frames; bit 4: it may adopt, "An entry's own process replaced"), the rest is zero. An epoch that changes under a session means the
 exit lost its streams: the entry resets its own.
 
 Drain is the exit's process being replaced without a cut. The entry answers it once per session: a new session with a new
@@ -85,8 +86,8 @@ an exit answers a stream's `adopt` with `ok` 0.
 
 | Frame | Fields |
 | --- | --- |
-| adopt 13 | kind u8 (1 stream, 2 flow), session id [16], stream u32 (its id there), stream u32 (its id here), up u64, down u64 (entry to exit; 0 and 0 for a flow) |
-| adopted 14 | kind u8, stream u32 (its id here), ok u8 (exit to entry) |
+| adopt 14 | kind u8 (1 stream, 2 flow), session id [16], stream u32 (its id there), stream u32 (its id here), up u64, down u64 (entry to exit; 0 and 0 for a flow) |
+| adopted 15 | kind u8, stream u32 (its id here), ok u8 (exit to entry) |
 
 The exit adopts a flow only of a session of its own process, and the old session's id is the proof: only the entry that
 opened that session knows it. It moves the flow under the new id into the session `adopt` came on, and answers on that
@@ -96,7 +97,7 @@ at each end takes the next ones as it took the ones before. The answer is `ok` 0
 it does not have (the exit's process was replaced since: the old session is an older process's), or an id the old
 session does not have. Adopting twice is adopting once. Neither end counts a flow it handed over or adopted as cut.
 
-An exit that predates adopt takes it for a torn frame and drops the member. So an entry that may send it sets bit 2 in its
+An exit that predates adopt takes it for a torn frame and drops the member. So an entry that may send it sets bit 4 in its
 hello's capabilities, and an exit that adopts answers the hello of such a member of the pool (or of another wire of
 streams), right after it, with `adopted` of kind 0 (stream 0, ok 1). The entry sends `adopt` only on a session whose exit
 said so; with an exit that never said it, the old process carries what it has as before.
@@ -209,6 +210,27 @@ then padding to 64 bytes. Before it answers (`echo.go`), the exit writes into th
 are not zeros (another user of the echo), goes back as it came. The calls the entry keeps side by side tick together and number
 their frames as one: frame n leaves on every wire at the same moment. An exit older than the stamp answers the zeros back,
 and the entry hears no direction from it.
+
+### Copies on demand (experiment)
+
+hikkari-client `plans/2026-11-18-copies-on-demand.md`; off unless the brain turns it on (`B_DEMAND`, rust/README.md). The
+voice class's copy of the other fate (the pool's) goes only while an end lost datagrams of a packet wire lately, not on
+every datagram.
+
+Each end judges a flow's holes among the datagrams that came on its packet wires (`hikkari_trunk::demand`): a seq under one
+that came 20 ms ago that never came on a packet wire is lost, whatever the pool brought. The members of a wire go round and an
+end reads their sockets a batch at a time, so a datagram may come after the next ones; 20 ms is past a turn of the loop.
+The wire is losing when, over the last one to two spans of 200 ms, at least 2 datagrams due on packet wires were lost and at
+least 1% of those due: a share, not a count, as the wire's own trickle (0.1%) over many people is many datagrams a second.
+A loss that finds the wire losing starts the copies, or holds them, for the entry's hold (5 minutes, owner 18.11:
+`demand::HOLD_NS`) from then; a cut comes in waves, and a pause in a wave shorter than the hold starts nothing anew.
+
+The entry turns the copies on for its own losses (down): its copy on the pool makes the exit answer there too, as the exit
+answers on every wire the flow's datagrams came on in the last second. For its losses (up) the exit asks with a copies frame,
+at most every 100 ms, on the packet member that lost and on one stream member of the session; the entry holds the copies as
+for a loss of its own. An entry that does not know the frame drops the rest of the datagram, so the exit sends it only to
+an entry whose hello said it reads copies frames (bit 2). The hold is the entry's: the brain gives it (`B_DEMAND`, 0 is
+copies always, as before the experiment); the exit only asks, and an entry holding copies always takes no notice.
 
 ### What a listener hears
 

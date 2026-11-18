@@ -86,7 +86,7 @@ impl Pipe {
                                 w.t.down_pkts += 1;
                                 w.t.down_bytes += len as u64;
                                 *moved += 1;
-                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess, m.epoch);
+                                deliver(flows, listens, ctl, out, &p[off..off + len], stream, seq, now, sess, m.epoch, true);
                             }
                             Frame::Hello => {
                                 if let Some(h) = frame::read_hello(p, at) {
@@ -103,6 +103,8 @@ impl Pipe {
                             // The exit's process is being replaced: answered
                             // once per session, on the turn after (session.rs).
                             Frame::Drain => *drains |= 1u32 << sess,
+                            // The exit lost datagrams on a packet wire.
+                            Frame::Copies => flows.n.demand.hold(now),
                             Frame::Ping(t) => {
                                 m.frame(Class::Own, 9, glue_max, now, |b| frame::put_ping(b, frame::F_PONG, t));
                             }
@@ -135,7 +137,7 @@ impl Pipe {
                                             w.t.down_pkts += 1;
                                             w.t.down_bytes += len as u64;
                                             *moved += 1;
-                                            deliver(flows, listens, ctl, out, &whole[off..off + len], stream, seq, now, sess, epoch);
+                                            deliver(flows, listens, ctl, out, &whole[off..off + len], stream, seq, now, sess, epoch, true);
                                         }
                                         _ => *bad += 1,
                                     }
@@ -186,9 +188,12 @@ impl Pipe {
 /// answered the same flow (an older generation that took the wires back
 /// beside the newest, unl1 16.11) left the window at the higher count, and
 /// the live one's answers fell under it as old, every one, until a reload.
+///
+/// `packet` says it came on a packet wire: the holes it leaves in the
+/// flow's seq there hold the copies on demand (hikkari_trunk::demand).
 #[allow(clippy::too_many_arguments)]
 #[inline]
-pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64, sess: u8, epoch: [u8; 8]) {
+pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Option<SeqPacket>, out: &mut [u8], p: &[u8], stream: u32, seq: u32, now: u64, sess: u8, epoch: [u8; 8], packet: bool) {
     let Some((f, counts)) = flows.with_counts(stream) else { return };
     if f.sess != sess {
         return;
@@ -196,8 +201,13 @@ pub(super) fn deliver(flows: &mut Flows, listens: &mut [Listen], ctl: &mut Optio
     if epoch != f.replay_epoch && epoch != [0; 8] {
         if f.replay_epoch != [0; 8] {
             f.replay = Default::default();
+            f.holes = Default::default();
         }
         f.replay_epoch = epoch;
+    }
+    if packet {
+        let lost = f.holes.arrived(seq, now);
+        counts.demand.arrived(lost, now);
     }
     let echo = f.echo();
     if f.replay.seen(seq) {
@@ -266,9 +276,10 @@ pub(super) fn take_client(
         return false;
     };
     let Some((f, counts)) = flows.with_counts(id) else { return false };
+    let pool = counts.demand.copies(now);
     let mut at = 0;
     while at < p.len() {
-        carry(wires, swires, route, later, f, id, &p[at..(at + step).min(p.len())], now);
+        carry(wires, swires, route, later, f, id, &p[at..(at + step).min(p.len())], now, pool);
         if !f.echo() {
             counts.out += 1;
         }

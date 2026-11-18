@@ -323,10 +323,12 @@ impl Pipe {
                     t.down_pkts += 1;
                     t.down_bytes += len as u64;
                     *moved += 1;
-                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now, sess, *epoch);
+                    deliver(flows, listens, ctl, msg, &inb[off..off + len], stream, seq, now, sess, *epoch, false);
                 }
                 // The exit's process is being replaced (session.rs).
                 Frame::Drain => *drains |= 1u32 << sess,
+                // The exit lost datagrams on a packet wire.
+                Frame::Copies => flows.n.demand.hold(now),
                 // The exit marked a tester's stream or flow (marks.rs).
                 Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
                 // The exit's answer to an adopt, or that it adopts at all

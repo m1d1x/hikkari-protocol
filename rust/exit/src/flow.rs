@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::UdpSocket;
 
 use hikkari_trunk::echo::EchoMap;
+use hikkari_trunk::demand::Holes;
 use hikkari_trunk::flow::{Replay, ANSWER_NS, COPIES, ECHO_PORT, MAX_CARRIES};
 use hikkari_trunk::observe::FlowObs;
 
@@ -48,6 +49,9 @@ pub struct Flow {
     /// The exit's own seq of its answers.
     pub seq: u32,
     pub replay: Replay,
+    /// Its datagrams that came on packet wires, to tell their holes there
+    /// (hikkari_trunk::demand).
+    pub holes: Holes,
     /// The wires it came on, the newest MAX_CARRIES.
     pub heard: [Heard; MAX_CARRIES],
     pub sock: Option<UdpSocket>,
@@ -74,6 +78,7 @@ impl Flow {
             port: 0,
             seq: 0,
             replay: Replay::default(),
+            holes: Holes::default(),
             heard: [Heard::FREE; MAX_CARRIES],
             sock: None,
             fd: -1,
