@@ -63,6 +63,9 @@ pub struct Flow {
     pub local_port: u16,
     /// The trunk's call: the frames the exit has had (hikkari_trunk::echo).
     pub echoed: EchoMap,
+    /// The session and id it had before the entry's new process adopted it
+    /// (exit/adopt.rs), which still reach it; NONE for none.
+    pub alias: (usize, u32),
 }
 
 impl Flow {
@@ -83,6 +86,7 @@ impl Flow {
             obs: FlowObs::default(),
             local_port: 0,
             echoed: EchoMap::default(),
+            alias: (NONE, 0),
         }
     }
 

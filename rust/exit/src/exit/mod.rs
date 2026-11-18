@@ -24,6 +24,7 @@
 //! generation.rs (a reload: the old exit drains to the new one on the same
 //! sockets), observe.rs (testers' streams and flows marked and reported).
 
+mod adopt;
 mod brain;
 mod death;
 mod generation;
@@ -151,6 +152,10 @@ pub struct Exit {
     tick_at: u64,
     stats_at: u64,
     moved: u64,
+    /// Flows and streams the entry's new processes adopted, and adopts
+    /// refused (adopt.rs).
+    adopted: u64,
+    adopt_refused: u64,
     t: Tick,
     /// The exit among its generations (generation.rs), and where their
     /// sockets are in the poll set.
@@ -204,6 +209,8 @@ impl Exit {
             tick_at: now + timers::TICK_EVERY,
             stats_at: now,
             moved: 0,
+            adopted: 0,
+            adopt_refused: 0,
             t: Tick::default(),
             gens: generation::Gens::new(),
             gslots: Vec::new(),
@@ -478,7 +485,7 @@ impl Exit {
         if self.pool.is_some() {
             let n = &self.streams.n;
             eprintln!(
-                "hk-exit: links={} streams open={} opened={} fin={} rst_peer={} rst_local={} hit={} resent={} early={}/{} up={}MiB down={}MiB link_dgrams={}",
+                "hk-exit: links={} streams open={} opened={} fin={} rst_peer={} rst_local={} hit={} resent={} early={}/{} up={}MiB down={}MiB link_dgrams={} adopted={} adopt_refused={}",
                 t.links,
                 self.streams.open,
                 n.opened,
@@ -491,7 +498,9 @@ impl Exit {
                 n.early_dropped,
                 n.up >> 20,
                 n.down >> 20,
-                t.link_dgrams
+                t.link_dgrams,
+                self.adopted,
+                self.adopt_refused
             );
         }
     }

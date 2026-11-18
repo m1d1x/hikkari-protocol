@@ -82,13 +82,16 @@ pub(super) struct Sess {
     /// session on standby (it takes nothing).
     pub rx: u8,
     pub standby: bool,
+    /// Its exit said it adopts flows of the entry's older processes
+    /// (adopt.rs).
+    pub adopts: bool,
 }
 
 impl Sess {
     pub fn new(now: u64) -> Sess {
         let mut id = [0u8; 16];
         sys::urandom(&mut id);
-        Sess { id, live: true, exit_drains: false, answered: false, opened_at: now, retired_at: 0, epoch: None, rx: 0, standby: false }
+        Sess { id, live: true, exit_drains: false, answered: false, opened_at: now, retired_at: 0, epoch: None, rx: 0, standby: false, adopts: false }
     }
 }
 

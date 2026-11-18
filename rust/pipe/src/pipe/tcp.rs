@@ -265,6 +265,7 @@ impl Pipe {
                 }
             }
         }
+        self.take_adopted(now);
         self.send_events();
         self.saw_epochs();
         self.observed(now);
@@ -273,7 +274,7 @@ impl Pipe {
     /// The whole frames read on member li of wire wi; false for bytes that
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
-        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, marks, .. } = self;
+        let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, marks, adopted, .. } = self;
         let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
         let sess = *sess;
         let Link { inb, in_n, out, h, up_at, epoch, .. } = &mut links[li];
@@ -281,7 +282,7 @@ impl Pipe {
         let mut at = 0;
         while at < *in_n {
             let Some((fr, next)) = frame::next_frame(&inb[..*in_n], at) else {
-                if !(frame::F_HELLO..=frame::F_OBSERVE).contains(&inb[at]) {
+                if !matches!(inb[at], frame::F_HELLO..=frame::F_OBSERVE | frame::F_ADOPTED) {
                     return false;
                 }
                 break; // the rest of the frame is still to come
@@ -330,7 +331,10 @@ impl Pipe {
                 Frame::Copies => flows.n.demand.hold(now),
                 // The exit marked a tester's stream or flow (marks.rs).
                 Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),
-                Frame::Open { .. } | Frame::Frag { .. } | Frame::Other => {}
+                // The exit's answer to an adopt, or that it adopts at all
+                // (adopt.rs).
+                Frame::Adopted { kind, stream, ok } => adopted.push((sess, kind, stream, ok)),
+                Frame::Open { .. } | Frame::Frag { .. } | Frame::Adopt { .. } | Frame::Other => {}
             }
             at = next;
         }

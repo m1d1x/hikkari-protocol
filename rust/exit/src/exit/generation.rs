@@ -358,7 +358,7 @@ impl Exit {
                         self.datagram(wi, from, &mut msg[HEAD..n], now);
                     }
                 }
-                Some(Msg::Dgram { .. }) | None => {}
+                Some(Msg::Dgram { .. } | Msg::Ready | Msg::Move(_) | Msg::Taken { .. } | Msg::Moved { .. }) | None => {}
             }
         }
         self.msg = msg;

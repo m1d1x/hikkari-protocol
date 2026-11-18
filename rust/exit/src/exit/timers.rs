@@ -122,7 +122,13 @@ impl Exit {
             let flows: Vec<usize> = x.flows.values().copied().collect();
             let streams: Vec<usize> = x.streams.values().copied().collect();
             for fi in flows {
-                self.end_flow(fi, END_SESSION, now);
+                // A flow adopted away is the new session's: only its old id
+                // ends with this one (exit/adopt.rs).
+                if self.flows.all[fi].session == s {
+                    self.end_flow(fi, END_SESSION, now);
+                } else {
+                    self.flows.all[fi].alias = (crate::peer::NONE, 0);
+                }
             }
             // No member is left to tell: the streams end without a reset
             // (trunk Session.Close).

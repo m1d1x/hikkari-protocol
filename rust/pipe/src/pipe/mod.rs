@@ -27,6 +27,7 @@
 //! pool.rs (the brain's client ports of streams and pools), h3.rs (the
 //! Chromium QUIC wire's members: tunnels from the book's ports).
 
+mod adopt;
 mod brain;
 mod data;
 mod death;
@@ -205,6 +206,13 @@ pub struct Pipe {
     owners: FxMap<u64>,
     freed: Vec<u64>,
     drained: bool,
+    /// Flows older generations hand over (adopt.rs), the exit's adopted
+    /// frames of this read (session, kind, stream, ok), flows taken from
+    /// older generations and handed to the newer one.
+    adopting: Vec<adopt::Adopting>,
+    adopted: Vec<(u8, u8, u32, bool)>,
+    handed_in: u64,
+    handed_out: u64,
     poll: Poll,
     slots: Vec<Slot>,
     dirty: bool,
@@ -264,6 +272,10 @@ impl Pipe {
             owners: FxMap::default(),
             freed: Vec::with_capacity(256),
             drained: false,
+            adopting: Vec::new(),
+            adopted: Vec::new(),
+            handed_in: 0,
+            handed_out: 0,
             poll: Poll::new(),
             slots: Vec::new(),
             dirty: true,

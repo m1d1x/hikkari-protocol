@@ -80,6 +80,11 @@ impl Flow {
     pub fn echo(&self) -> bool {
         self.port == ECHO_PORT
     }
+
+    /// Its stream id on the trunk.
+    pub fn id(&self) -> u32 {
+        self.id
+    }
 }
 
 /// The clients' datagrams, as trunk Stats counts them (the trunk's own
@@ -196,6 +201,25 @@ impl Flows {
     /// The keys of every client's open flow.
     pub fn client_keys(&self) -> impl Iterator<Item = u64> + '_ {
         self.by_addr.keys().copied()
+    }
+
+    /// Every client's open flow and its key.
+    pub fn clients_open(&self) -> impl Iterator<Item = (u64, &Flow)> + '_ {
+        self.by_addr.iter().map(|(&key, &id)| (key, &self.list[((id & SLOT_MASK) - 1) as usize]))
+    }
+
+    /// Gives up the client's flow of `key`, ending nothing: another
+    /// generation of the pipe carries it on (pipe/adopt.rs). Its next seq,
+    /// None for no such flow.
+    pub fn give_up(&mut self, key: u64) -> Option<u32> {
+        let id = self.by_addr.remove(&key)?;
+        let slot = (id & SLOT_MASK) - 1;
+        let f = &mut self.list[slot as usize];
+        let seq = f.seq;
+        f.dest = Dest::Gone;
+        self.clients -= 1;
+        self.free.push(slot);
+        Some(seq)
     }
 
     /// Ends every client's flow unused for idle_ns (trunk's sweep of

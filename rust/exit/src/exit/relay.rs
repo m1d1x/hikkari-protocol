@@ -43,7 +43,10 @@ impl Exit {
         if f.fd >= 0 {
             self.relays.del(f.fd);
         }
-        let s = f.session;
+        let (s, (a, old)) = (f.session, f.alias);
+        if a != crate::peer::NONE && self.sessions.all[a].flows.get(&old) == Some(&fi) {
+            self.sessions.all[a].flows.remove(&old);
+        }
         self.flows.end(&mut self.sessions.all[s].flows, fi)
     }
 
