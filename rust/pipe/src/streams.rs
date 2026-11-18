@@ -85,6 +85,13 @@ pub struct Stream {
     leg_seen: (u32, u32),
     /// What it did, for its reports if the exit marks it (observe.rs).
     pub obs: StreamObs,
+    /// Handed to a newer generation (pipe/adopt.rs): since when its client
+    /// is not read (0: it is), and whether its connection went over.
+    pub frozen_at: u64,
+    pub handed: bool,
+    /// Taken from an older generation and not adopted by the exit yet: its
+    /// client is not read.
+    pub adopting: bool,
 }
 
 impl Stream {
@@ -170,7 +177,43 @@ impl Streams {
             write_done: false,
             leg_seen: (0, 0),
             obs: StreamObs::new(sys::now_ns()),
+            frozen_at: 0,
+            handed: false,
+            adopting: false,
         };
+        self.unopened += 1;
+        self.n.opened += 1;
+        self.put(st)
+    }
+
+    /// A stream an older generation hands over (pipe/adopt.rs): its client's
+    /// connection, the exit's port, and `up` bytes read from the client and
+    /// `down` written to it there, all confirmed. Opened already (the exit
+    /// adopts it, no open goes), on session `sess`, its client not read
+    /// until the exit adopts it. Its slot.
+    pub fn adopted(&mut self, fd: OwnedFd, port: u16, sess: u8, up: u64, down: u64) -> usize {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let st = Stream {
+            client: Client { fd, down: Behind::default() },
+            id: self.next_id,
+            port,
+            opened: true,
+            send: Send::at(up),
+            recv: Recv::at(down),
+            read_done: false,
+            sess,
+            write_done: false,
+            leg_seen: (0, 0),
+            obs: StreamObs::new(sys::now_ns()),
+            frozen_at: 0,
+            handed: false,
+            adopting: true,
+        };
+        self.put(st)
+    }
+
+    fn put(&mut self, st: Stream) -> usize {
+        let id = st.id;
         let slot = match self.free.pop() {
             Some(s) => {
                 self.list[s] = Some(st);
@@ -181,11 +224,23 @@ impl Streams {
                 self.list.len() - 1
             }
         };
-        self.by_id.insert(self.next_id, slot as u32);
-        self.unopened += 1;
+        self.by_id.insert(id, slot as u32);
         self.open += 1;
-        self.n.opened += 1;
         slot
+    }
+
+    /// Gives up the stream in `slot`, ending nothing: another generation
+    /// carries it on, or never took it here. Its connection closes here
+    /// only (the other generation holds its own).
+    pub fn give_up(&mut self, slot: usize) {
+        if let Some(st) = self.list[slot].take() {
+            self.by_id.remove(&st.id);
+            if !st.opened {
+                self.unopened -= 1;
+            }
+            self.open -= 1;
+            self.free.push(slot);
+        }
     }
 
     pub fn slots(&self) -> usize {

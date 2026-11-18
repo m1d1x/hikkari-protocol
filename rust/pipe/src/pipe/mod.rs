@@ -28,6 +28,7 @@
 //! Chromium QUIC wire's members: tunnels from the book's ports).
 
 mod adopt;
+mod adopt_streams;
 mod brain;
 mod data;
 mod death;
@@ -210,6 +211,9 @@ pub struct Pipe {
     /// frames of this read (session, kind, stream, ok), flows taken from
     /// older generations and handed to the newer one.
     adopting: Vec<adopt::Adopting>,
+    adopting_streams: Vec<adopt_streams::AdoptingStream>,
+    /// Streams frozen to go to the newer generation (adopt_streams.rs).
+    freezing: usize,
     adopted: Vec<(u8, u8, u32, bool)>,
     handed_in: u64,
     handed_out: u64,
@@ -273,6 +277,8 @@ impl Pipe {
             freed: Vec::with_capacity(256),
             drained: false,
             adopting: Vec::new(),
+            adopting_streams: Vec::new(),
+            freezing: 0,
             adopted: Vec::new(),
             handed_in: 0,
             handed_out: 0,

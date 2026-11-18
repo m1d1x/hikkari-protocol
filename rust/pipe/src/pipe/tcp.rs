@@ -186,7 +186,7 @@ impl Pipe {
                 continue;
             }
             let Some((st, n)) = streams.with_counts(slot) else { continue };
-            if !st.opened || st.read_done || waits & (1 << st.sess) != 0 {
+            if !st.opened || st.read_done || waits & (1 << st.sess) != 0 || st.frozen_at != 0 || st.adopting {
                 continue;
             }
             for _ in 0..READS_PER_TURN {
@@ -266,6 +266,7 @@ impl Pipe {
             }
         }
         self.take_adopted(now);
+        self.hand_streams(now);
         self.send_events();
         self.saw_epochs();
         self.observed(now);
@@ -434,6 +435,7 @@ impl Pipe {
             }
         }
         self.end_doomed();
+        self.hand_streams(sys::now_ns());
     }
 
     /// Every member's waiting frames, as much as its socket takes.
@@ -481,7 +483,7 @@ impl Pipe {
             match *s {
                 Slot::Client(slot) => {
                     let Some(st) = streams.get(slot) else { continue };
-                    let read = st.opened && !st.read_done && chunk & (1 << st.sess) != 0 && st.send.room() > 0;
+                    let read = st.opened && !st.read_done && chunk & (1 << st.sess) != 0 && st.send.room() > 0 && st.frozen_at == 0 && !st.adopting;
                     poll.want(si, read, st.client.down_pending());
                 }
                 Slot::Link(wi, li) => {
@@ -613,6 +615,16 @@ fn stream_frame(fr: Frame, inb: &[u8], out: &mut Out, streams: &mut Streams, doo
         return;
     };
     let (st, n) = streams.with_counts(slot).unwrap();
+    // A stream being handed over takes no new bytes from the exit: what it
+    // has is written to its client and then goes as `down`; the exit sends
+    // the rest again to the new generation (pipe/adopt.rs). Only a chunk
+    // that fills the hole under ones kept past it is taken, so none stays
+    // kept: those the exit counts as confirmed.
+    if let Frame::Data { off, .. } = fr {
+        if st.frozen_at != 0 && (st.recv.none_ahead() || off > st.recv.received) {
+            return;
+        }
+    }
     match fr {
         Frame::Data { off, at, len, .. } => {
             let (mut wrote, mut gone) = (0, false);

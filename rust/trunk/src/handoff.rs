@@ -19,7 +19,11 @@
 //! new and its exit adopts), old → new `move` (a flow: its address, its
 //! session's id, its stream id, port, class, copies and next seq), new →
 //! old `taken` (the exit adopted it), old → new `moved` (the old pipe forgot
-//! it; the seq it got to, 0 for a flow it had ended). An address is
+//! it; the seq it got to, 0 for a flow it had ended). A stream: old → new
+//! `smove` with the client's connection (SCM_RIGHTS), its session's id, its
+//! stream id, port, `up` and `down`; new → old `staken` (the exit adopted
+//! it: the old pipe lets it go) or `skept` (it did not: the old pipe goes
+//! on with it). An address is
 //! the id of its listened port or wire (the brain's, the same in both
 //! pipes), the IPv4 address as on the wire, the port; integers
 //! little-endian.
@@ -35,6 +39,11 @@ pub const READY: u8 = 0x06;
 pub const MOVE: u8 = 0x07;
 pub const TAKEN: u8 = 0x08;
 pub const MOVED: u8 = 0x09;
+pub const SMOVE: u8 = 0x0a;
+pub const STAKEN: u8 = 0x0b;
+pub const SKEPT: u8 = 0x0c;
+/// An smove: kind, session [16], stream u32, port u16, up u64, down u64.
+pub const SMOVE_LEN: usize = 1 + 16 + 4 + 2 + 8 + 8;
 
 /// An address: listen, IPv4, port.
 pub const ADDR: usize = 1 + 4 + 2;
@@ -47,6 +56,17 @@ pub const OWN_MAX: usize = 8192;
 pub const MOVE_LEN: usize = HEAD + 16 + 4 + 2 + 1 + 1 + 4;
 /// A moved: the head, seq u32.
 pub const MOVED_LEN: usize = HEAD + 4;
+
+/// A stream the old pipe hands over (`smove`); its client's connection
+/// comes with the message.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct StreamMoving {
+    pub session: [u8; 16],
+    pub stream: u32,
+    pub port: u16,
+    pub up: u64,
+    pub down: u64,
+}
 
 /// A flow the old pipe hands over (`move`).
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -75,6 +95,9 @@ pub enum Msg<'a> {
     Move(Moving),
     Taken { listen: u8, addr: SocketAddrV4 },
     Moved { listen: u8, addr: SocketAddrV4, seq: u32 },
+    StreamMove(StreamMoving),
+    StreamTaken { stream: u32 },
+    StreamKept { stream: u32 },
 }
 
 /// Reads one message; None for one torn or unknown.
@@ -83,6 +106,23 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
     match kind {
         ALL => return (m.len() == 1).then_some(Msg::All),
         READY => return (m.len() == 1).then_some(Msg::Ready),
+        STAKEN | SKEPT => {
+            let stream = u32::from_le_bytes(m.get(1..5)?.try_into().ok()?);
+            return (m.len() == 5).then_some(if kind == STAKEN { Msg::StreamTaken { stream } } else { Msg::StreamKept { stream } });
+        }
+        SMOVE => {
+            if m.len() != SMOVE_LEN {
+                return None;
+            }
+            let le64 = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap());
+            return Some(Msg::StreamMove(StreamMoving {
+                session: m[1..17].try_into().ok()?,
+                stream: u32::from_le_bytes(m[17..21].try_into().ok()?),
+                port: u16::from_le_bytes([m[21], m[22]]),
+                up: le64(&m[23..31]),
+                down: le64(&m[31..39]),
+            }));
+        }
         GEN => return (m.len() == 2).then(|| Msg::Gen { gen: m[1] }),
         OWN => return (m.len() - 1).is_multiple_of(ADDR).then_some(Msg::Own { addrs: &m[1..] }),
         _ => {}
@@ -148,6 +188,24 @@ pub fn put_move(out: &mut [u8], m: &Moving) -> usize {
     MOVE_LEN
 }
 
+/// Writes an smove into out (at least SMOVE_LEN bytes).
+pub fn put_smove(out: &mut [u8], s: &StreamMoving) -> usize {
+    out[0] = SMOVE;
+    out[1..17].copy_from_slice(&s.session);
+    out[17..21].copy_from_slice(&s.stream.to_le_bytes());
+    out[21..23].copy_from_slice(&s.port.to_le_bytes());
+    out[23..31].copy_from_slice(&s.up.to_le_bytes());
+    out[31..39].copy_from_slice(&s.down.to_le_bytes());
+    SMOVE_LEN
+}
+
+/// Writes an staken or skept (`kind`) of `stream` into out (5 bytes).
+pub fn put_stream_answer(out: &mut [u8], kind: u8, stream: u32) -> usize {
+    out[0] = kind;
+    out[1..5].copy_from_slice(&stream.to_le_bytes());
+    5
+}
+
 /// Writes a moved into out (at least MOVED_LEN bytes).
 pub fn put_moved(out: &mut [u8], listen: u8, addr: SocketAddrV4, seq: u32) -> usize {
     let h = put_head(out, MOVED, listen, addr);
@@ -207,5 +265,18 @@ mod tests {
         let n = put_head(&mut b, TAKEN, 3, a);
         assert_eq!(parse(&b[..n]), Some(Msg::Taken { listen: 3, addr: a }));
         assert_eq!(parse(&[READY]), Some(Msg::Ready));
+    }
+
+    #[test]
+    fn a_stream_handed_over_reads_back_as_written() {
+        let s = StreamMoving { session: [4; 16], stream: 77, port: 443, up: 1 << 33, down: 12345 };
+        let mut b = [0u8; 64];
+        let n = put_smove(&mut b, &s);
+        assert_eq!(parse(&b[..n]), Some(Msg::StreamMove(s)));
+        assert!(parse(&b[..n - 1]).is_none(), "an smove torn");
+        let n = put_stream_answer(&mut b, STAKEN, 77);
+        assert_eq!(parse(&b[..n]), Some(Msg::StreamTaken { stream: 77 }));
+        let n = put_stream_answer(&mut b, SKEPT, 78);
+        assert_eq!(parse(&b[..n]), Some(Msg::StreamKept { stream: 78 }));
     }
 }

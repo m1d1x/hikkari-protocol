@@ -157,6 +157,9 @@ pub struct Stream {
     pub local_port: u16,
     /// The loopback port it reaches (0: the trunk's own download).
     pub port: u16,
+    /// The session and id it had before the entry's new process adopted it
+    /// (exit/adopt.rs); NONE for none.
+    pub adopted_from: (usize, u32),
 }
 
 impl Stream {
@@ -178,6 +181,7 @@ impl Stream {
             obs: StreamObs::default(),
             local_port: 0,
             port: 0,
+            adopted_from: (NONE, 0),
         }
     }
 

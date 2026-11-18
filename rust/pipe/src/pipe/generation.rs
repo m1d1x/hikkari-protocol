@@ -128,7 +128,9 @@ impl Pipe {
         if self.fds.len() != 1 {
             return Err(format!("adopt: {} sockets, want 1", self.fds.len()));
         }
-        let o = Older { sock: Some(SeqPacket::new(self.fds.remove(0), 0)), all: false, ready: false };
+        // Room for one descriptor a message: a stream's client connection
+        // (adopt_streams.rs).
+        let o = Older { sock: Some(SeqPacket::new(self.fds.remove(0), 1)), all: false, ready: false };
         let owners = &self.owners;
         // A slot of an older pipe gone and owning nothing is used again.
         match (0..self.older.len()).find(|&i| self.older[i].sock.is_none() && !owners.values().any(|&v| v as usize == i)) {
@@ -196,6 +198,14 @@ impl Pipe {
                     self.taken(listen, addr);
                     continue;
                 }
+                Some(Msg::StreamTaken { stream }) => {
+                    self.stream_answered(stream, true);
+                    continue;
+                }
+                Some(Msg::StreamKept { stream }) => {
+                    self.stream_answered(stream, false);
+                    continue;
+                }
                 _ => continue,
             };
             let Some(li) = self.listens.iter().position(|l| l.id == listen) else { continue };
@@ -227,7 +237,8 @@ impl Pipe {
     fn read_older(&mut self, i: usize) {
         loop {
             let Some(s) = &mut self.older[i].sock else { return };
-            self.fds.clear();
+            // A descriptor of the last message no one took is closed.
+            super::adopt_streams::close_stray(&mut self.fds);
             let n = match s.recv(&mut self.msg, &mut self.fds) {
                 Ok(None) => return,
                 Ok(Some(n)) if n > 0 => n,
@@ -276,8 +287,13 @@ impl Pipe {
                     take_client(flows, wires, swires, route, later, &listens[li], li, sa, key, payload, payload.len(), now, moved, *cur);
                 }
                 Some(Msg::Move(m)) => self.moving(i, m, sys::now_ns()),
+                Some(Msg::StreamMove(m)) => {
+                    if let Some(fd) = self.fds.pop() {
+                        self.stream_moving(i, m, fd, sys::now_ns());
+                    }
+                }
                 Some(Msg::Moved { listen, addr, seq }) => self.moved(i, listen, addr, seq),
-                Some(Msg::Dgram { .. } | Msg::Gen { .. } | Msg::Ready | Msg::Taken { .. }) | None => {}
+                Some(Msg::Dgram { .. } | Msg::Gen { .. } | Msg::Ready | Msg::Taken { .. } | Msg::StreamTaken { .. } | Msg::StreamKept { .. }) | None => {}
             }
         }
     }

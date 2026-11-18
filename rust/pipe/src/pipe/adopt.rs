@@ -14,12 +14,13 @@
 //! the flow without ending it and says `moved` with the seq it got to; the
 //! new one takes the address and carries the flow from that seq on. An
 //! adopt refused, or unanswered after ADOPT_TRIES tries, leaves the flow
-//! with the old pipe as before.
+//! with the old pipe as before. Streams go over with their client's
+//! connection: adopt_streams.rs.
 
 use std::net::SocketAddrV4;
 
 use hikkari_sys as sys;
-use hikkari_trunk::frame::{self, ADOPT_EXIT, OBS_FLOW};
+use hikkari_trunk::frame::{self, ADOPT_EXIT, OBS_FLOW, OBS_STREAM};
 use hikkari_trunk::handoff::{self, Moving};
 
 use super::data::client_key;
@@ -30,9 +31,9 @@ use crate::ctl::ANY_WIRE;
 use crate::flow::{Dest, Flow};
 
 /// An adopt unanswered this long goes again on another member.
-const ADOPT_AGAIN_NS: u64 = 2_000_000_000;
-/// Tries of one adopt before the flow is left with the old pipe.
-const ADOPT_TRIES: u8 = 3;
+pub(super) const ADOPT_AGAIN_NS: u64 = 2_000_000_000;
+/// Tries of one adopt before the flow or stream is left with the old pipe.
+pub(super) const ADOPT_TRIES: u8 = 3;
 
 /// A flow an older generation hands over, while the exit and that
 /// generation answer: its id here, its key, the older one's index, what
@@ -57,7 +58,14 @@ impl Pipe {
                 self.sessions[sess as usize].adopts |= ok;
                 continue;
             }
-            if kind != OBS_FLOW || sess != self.cur {
+            if sess != self.cur {
+                continue;
+            }
+            if kind == OBS_STREAM {
+                self.stream_adopted(stream, ok);
+                continue;
+            }
+            if kind != OBS_FLOW {
                 continue;
             }
             let Some(i) = self.adopting.iter().position(|a| a.id == stream && !a.taken) else { continue };
@@ -88,6 +96,7 @@ impl Pipe {
                 o.ready = true;
             }
         }
+        self.streams_clock(now);
         let mut i = 0;
         while i < self.adopting.len() {
             let a = &self.adopting[i];
@@ -173,7 +182,8 @@ impl Pipe {
             s.send(&self.out[..k]);
             n += 1;
         }
-        eprintln!("hk-pipe: hands {n} flow(s) to the newer generation");
+        let frozen = self.freeze_streams(sys::now_ns());
+        eprintln!("hk-pipe: hands {n} flow(s) and {frozen} stream(s) to the newer generation");
     }
 
     /// The newer generation's `taken`: the exit adopted the flow; it is

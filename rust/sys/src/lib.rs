@@ -421,6 +421,38 @@ impl SeqPacket {
         Ok(Some(n as usize))
     }
 
+    /// Sends one message with descriptors (SCM_RIGHTS: the other end gets
+    /// its own copies, these stay open here) without waiting; false (and
+    /// counted) when the socket refuses it.
+    pub fn send_fds(&mut self, msg: &[u8], fds: &[i32]) -> bool {
+        let mut iov = libc::iovec { iov_base: msg.as_ptr() as *mut _, iov_len: msg.len() };
+        let space = unsafe { libc::CMSG_SPACE((fds.len() * 4) as u32) } as usize;
+        let mut cmsg = vec![0u8; space];
+        let mut h: libc::msghdr = unsafe { zeroed() };
+        h.msg_iov = &mut iov;
+        h.msg_iovlen = 1;
+        h.msg_control = cmsg.as_mut_ptr() as *mut _;
+        h.msg_controllen = space as _;
+        // The one control message the buffer was sized for: the
+        // descriptors, as recv reads them.
+        let n = unsafe {
+            let c = libc::CMSG_FIRSTHDR(&h);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN((fds.len() * 4) as u32) as _;
+            let p = libc::CMSG_DATA(c) as *mut i32;
+            for (i, &fd) in fds.iter().enumerate() {
+                std::ptr::write_unaligned(p.add(i), fd);
+            }
+            libc::sendmsg(self.fd, &h, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+        };
+        if n < 0 {
+            self.dropped += 1;
+            return false;
+        }
+        true
+    }
+
     /// Sends one message without waiting; false (and counted) when the
     /// socket refuses it.
     pub fn send(&mut self, msg: &[u8]) -> bool {
