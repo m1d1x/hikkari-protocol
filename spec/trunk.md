@@ -80,22 +80,34 @@ of its own on its current session and sends `adopt` for it on a member of its po
 datagrams still go to the old process, and its answers come on whichever session the exit holds it on. On `adopted` the
 new process tells the old one, which forgets the flow without ending it and says the seq it got to; the new process takes
 the address and carries the flow from that seq on. A flow the exit does not adopt, or whose `adopt` has no answer after
-3 tries 2 seconds apart, stays with the old process. A stream stays with the process that accepted it: adopt carries a
-stream's offsets (`up` read from the client, `down` written to it) for when streams are handed over too, and until then
-an exit answers a stream's `adopt` with `ok` 0.
+3 tries 2 seconds apart, stays with the old process.
+
+A stream goes over with its client's connection itself (the descriptor passed between the processes), so the client
+sees no end of it. The old process freezes every stream with no FIN either way: it reads its client no more, and takes no
+new chunk from the exit but one that fills a hole under chunks kept past it (the exit counts those as confirmed, so none
+may stay behind). Once the exit confirmed every byte it sent and everything it got is written to the client, it hands
+over the connection, its session's id, its stream id, its port, `up` (bytes read from the client) and `down` (bytes
+written to it). One not ready within 5 seconds, or that met a FIN, stays with the old process. The new process opens the
+stream under an id of its own, already open, its client not read, and sends `adopt`; on `adopted` it reads the client,
+and the old process lets the stream go without an end. Refused or unanswered, it goes back: the old process goes on with
+it, and the new one closes its copy of the connection.
 
 | Frame | Fields |
 | --- | --- |
 | adopt 14 | kind u8 (1 stream, 2 flow), session id [16], stream u32 (its id there), stream u32 (its id here), up u64, down u64 (entry to exit; 0 and 0 for a flow) |
 | adopted 15 | kind u8, stream u32 (its id here), ok u8 (exit to entry) |
 
-The exit adopts a flow only of a session of its own process, and the old session's id is the proof: only the entry that
-opened that session knows it. It moves the flow under the new id into the session `adopt` came on, and answers on that
-session's members from then on; the old id goes on reaching it until the old session ends, so what the old process sent
+The exit adopts a flow or stream only of a session of its own process, and the old session's id is the proof: only the entry that
+opened that session knows it. It moves the flow or stream under the new id into the session `adopt` came on, and sends
+on that session's members from then on; a flow's old id goes on reaching it until the old session ends, so what the old process sent
 on it before it learned of the move is not lost. The flow's `seq` numbering and its answers' go on: the window of copies
-at each end takes the next ones as it took the ones before. The answer is `ok` 0 for a kind it does not adopt, a session
-it does not have (the exit's process was replaced since: the old session is an older process's), or an id the old
-session does not have. Adopting twice is adopting once. Neither end counts a flow it handed over or adopted as cut.
+at each end takes the next ones as it took the ones before. A stream's `up` must be what the exit received, in order and
+with nothing kept past a hole, and it has no FIN from the entry; what it sent at `down` and after (the old process never
+wrote it to the client) is owed again and goes on the new session, and an ack on the member `adopt` came on gives the new
+process its credit. The old id of a stream ends with the move: the old process sent nothing on it once it waited for its
+bytes to be confirmed. The answer is `ok` 0 for a kind it does not adopt, a session it does not have (the exit's process
+was replaced since: the old session is an older process's), an id the old session does not have, or a stream whose `up`
+does not hold. Adopting twice is adopting once. Neither end counts a flow or stream it handed over or adopted as cut.
 
 An exit that predates adopt takes it for a torn frame and drops the member. So an entry that may send it sets bit 4 in its
 hello's capabilities, and an exit that adopts answers the hello of such a member of the pool (or of another wire of

@@ -123,6 +123,20 @@ impl Default for Send {
 }
 
 impl Send {
+    /// A sending half that numbered `off` bytes already, all of them
+    /// confirmed: a stream an older process of the entry handed over
+    /// (spec/trunk.md, "An entry's own process replaced"). No credit until
+    /// the other end's first ack says it.
+    pub fn at(off: u64) -> Send {
+        Send { sent: off, credit: off, ..Send::default() }
+    }
+
+    /// Everything it numbered is confirmed: nothing of the open or the
+    /// chunks is owed.
+    pub fn all_confirmed(&self) -> bool {
+        !self.owed.iter().any(|o| o.kind != F_FIN)
+    }
+
     /// How many bytes the credit lets it number now.
     pub fn room(&self) -> u64 {
         self.credit.saturating_sub(self.sent)
@@ -227,6 +241,17 @@ impl Default for Recv {
 }
 
 impl Recv {
+    /// A receiving half that has `off` bytes, all written on: a stream an
+    /// older process handed over.
+    pub fn at(off: u64) -> Recv {
+        Recv { received: off, written: off, advertise: off + WINDOW, ..Recv::default() }
+    }
+
+    /// No chunk past a hole is kept.
+    pub fn none_ahead(&self) -> bool {
+        self.ahead.is_empty()
+    }
+
     /// A chunk of `p` at `off` (trunk dataLocked): the bytes that are next in
     /// order go to `take`, those of the chunk and then of the ones kept past
     /// the hole it fills; a chunk past a hole is kept while it is inside the

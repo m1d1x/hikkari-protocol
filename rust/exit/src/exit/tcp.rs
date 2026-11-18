@@ -227,7 +227,7 @@ impl Exit {
                     let (s, m, wire) = (l.session, (li | LINK_SEEN, l.gen as u32), l.wire);
                     self.flow_dgram(s, m, wire, stream, seq, port, &inb[off..off + len], now, false);
                 }
-                Frame::Adopt { kind, session, old, new, .. } => self.adopt_frame(li, kind, &session, old, new),
+                Frame::Adopt { kind, session, old, new, up, down } => self.adopt_frame(li, kind, &session, old, new, up, down, now),
                 Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Adopted { .. } | Frame::Copies | Frame::Other => {}
             }
             at = next;
