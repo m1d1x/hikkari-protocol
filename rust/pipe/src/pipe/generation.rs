@@ -35,6 +35,8 @@ const MAX_OLDER: usize = 64;
 pub(super) struct Older {
     pub sock: Option<SeqPacket>,
     pub all: bool,
+    /// It was told this pipe is ready to take its flows (adopt.rs).
+    pub ready: bool,
 }
 
 /// An address's key among the owners: the listen by its id (the brain's,
@@ -46,7 +48,7 @@ pub(super) fn owner_key(listen: u8, addr: &sys::sockaddr_in) -> u64 {
 }
 
 /// The listen part and the address of a key (client_key, owner_key).
-fn split(key: u64) -> (usize, SocketAddrV4) {
+pub(super) fn split(key: u64) -> (usize, SocketAddrV4) {
     ((key >> 48) as usize, SocketAddrV4::new(Ipv4Addr::from(((key >> 16) & 0xffff_ffff) as u32), key as u16))
 }
 
@@ -126,7 +128,7 @@ impl Pipe {
         if self.fds.len() != 1 {
             return Err(format!("adopt: {} sockets, want 1", self.fds.len()));
         }
-        let o = Older { sock: Some(SeqPacket::new(self.fds.remove(0), 0)), all: false };
+        let o = Older { sock: Some(SeqPacket::new(self.fds.remove(0), 0)), all: false, ready: false };
         let owners = &self.owners;
         // A slot of an older pipe gone and owning nothing is used again.
         match (0..self.older.len()).find(|&i| self.older[i].sock.is_none() && !owners.values().any(|&v| v as usize == i)) {
@@ -184,7 +186,18 @@ impl Pipe {
                     return;
                 }
             };
-            let Some(Msg::Dgram { listen, addr, payload }) = handoff::parse(&self.msg[..n]) else { continue };
+            let (listen, addr, payload) = match handoff::parse(&self.msg[..n]) {
+                Some(Msg::Dgram { listen, addr, payload }) => (listen, addr, payload),
+                Some(Msg::Ready) => {
+                    self.hand_over();
+                    continue;
+                }
+                Some(Msg::Taken { listen, addr }) => {
+                    self.taken(listen, addr);
+                    continue;
+                }
+                _ => continue,
+            };
             let Some(li) = self.listens.iter().position(|l| l.id == listen) else { continue };
             let sa = sys::sockaddr(addr);
             // A flow of an older pipe that drains through this one goes on
@@ -220,8 +233,11 @@ impl Pipe {
                 Ok(Some(n)) if n > 0 => n,
                 _ => {
                     // Gone: every address it held is this pipe's.
-                    self.older[i] = Older { sock: None, all: true };
+                    self.older[i] = Older { sock: None, all: true, ready: true };
                     self.owners.retain(|_, o| *o as usize != i);
+                    // A flow the exit adopted is this pipe's already; its
+                    // `moved` will not come (adopt.rs).
+                    self.adopting.retain(|a| a.older != i || !a.taken);
                     self.dirty = true;
                     return;
                 }
@@ -259,7 +275,9 @@ impl Pipe {
                     let key = client_key(li, &sa);
                     take_client(flows, wires, swires, route, later, &listens[li], li, sa, key, payload, payload.len(), now, moved, *cur);
                 }
-                Some(Msg::Dgram { .. } | Msg::Gen { .. }) | None => {}
+                Some(Msg::Move(m)) => self.moving(i, m, sys::now_ns()),
+                Some(Msg::Moved { listen, addr, seq }) => self.moved(i, listen, addr, seq),
+                Some(Msg::Dgram { .. } | Msg::Gen { .. } | Msg::Ready | Msg::Taken { .. }) | None => {}
             }
         }
     }
@@ -268,6 +286,7 @@ impl Pipe {
     /// their addresses go to the newer generation, and tells the brain once
     /// it carries nothing more.
     pub(super) fn sweep_flows(&mut self, now: u64) {
+        self.adopt_clock(now);
         self.flows.sweep(now, self.flow_idle_ns, &mut self.freed);
         self.close_retired(now);
         if let Some(s) = &mut self.newer {

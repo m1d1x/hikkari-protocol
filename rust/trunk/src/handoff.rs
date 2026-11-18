@@ -12,7 +12,14 @@
 //! them is whole: the new pipe may read the shared sockets), `free` (the
 //! old pipe let that address go; with the datagram it was handed for it, if
 //! any, which the new pipe takes itself). New → old: `dgram` (a datagram
-//! from an address, or of a connection, the old pipe keeps). An address is
+//! from an address, or of a connection, the old pipe keeps).
+//!
+//! The entry's flows handed over (spec/trunk.md, "An entry's own process
+//! replaced"): new → old `ready` (the new pipe's session takes everything
+//! new and its exit adopts), old → new `move` (a flow: its address, its
+//! session's id, its stream id, port, class, copies and next seq), new →
+//! old `taken` (the exit adopted it), old → new `moved` (the old pipe forgot
+//! it; the seq it got to, 0 for a flow it had ended). An address is
 //! the id of its listened port or wire (the brain's, the same in both
 //! pipes), the IPv4 address as on the wire, the port; integers
 //! little-endian.
@@ -24,6 +31,10 @@ pub const ALL: u8 = 0x02;
 pub const FREE: u8 = 0x03;
 pub const DGRAM: u8 = 0x04;
 pub const GEN: u8 = 0x05;
+pub const READY: u8 = 0x06;
+pub const MOVE: u8 = 0x07;
+pub const TAKEN: u8 = 0x08;
+pub const MOVED: u8 = 0x09;
 
 /// An address: listen, IPv4, port.
 pub const ADDR: usize = 1 + 4 + 2;
@@ -31,6 +42,24 @@ pub const ADDR: usize = 1 + 4 + 2;
 pub const HEAD: usize = 1 + ADDR;
 /// Addresses one own carries at most: well inside a message of 64 KiB.
 pub const OWN_MAX: usize = 8192;
+/// A move: the head, session [16], stream u32, port u16, class u8, copies
+/// u8, seq u32.
+pub const MOVE_LEN: usize = HEAD + 16 + 4 + 2 + 1 + 1 + 4;
+/// A moved: the head, seq u32.
+pub const MOVED_LEN: usize = HEAD + 4;
+
+/// A flow the old pipe hands over (`move`).
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct Moving {
+    pub listen: u8,
+    pub addr: SocketAddrV4,
+    pub session: [u8; 16],
+    pub stream: u32,
+    pub port: u16,
+    pub class: u8,
+    pub copies: u8,
+    pub seq: u32,
+}
 
 /// One message from the other generation.
 #[derive(Debug, PartialEq)]
@@ -42,6 +71,10 @@ pub enum Msg<'a> {
     Gen { gen: u8 },
     Free { listen: u8, addr: SocketAddrV4, payload: &'a [u8] },
     Dgram { listen: u8, addr: SocketAddrV4, payload: &'a [u8] },
+    Ready,
+    Move(Moving),
+    Taken { listen: u8, addr: SocketAddrV4 },
+    Moved { listen: u8, addr: SocketAddrV4, seq: u32 },
 }
 
 /// Reads one message; None for one torn or unknown.
@@ -49,6 +82,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
     let kind = *m.first()?;
     match kind {
         ALL => return (m.len() == 1).then_some(Msg::All),
+        READY => return (m.len() == 1).then_some(Msg::Ready),
         GEN => return (m.len() == 2).then(|| Msg::Gen { gen: m[1] }),
         OWN => return (m.len() - 1).is_multiple_of(ADDR).then_some(Msg::Own { addrs: &m[1..] }),
         _ => {}
@@ -58,9 +92,22 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
     }
     let (listen, addr) = read_addr(&m[1..HEAD]);
     let payload = &m[HEAD..];
+    let le32 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     Some(match kind {
         FREE => Msg::Free { listen, addr, payload },
         DGRAM => Msg::Dgram { listen, addr, payload },
+        TAKEN if payload.is_empty() => Msg::Taken { listen, addr },
+        MOVED if m.len() == MOVED_LEN => Msg::Moved { listen, addr, seq: le32(payload) },
+        MOVE if m.len() == MOVE_LEN => Msg::Move(Moving {
+            listen,
+            addr,
+            session: payload[..16].try_into().ok()?,
+            stream: le32(&payload[16..20]),
+            port: u16::from_le_bytes([payload[20], payload[21]]),
+            class: payload[22],
+            copies: payload[23],
+            seq: le32(&payload[24..28]),
+        }),
         _ => return None,
     })
 }
@@ -87,6 +134,25 @@ pub fn put_addr(out: &mut [u8], listen: u8, addr: SocketAddrV4) -> usize {
 pub fn put_head(out: &mut [u8], kind: u8, listen: u8, addr: SocketAddrV4) -> usize {
     out[0] = kind;
     1 + put_addr(&mut out[1..], listen, addr)
+}
+
+/// Writes a move into out (at least MOVE_LEN bytes).
+pub fn put_move(out: &mut [u8], m: &Moving) -> usize {
+    let h = put_head(out, MOVE, m.listen, m.addr);
+    out[h..h + 16].copy_from_slice(&m.session);
+    out[h + 16..h + 20].copy_from_slice(&m.stream.to_le_bytes());
+    out[h + 20..h + 22].copy_from_slice(&m.port.to_le_bytes());
+    out[h + 22] = m.class;
+    out[h + 23] = m.copies;
+    out[h + 24..h + 28].copy_from_slice(&m.seq.to_le_bytes());
+    MOVE_LEN
+}
+
+/// Writes a moved into out (at least MOVED_LEN bytes).
+pub fn put_moved(out: &mut [u8], listen: u8, addr: SocketAddrV4, seq: u32) -> usize {
+    let h = put_head(out, MOVED, listen, addr);
+    out[h..h + 4].copy_from_slice(&seq.to_le_bytes());
+    MOVED_LEN
 }
 
 #[cfg(test)]
@@ -126,5 +192,20 @@ mod tests {
         b[0] = 0x7f;
         assert!(parse(&b[..n]).is_none(), "unknown");
         assert!(parse(&[]).is_none());
+    }
+
+    #[test]
+    fn a_flow_handed_over_reads_back_as_written() {
+        let a: SocketAddrV4 = "10.1.2.3:50443".parse().unwrap();
+        let m = Moving { listen: 3, addr: a, session: [9; 16], stream: 0x0010_0002, port: 2053, class: 1, copies: 2, seq: 77 };
+        let mut b = [0u8; 64];
+        let n = put_move(&mut b, &m);
+        assert_eq!(parse(&b[..n]), Some(Msg::Move(m)));
+        assert!(parse(&b[..n - 1]).is_none(), "a move torn");
+        let n = put_moved(&mut b, 3, a, 78);
+        assert_eq!(parse(&b[..n]), Some(Msg::Moved { listen: 3, addr: a, seq: 78 }));
+        let n = put_head(&mut b, TAKEN, 3, a);
+        assert_eq!(parse(&b[..n]), Some(Msg::Taken { listen: 3, addr: a }));
+        assert_eq!(parse(&[READY]), Some(Msg::Ready));
     }
 }

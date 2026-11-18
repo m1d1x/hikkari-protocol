@@ -12,7 +12,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use hikkari_sys::{self as sys, Io};
-use hikkari_trunk::frame::{self, Frame, F_HELLO, F_OBSERVE, KIND_PACKET, KIND_STREAMS, NO_GOT};
+use hikkari_trunk::frame::{self, Frame, F_ADOPT, F_HELLO, F_OBSERVE, KIND_PACKET, KIND_STREAMS, NO_GOT};
 use hikkari_trunk::health::{Health, Verdict};
 
 use super::stream::{ack_on, Why};
@@ -185,7 +185,7 @@ impl Exit {
         let mut ok = true;
         while at < n {
             let Some((fr, next)) = frame::next_frame(&inb[..n], at) else {
-                ok = (F_HELLO..=F_OBSERVE).contains(&inb[at]); // else: the rest is to come
+                ok = matches!(inb[at], F_HELLO..=F_OBSERVE | F_ADOPT); // else: the rest is to come
                 break;
             };
             if !self.links.all[li].joined() && !matches!(fr, Frame::Hello) {
@@ -227,7 +227,8 @@ impl Exit {
                     let (s, m, wire) = (l.session, (li | LINK_SEEN, l.gen as u32), l.wire);
                     self.flow_dgram(s, m, wire, stream, seq, port, &inb[off..off + len], now);
                 }
-                Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Other => {}
+                Frame::Adopt { kind, session, old, new, .. } => self.adopt_frame(li, kind, &session, old, new),
+                Frame::Drain | Frame::Observe { .. } | Frame::Frag { .. } | Frame::Adopted { .. } | Frame::Other => {}
             }
             at = next;
         }
@@ -273,6 +274,12 @@ impl Exit {
         t.joined += 1;
         let (id, epoch) = (sess.id, sess.epoch);
         l.out.frame(31, |b| frame::put_hello(b, &id, &epoch, t2.map(|f| (wire, f))));
+        // The entry may adopt: this exit says it does (spec/trunk.md, "An
+        // entry's own process replaced"). An entry that did not ask would
+        // take the frame for a torn one.
+        if h.epoch[0] & frame::CAP_ADOPT != 0 {
+            l.out.frame(frame::ADOPTED_LEN, |b| frame::put_adopted(b, frame::ADOPT_EXIT, 0, true));
+        }
         if self.gens.told {
             l.out.frame(1, frame::put_drain);
         }

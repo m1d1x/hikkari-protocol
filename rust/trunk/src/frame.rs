@@ -14,11 +14,26 @@ pub const F_DRAIN: u8 = 10;
 pub const F_OBSERVE: u8 = 11;
 /// A piece of a frame cut for a datagram that does not hold it (frag.rs).
 pub const F_FRAG: u8 = 12;
+/// The entry's new process claims a flow or stream of its old one's session
+/// (spec/trunk.md, "An entry's own process replaced"); the exit answers.
+pub const F_ADOPT: u8 = 13;
+pub const F_ADOPTED: u8 = 14;
 
 /// The entry's capabilities, the first byte of the epoch its hello sends
 /// (spec/trunk.md, "Frames": hello; trunk capObserve): it reads observe
 /// frames, so the exit sends it the marks of testers' streams and flows.
 pub const CAP_OBSERVE: u8 = 1;
+/// The entry may send adopt: an exit that adopts says so with an adopted of
+/// ADOPT_EXIT right after its answer to the hello (an older exit drops a
+/// member on a frame it does not know).
+pub const CAP_ADOPT: u8 = 2;
+/// An adopt's kinds: the flow or stream it claims (OBS_STREAM, OBS_FLOW),
+/// and the adopted that says the exit adopts at all.
+pub const ADOPT_EXIT: u8 = 0;
+/// An adopt frame: type, kind u8, session [16], old u32, new u32, up u64, down u64.
+pub const ADOPT_LEN: usize = 42;
+/// An adopted frame: type, kind u8, stream u32, ok u8.
+pub const ADOPTED_LEN: usize = 7;
 /// An observe frame's kinds (trunk ObsStream, ObsFlow).
 pub const OBS_STREAM: u8 = 1;
 pub const OBS_FLOW: u8 = 2;
@@ -42,7 +57,7 @@ pub fn hello_t1(out: &mut [u8], session: &[u8; 16]) -> usize {
     out[1..5].copy_from_slice(b"HKT1");
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0);
-    out[21] = CAP_OBSERVE;
+    out[21] = CAP_OBSERVE | CAP_ADOPT;
     29
 }
 
@@ -94,7 +109,7 @@ pub fn hello_t2(out: &mut [u8], session: &[u8; 16], wire: u8) -> usize {
     out[1..5].copy_from_slice(b"HKT2");
     out[5..21].copy_from_slice(session);
     out[21..29].fill(0); // the entry has no epoch; byte 0 is its capabilities
-    out[21] = CAP_OBSERVE;
+    out[21] = CAP_OBSERVE | CAP_ADOPT;
     out[29] = wire;
     out[30] = KIND_PACKET;
     31
@@ -174,6 +189,30 @@ pub fn put_observe(out: &mut [u8], kind: u8, stream: u32, id: u64) -> usize {
     14
 }
 
+/// The entry's adopt: flow or stream `old` of the session `session` (its
+/// old process's) is now `new` of the session this member is of; a stream's
+/// `up` (bytes the exit received) and `down` (bytes the client got).
+pub fn put_adopt(out: &mut [u8], kind: u8, session: &[u8; 16], old: u32, new: u32, up: u64, down: u64) -> usize {
+    out[0] = F_ADOPT;
+    out[1] = kind;
+    out[2..18].copy_from_slice(session);
+    out[18..22].copy_from_slice(&old.to_be_bytes());
+    out[22..26].copy_from_slice(&new.to_be_bytes());
+    out[26..34].copy_from_slice(&up.to_be_bytes());
+    out[34..42].copy_from_slice(&down.to_be_bytes());
+    ADOPT_LEN
+}
+
+/// The exit's answer to an adopt of `stream` (its new id), or with
+/// ADOPT_EXIT, stream 0 and ok, that it adopts at all.
+pub fn put_adopted(out: &mut [u8], kind: u8, stream: u32, ok: bool) -> usize {
+    out[0] = F_ADOPTED;
+    out[1] = kind;
+    out[2..6].copy_from_slice(&stream.to_be_bytes());
+    out[6] = ok as u8;
+    ADOPTED_LEN
+}
+
 /// The exit's drain (spec/trunk.md, "Drain"): its process is being replaced.
 #[inline]
 pub fn put_drain(out: &mut [u8]) -> usize {
@@ -204,6 +243,11 @@ pub enum Frame {
     /// Piece `index` of `count` of the sender's cut frame `id`, its bytes at
     /// `off..off + len` (frag.rs).
     Frag { id: u16, index: u8, count: u8, off: usize, len: usize },
+    /// The entry claims `old` of its old session `session` as `new` here.
+    Adopt { kind: u8, session: [u8; 16], old: u32, new: u32, up: u64, down: u64 },
+    /// The exit's answer to an adopt of `stream`, or with ADOPT_EXIT that it
+    /// adopts.
+    Adopted { kind: u8, stream: u32, ok: bool },
     Other,
 }
 
@@ -269,6 +313,15 @@ pub fn next_frame(p: &[u8], at: usize) -> Option<(Frame, usize)> {
             let id = u16::from_be_bytes([p[b], p[b + 1]]);
             Some((Frame::Frag { id, index: p[b + 2], count: p[b + 3], off: b + 6, len: n }, next))
         }
+        F_ADOPT => {
+            let next = fixed(ADOPT_LEN - 1)?;
+            let session = p[b + 1..b + 17].try_into().ok()?;
+            Some((Frame::Adopt { kind: p[b], session, old: be32(b + 17), new: be32(b + 21), up: be64(b + 25), down: be64(b + 33) }, next))
+        }
+        F_ADOPTED => {
+            let next = fixed(ADOPTED_LEN - 1)?;
+            Some((Frame::Adopted { kind: p[b], stream: be32(b + 1), ok: p[b + 5] != 0 }, next))
+        }
         F_DATA => {
             if rest < 14 {
                 return None;
@@ -315,7 +368,7 @@ mod tests {
         let (f, next) = next_frame(&b[..n], 0).unwrap();
         assert!(matches!(f, Frame::Hello) && next == n);
         let h = read_hello(&b[..n], 0).unwrap();
-        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [CAP_OBSERVE, 0, 0, 0, 0, 0, 0, 0], Some((2, KIND_PACKET))), "the entry reads observe frames");
+        assert_eq!((h.session, h.epoch, h.t2), ([7; 16], [CAP_OBSERVE | CAP_ADOPT, 0, 0, 0, 0, 0, 0, 0], Some((2, KIND_PACKET))), "the entry reads observe frames and may adopt");
         let m = put_hello(&mut b, &h.session, &[9; 8], h.t2);
         let go = [&[1u8][..], b"HKT2", &[7; 16], &[9; 8], &[2, 2]].concat();
         assert_eq!(&b[..m], &go[..]);
@@ -362,5 +415,23 @@ mod tests {
         }
         assert_eq!(seen, ["hello", "open 5 9000", "data 5 1099511627776 xyz", "ack 5 7 2097152 1 true", "fin 5 7", "rst 5"]);
         assert!(next_frame(&b[h..h + DATA_HEAD + 2], 0).is_none(), "a chunk torn short is no frame");
+    }
+
+    /// adopt and adopted byte for byte as spec/trunk.md lays them out. The Go
+    /// exit does not adopt (it never says so): the Rust exit replaced it on
+    /// the cascade (R6.4), so the bytes have no Go side.
+    #[test]
+    fn adopt_golden() {
+        let mut b = [0u8; 64];
+        let n = put_adopt(&mut b, OBS_STREAM, &[0xaa; 16], 7, 0x0102_0304, 1 << 40, 5);
+        let hex: String = b[..n].iter().map(|x| format!("{x:02x}")).collect();
+        assert_eq!(hex, "0d01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000070102030400000100000000000000000000000005");
+        let Some((Frame::Adopt { kind, session, old, new, up, down }, next)) = next_frame(&b[..n], 0) else { panic!("not an adopt") };
+        assert_eq!((kind, session, old, new, up, down, next), (OBS_STREAM, [0xaa; 16], 7, 0x0102_0304, 1 << 40, 5, n));
+        assert!(next_frame(&b[..n - 1], 0).is_none(), "an adopt torn");
+        let n = put_adopted(&mut b, OBS_FLOW, 9, true);
+        assert_eq!(&b[..n], &[F_ADOPTED, OBS_FLOW, 0, 0, 0, 9, 1]);
+        let Some((Frame::Adopted { kind, stream, ok }, _)) = next_frame(&b[..n], 0) else { panic!("not an adopted") };
+        assert_eq!((kind, stream, ok), (OBS_FLOW, 9, true));
     }
 }

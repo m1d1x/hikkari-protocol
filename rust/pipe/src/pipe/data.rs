@@ -118,6 +118,8 @@ impl Pipe {
                             | Frame::Ack { .. }
                             | Frame::Fin { .. }
                             | Frame::Rst { .. }
+                            | Frame::Adopt { .. }
+                            | Frame::Adopted { .. }
                             | Frame::Other => {}
                             // The exit marked a tester's flow (marks.rs).
                             Frame::Observe { kind, stream, token } => marks.push((kind, stream, token)),

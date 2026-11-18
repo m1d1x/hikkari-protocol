@@ -217,7 +217,10 @@ impl Exit {
             }
         };
         let f = &mut self.flows.all[fi];
-        if f.arrived(m, wire_id, seq, now) {
+        // A datagram on the old id of an adopted flow (exit/adopt.rs): taken,
+        // but the answers stay on the new session's members.
+        let dup = if f.session == s { f.arrived(m, wire_id, seq, now) } else { f.replay.seen(seq) };
+        if dup {
             if !f.echo() {
                 self.t.dgrams_copy += 1;
                 f.obs.copies += 1;
