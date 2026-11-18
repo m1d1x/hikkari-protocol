@@ -116,36 +116,58 @@ func TestSelectorGivesVoiceAThirdCopyAtOnce(t *testing.T) {
 	}
 }
 
-// TestSelectorMovesVideoOffABadWireAtOnce: video is on udp; 3 bad seconds of
-// udp's own call in the last 5 move it to the pool, another fate, in that
-// Choose. Back on udp once it has been better for Hold.
-func TestSelectorMovesVideoOffABadWireAtOnce(t *testing.T) {
+// TestVideoLeavesADatagramWireOnlyForAnotherOne: video has no copy, so the
+// pool, TCP, is never its carrier while a wire of fate udp is up (owner's
+// decisions of 15.11 and 18.11; 17.11 18:01 video went to the pool as
+// "better" and stayed 64 minutes). Bad seconds move it at once to another
+// datagram wire, not to the pool; with no other one it stays where it is.
+// Only once every datagram wire is red does it go to the pool, and it comes
+// back as soon as one is not.
+func TestVideoLeavesADatagramWireOnlyForAnotherOne(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
+	badUDP := func(sel *Selector, wires ...WireID) {
+		for i := 5; i > 0; i-- {
+			at := now.Add(-time.Duration(i) * time.Second)
+			sel.Second(CallSecond{At: at, Wire: testUDP, Frames: 50, Bad: i <= 3})
+			for _, w := range wires {
+				sel.Second(CallSecond{At: at, Wire: w, Frames: 50})
+			}
+		}
+	}
+
 	sel := NewSelector(SelectorConfig{}, selPool, selUDP)
 	if c := sel.Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Video() != testUDP {
 		t.Fatalf("video starts on %d", c.Route.Video())
 	}
-	for i := 5; i > 0; i-- {
-		at := now.Add(-time.Duration(i) * time.Second)
-		sel.Second(CallSecond{At: at, Wire: testUDP, Frames: 50, Bad: i <= 3})
-		sel.Second(CallSecond{At: at, Wire: PoolWire, Frames: 50})
+	badUDP(sel, PoolWire)
+	if c := sel.Choose(now, liveAll(now, PoolWire, testUDP)); c.Route.Video() != testUDP || strings.Contains(c.Why, "video") {
+		t.Fatalf("bad seconds of the only datagram wire put video on the pool: %+v", c)
 	}
-	c := sel.Choose(now, liveAll(now, PoolWire, testUDP))
-	if c.Route.Video() != PoolWire || c.Why != "video: udp had 3 bad seconds of 5, to pool" {
-		t.Fatalf("video stayed on a bad wire: %+v", c)
+	later := now.Add(DefaultHold + time.Second)
+	if c := sel.Choose(later, liveAll(later, PoolWire, testUDP)); c.Route.Video() != testUDP {
+		t.Fatalf("the pool took video as better after Hold: %+v", c)
 	}
-	if c.Route.Voice != testUDP {
-		t.Fatalf("voice moved with video: %+v", c.Route)
+
+	sel = NewSelector(SelectorConfig{}, selPool, selUDP, selQuic)
+	sel.Choose(now, liveAll(now, PoolWire, testUDP, testQuic))
+	sel.video = testUDP
+	badUDP(sel, PoolWire, testQuic)
+	c := sel.Choose(now, liveAll(now, PoolWire, testUDP, testQuic))
+	if c.Route.Video() != testQuic || c.Why != "video: udp had 3 bad seconds of 5, to quic" {
+		t.Fatalf("video did not move to the other datagram wire: %+v", c)
 	}
-	// udp is clean again: its bad seconds age out of the minute, then it
-	// is better (a wire of fate udp) for Hold.
-	back := now.Add(secondsKept + time.Second)
-	sel.Choose(back, liveAll(back, PoolWire, testUDP))
-	if c := sel.Choose(back.Add(DefaultHold-time.Second), liveAll(back, PoolWire, testUDP)); c.Route.Video() != PoolWire {
-		t.Fatalf("video back before Hold: %+v", c)
+
+	sel = NewSelector(SelectorConfig{}, selPool, selUDP)
+	sel.Choose(now, liveAll(now, PoolWire, testUDP))
+	t1 := now.Add(time.Second)
+	live := liveAll(t1, PoolWire, testUDP)
+	live[testUDP] = WireState{ID: testUDP, Members: 2, Proof: now, Owed: 600 * time.Millisecond}
+	if c := sel.Choose(t1, live); c.Route.Video() != PoolWire {
+		t.Fatalf("every datagram wire red and video not on the pool: %+v", c)
 	}
-	if c := sel.Choose(back.Add(DefaultHold), liveAll(back, PoolWire, testUDP)); c.Route.Video() != testUDP || c.Why != "video: udp better than pool for 5m0s" {
-		t.Fatalf("video not back after Hold: %+v", c)
+	t2 := t1.Add(time.Second)
+	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Video() != testUDP {
+		t.Fatalf("video stayed on the pool after udp came back: %+v", c)
 	}
 }
 

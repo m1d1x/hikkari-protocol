@@ -261,15 +261,25 @@ func (s *Selector) videoBetterLocked(a, b WireID, now time.Time) bool {
 }
 
 // chooseVideoLocked puts video's one wire on next: off a wire that had
-// videoLeaveBad bad seconds of its last ones at once, to the best wire of
-// another fate (of any, with none); to a better one after Hold. It says what
-// changed.
+// videoLeaveBad bad seconds of its last ones at once, to the best other
+// wire; to a better one after Hold. It says what changed.
+//
+// Video has no copy, so the wire it is on is its only carrier, and TCP is
+// never the only carrier of live UDP (owner's decisions of 15.11 and 18.11):
+// one lost segment of the pool holds every frame behind it. While a wire of
+// fate udp is up, the pool is not a choice for video at all, however it
+// ranks; video goes to the pool only once every datagram wire is red.
 func (s *Selector) chooseVideoLocked(next *Route, ids []WireID, left map[WireID]bool, now time.Time) string {
 	var ranked []WireID
+	datagram := false
 	for _, id := range ids {
 		if !left[id] {
 			ranked = append(ranked, id)
+			datagram = datagram || s.wires[id].w.fate() == FateUDP
 		}
+	}
+	if datagram {
+		ranked = slices.DeleteFunc(ranked, func(id WireID) bool { return s.wires[id].w.fate() != FateUDP })
 	}
 	sort.SliceStable(ranked, func(i, j int) bool { return s.videoBetterLocked(ranked[i], ranked[j], now) })
 	cur := s.video

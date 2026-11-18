@@ -64,8 +64,10 @@ func TestSelectorLeavesARedWireAtOnce(t *testing.T) {
 // voice on the pool; once it is not red it is voice's main wire again at
 // once, with no Hold (spec/trunk.md, Wires: one fate is the fallback, not a
 // rank; 14.11 21:50 UTC voice stayed inside TCP all night after a reload of
-// the exit). A wire of datagrams rougher than the pool is still voice's main
-// wire: the pool carries its copy in the set whatever the rank.
+// the exit). Video, which went to the pool with it, comes back with it
+// (owner's decision of 18.11). A wire of datagrams rougher than the pool is
+// still voice's main wire: the pool carries its copy in the set whatever the
+// rank.
 func TestSelectorBringsVoiceBackOffThePoolAtOnce(t *testing.T) {
 	now := time.Now()
 	// A new process has heard no call yet: voice starts on datagrams.
@@ -86,7 +88,7 @@ func TestSelectorBringsVoiceBackOffThePoolAtOnce(t *testing.T) {
 		t.Fatalf("voice stayed on a red wire: %+v", c)
 	}
 	t2 := t1.Add(time.Second)
-	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Why != "voice: on udp; voice2: on pool" {
+	if c := sel.Choose(t2, liveAll(t2, PoolWire, testUDP)); c.Route.Voice != testUDP || c.Route.Video() != testUDP || c.Why != "voice: on udp; voice2: on pool; video: on udp" {
 		t.Fatalf("voice not back on the datagrams' wire at once: %+v", c)
 	}
 
