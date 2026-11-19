@@ -111,7 +111,10 @@ type Pipe struct {
 	// the brain's new members dial it on their wire's port.
 	receivers   Receivers
 	receiversAt time.Time
-	activeIP    netip.Addr
+	// rxCalls is the minutes of the calls held to each receiver
+	// (RunReceiverCalls) the judge has not heard yet.
+	rxCalls  []RxWindow
+	activeIP netip.Addr
 }
 
 // listenConf is a client port as the brain gave it, to give it again to
@@ -436,15 +439,33 @@ func (p *Pipe) Tick() (Tick, time.Time) {
 // the pipe (trunk.CallCarrier): the trunk's call hears the pipe as a client
 // does.
 func (p *Pipe) OpenCallFlow(o trunk.FlowOptions, deliver func([]byte)) trunk.CallFlow {
+	return p.openCallFlow(deliver, func(tag uint32) []byte { return putOpen(tag, o, trunk.EchoPort) })
+}
+
+func (p *Pipe) openCallFlow(deliver func([]byte), open func(tag uint32) []byte) trunk.CallFlow {
 	tag := p.nextTag.Add(1)
 	p.mu.Lock()
 	p.flows[tag] = deliver
 	p.mu.Unlock()
 	f := &callFlow{p: p, tag: tag}
-	if err := p.send(putOpen(tag, o, trunk.EchoPort)); err != nil {
+	if err := p.send(open(tag)); err != nil {
 		f.Close()
 	}
 	return f
+}
+
+// AtReceiver is the pipe as a carrier of calls held to receiver rx, active
+// or on standby: its flows stay on that receiver through a move of the
+// entry (rust/pipe session.rs rehome_held).
+func (p *Pipe) AtReceiver(rx byte) trunk.CallCarrier { return receiverCarrier{p: p, rx: rx} }
+
+type receiverCarrier struct {
+	p  *Pipe
+	rx byte
+}
+
+func (c receiverCarrier) OpenCallFlow(o trunk.FlowOptions, deliver func([]byte)) trunk.CallFlow {
+	return c.p.openCallFlow(deliver, func(tag uint32) []byte { return putOpenRx(tag, o, trunk.EchoPort, c.rx) })
 }
 
 type callFlow struct {

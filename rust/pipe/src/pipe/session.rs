@@ -185,6 +185,7 @@ impl Pipe {
             }
         }
         self.step_standbys(now);
+        self.rehome_held();
         let c = self.cur as usize;
         if self.newer.is_none() && self.next.is_none() && self.sessions[c].exit_drains && !self.sessions[c].answered {
             self.sessions[c].answered = true;
@@ -435,10 +436,28 @@ impl Pipe {
             self.receivers.push(Receiver { rx: old_rx, ip, pool_members: members, sess: None, stale: true });
         }
         self.step_standbys(now);
+        self.rehome_held();
         if self.ctl.is_some() {
             self.send_tick(now);
         }
         Ok(())
+    }
+
+    /// The brain's flows held to a receiver (B_OPEN_RX) go to its session:
+    /// the current one when it is the active receiver, its standby session
+    /// otherwise. The brain's call to each receiver keeps hearing that
+    /// receiver through a move of the entry.
+    pub(super) fn rehome_held(&mut self) {
+        let (sessions, receivers, cur, next) = (&self.sessions, &self.receivers, self.cur, self.next);
+        self.flows.rehome_held(|rx| {
+            if sessions[cur as usize].rx == rx {
+                return Some(cur);
+            }
+            if next.is_some_and(|n| sessions[n as usize].rx == rx) {
+                return None;
+            }
+            receivers.iter().find(|r| r.rx == rx).and_then(|r| r.sess)
+        });
     }
 
     /// The current receiver's address: its wires' or its pools' exit.

@@ -10,8 +10,16 @@ package pipectl
 // with the most members up; it holds while the pipe or the brain paused (a
 // pause makes every proof old at once, as the selector's own-pause rule of
 // 12.11), for Settle after a move, and when no receiver is heard (a cut of
-// the whole path: moving would cut everyone for nothing). It never moves
-// back on its own: a move is a cut for every client.
+// the whole path: moving would cut everyone for nothing).
+//
+// A move cuts every client's stream and flow (hikkari-client plans research
+// 2026-11-19-entry-on-ams3-after-path-silence.md: both moves of 19.11 ended
+// 4 streams and 2 flows, all the people had): their connections to the
+// internet live on the receiver. So the judge moves to a better receiver
+// only on minutes, never on seconds (better.go): 19.11 12:10 a silence of
+// the whole path woke the spare ams3 a moment before unl1, the entry moved
+// there and stood 43 minutes on a machine that froze 2–3 times a minute,
+// every minute of the people's call red, unl1 clean beside it.
 //
 // The pool is judged on its own too (17.11, plans research
 // 2026-11-17-pool-reset-unl1-1351.md): it is the only wire that carries the
@@ -58,6 +66,11 @@ const (
 // Judge decides moves between receivers. Its zero value is ready.
 type Judge struct {
 	movedAt time.Time
+	// betterAt is the latest move to a better receiver: the next waits
+	// BetterHold. calls is the latest minutes of the call held to each
+	// receiver (Hear).
+	betterAt time.Time
+	calls    map[byte][]RxWindow
 	// silentSince is when the active receiver was first not heard, by rx: a
 	// receiver nobody has heard since the pipe started is dead only after
 	// DeadAfter of its own. poolSilentSince is the same for its pool alone.
@@ -114,7 +127,10 @@ func (j *Judge) Step(now time.Time, tick Tick, rs Receivers, paused time.Duratio
 	if pool == nil || heardWithin(pool, PoolDeadAfter) {
 		delete(j.poolSilentSince, rs.Active)
 		if whole {
-			return Verdict{Why: "the active receiver is heard"}
+			if paused >= 0 && paused < DeadAfter {
+				return Verdict{Why: "the active receiver is heard"}
+			}
+			return j.better(now, rs)
 		}
 	}
 	// What is unheard: the whole receiver, or, the rest of it heard, its
@@ -164,6 +180,7 @@ func (j *Judge) Step(now time.Time, tick Tick, rs Receivers, paused time.Duratio
 		return Verdict{Why: "no receiver is heard: the whole path"}
 	}
 	j.movedAt = now
+	j.betterAt = time.Time{}
 	delete(j.silentSince, rs.Active)
 	delete(j.poolSilentSince, rs.Active)
 	to := rs.Standby[best]

@@ -62,6 +62,11 @@ pub struct Flow {
     /// The session it goes on (the pipe's session.rs): the one that took
     /// everything new when it opened. A client's flow stays there to its end.
     pub sess: u8,
+    /// The receiver a flow of the brain's is held to (B_OPEN_RX): its
+    /// session is that receiver's, active or on standby, and a move of the
+    /// entry leaves it there (session.rs rehome_held). None: it goes with
+    /// the entry.
+    pub rx: Option<u8>,
     /// What it did, for its reports if the exit marks it (observe.rs).
     pub obs: FlowObs,
     id: u32,
@@ -71,7 +76,7 @@ pub struct Flow {
 
 impl Flow {
     pub fn new(dest: Dest, class: u8, pin: u8, port: u16, copies: u8, now: u64) -> Flow {
-        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), replay_epoch: [0; 8], holes: Holes::default(), used: now, sess: 0, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
+        Flow { dest, seq: 0, class, pin, port, copies, replay: Replay::default(), replay_epoch: [0; 8], holes: Holes::default(), used: now, sess: 0, rx: None, obs: FlowObs { opened: now, ..FlowObs::default() }, id: 0, key: 0 }
     }
 
     /// The trunk's own call, not a client's: neither end counts it among its
@@ -249,8 +254,22 @@ impl Flows {
     /// answers anew, so the copies seen start over.
     pub fn move_brains(&mut self, from: u8, to: u8) {
         for f in self.list.iter_mut() {
-            if f.sess == from && matches!(f.dest, Dest::Brain { .. }) {
+            if f.sess == from && f.rx.is_none() && matches!(f.dest, Dest::Brain { .. }) {
                 f.sess = to;
+                f.replay = Replay::default();
+            }
+        }
+    }
+
+    /// The brain's flows held to a receiver go to its session now, by
+    /// `sess_of` (none: the receiver has no session yet, the flow waits
+    /// where it is); one that changes session forgets the answers it saw,
+    /// the other exit numbers its own.
+    pub fn rehome_held(&mut self, sess_of: impl Fn(u8) -> Option<u8>) {
+        for f in self.list.iter_mut() {
+            let Some(rx) = f.rx else { continue };
+            if let Some(s) = sess_of(rx).filter(|&s| s != f.sess) {
+                f.sess = s;
                 f.replay = Replay::default();
             }
         }
@@ -393,6 +412,32 @@ mod tests {
         assert!(fl.with_counts(id).is_some(), "a call the brain keeps is not swept");
         fl.close(9);
         assert!(fl.tagged(9).is_none() && fl.with_counts(id).is_none());
+    }
+
+    #[test]
+    fn a_call_held_to_a_receiver_stays_with_it_through_a_move_of_the_entry() {
+        let mut fl = Flows::new();
+        let mut held = Flow::new(Dest::Brain { tag: 1 }, CLASS_VOICE, ANY_WIRE, ECHO_PORT, 1, 0);
+        (held.sess, held.rx) = (2, Some(1));
+        fl.open(1, held).unwrap();
+        let mut free = Flow::new(Dest::Brain { tag: 2 }, CLASS_VOICE, ANY_WIRE, ECHO_PORT, 1, 0);
+        free.sess = 0;
+        fl.open(2, free).unwrap();
+        let sess = |fl: &mut Flows, tag| {
+            let id = fl.tagged(tag).unwrap();
+            fl.with_counts(id).unwrap().0.sess
+        };
+        // The entry moves from session 0 to receiver 1's session 2: the
+        // brain's own flows go along, the one held to receiver 1 stays.
+        fl.move_brains(0, 2);
+        assert_eq!((sess(&mut fl, 1), sess(&mut fl, 2)), (2, 2));
+        // Receiver 1 gets a session anew (3): the held flow follows it, the
+        // other stays with the entry.
+        fl.rehome_held(|rx| (rx == 1).then_some(3));
+        assert_eq!((sess(&mut fl, 1), sess(&mut fl, 2)), (3, 2));
+        // No session for its receiver yet: it waits where it is.
+        fl.rehome_held(|_| None);
+        assert_eq!(sess(&mut fl, 1), 3);
     }
 
     #[test]

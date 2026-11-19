@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 10
+const Version = 11
 
 // Brain → pipe.
 const (
@@ -54,6 +54,9 @@ const (
 	// demand: the voice class's copies on the pool on demand
 	// (rust/trunk/src/demand.rs, spec/trunk.md "Copies on demand").
 	bDemand = 0x13 // hold_ms u32: held this long after a loss; 0: copies always
+	// open_rx: a flow of the brain's held to one receiver, active or on
+	// standby (session.rs rehome_held): the call to each receiver.
+	bOpenRx = 0x14 // tag u32, class u8, pin u8, port u16, copies u8, rx u8
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -307,6 +310,13 @@ func putOpen(tag uint32, o trunk.FlowOptions, port uint16) []byte {
 	b = append(b, byte(o.Class), byte(o.Pin))
 	b = binary.LittleEndian.AppendUint16(b, port)
 	return append(b, byte(o.Copies))
+}
+
+// putOpenRx is putOpen held to receiver rx.
+func putOpenRx(tag uint32, o trunk.FlowOptions, port uint16, rx byte) []byte {
+	b := putOpen(tag, o, port)
+	b[0] = bOpenRx
+	return append(b, rx)
 }
 
 func putTag(typ byte, tag uint32) []byte { return binary.LittleEndian.AppendUint32([]byte{typ}, tag) }

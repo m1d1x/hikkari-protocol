@@ -123,6 +123,8 @@ impl Pipe {
         }
         let (cur, taker) = (self.cur, self.taker());
         let taker_rx = taker.map_or(0, |s| self.sessions[s as usize].rx);
+        let mut rehome_now = false;
+        let rehome = &mut rehome_now;
         let Pipe { msg, fds, wires, swires, flows, route, later, listens, dirty, gro, moved, gone, h3s, receivers, .. } = self;
         let Some(m) = ctl::parse(&msg[..n]) else {
             return Err(format!("a message the pipe does not know: type {:#x}, {} bytes", msg[0], n));
@@ -219,10 +221,12 @@ impl Pipe {
                 *dirty = true;
             }
             Msg::Route(r) => *route = *r,
-            Msg::Open { tag, class, pin, port, copies } => {
+            Msg::Open { tag, class, pin, port, copies, rx } => {
                 let mut f = Flow::new(Dest::Brain { tag }, class, pin, port, copies, now);
                 f.sess = cur;
+                f.rx = rx;
                 flows.open(tag, f)?;
+                *rehome = rx.is_some();
             }
             Msg::Dgram { tag, payload } => {
                 let Some((id, (f, n))) = flows.tagged(tag).and_then(|id| Some((id, flows.with_counts(id)?))) else {
@@ -260,6 +264,10 @@ impl Pipe {
                 m.set_sock(Some(s));
                 *dirty = true;
             }
+        }
+        // A flow held to a receiver starts on that receiver's session.
+        if rehome_now {
+            self.rehome_held();
         }
         Ok(())
     }

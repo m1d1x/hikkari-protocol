@@ -12,7 +12,10 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"sync"
 	"time"
+
+	"github.com/m1d1x/hikkari-protocol/trunk"
 )
 
 // SetReceiver gives the pipe receiver rx on standby at ip, on the active
@@ -99,6 +102,13 @@ func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove 
 		if !resumed.IsZero() {
 			paused = time.Since(resumed)
 		}
+		p.mu.Lock()
+		heard := p.rxCalls
+		p.rxCalls = nil
+		p.mu.Unlock()
+		for _, w := range heard {
+			j.Hear(w)
+		}
 		v := j.Step(now, tick, rs, paused)
 		if !v.Move {
 			continue
@@ -112,6 +122,35 @@ func (p *Pipe) RunReceivers(ctx context.Context, at map[byte]netip.Addr, onMove 
 			onMove(Move{From: rs.Active, To: v.To, FromIP: at[rs.Active], ToIP: ip, Why: v.Why, Err: err})
 		}
 	}
+}
+
+// RunReceiverCalls calls each receiver of rxs through the pipe until ctx
+// ends, a flow held to it (AtReceiver) whichever is active, by cfg: the
+// brain gives the people's call (copies1), a datagram every 20 ms to the
+// exit's echo by the voice class's route, one copy, a minute's window. Each
+// window goes to the judge of RunReceivers (better.go) and to report, on
+// the call's goroutine.
+func (p *Pipe) RunReceiverCalls(ctx context.Context, rxs []byte, cfg trunk.CallConfig, report func(rx byte, w trunk.CallWindow)) {
+	var wg sync.WaitGroup
+	for _, rx := range rxs {
+		c := p.AtReceiver(rx)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			trunk.RunCallOn(ctx, func() trunk.CallCarrier { return c }, cfg, func(w trunk.CallWindow) {
+				p.mu.Lock()
+				p.rxCalls = append(p.rxCalls, RxWindowOf(rx, w))
+				if len(p.rxCalls) > 64 {
+					p.rxCalls = p.rxCalls[len(p.rxCalls)-64:]
+				}
+				p.mu.Unlock()
+				if report != nil {
+					report(rx, w)
+				}
+			})
+		}()
+	}
+	wg.Wait()
 }
 
 const (

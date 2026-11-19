@@ -7,7 +7,7 @@
 
 use crate::route::Route;
 
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -29,6 +29,7 @@ pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16,
 pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver on standby at ip, the active one's ports (0.0.0.0: taken away)
 pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
 pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
+pub const B_OPEN_RX: u8 = 0x14; // tag u32, class u8, pin u8, port u16, copies u8, rx u8: a flow of the brain's held to receiver rx, active or on standby (session.rs)
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -79,7 +80,9 @@ pub enum Msg<'a> {
     Unwire { id: u8 },
     /// Boxed: the fates make it the largest message, and it is a rare one.
     Route(Box<Route>),
-    Open { tag: u32, class: u8, pin: u8, port: u16, copies: u8 },
+    /// A flow of the brain's; rx: held to that receiver, active or on
+    /// standby, wherever the entry carries everything else.
+    Open { tag: u32, class: u8, pin: u8, port: u16, copies: u8, rx: Option<u8> },
     Dgram { tag: u32, payload: &'a [u8] },
     Close { tag: u32 },
     Member { wire: u8, index: u8 },
@@ -173,7 +176,8 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         }
         B_UNWIRE => Msg::Unwire { id: r.u8()? },
         B_ROUTE => Msg::Route(Box::new(Route::parse(r.rest())?)),
-        B_OPEN => Msg::Open { tag: r.u32()?, class: r.u8()?, pin: r.u8()?, port: r.u16()?, copies: r.u8()? },
+        B_OPEN => Msg::Open { tag: r.u32()?, class: r.u8()?, pin: r.u8()?, port: r.u16()?, copies: r.u8()?, rx: None },
+        B_OPEN_RX if m.len() == 11 => Msg::Open { tag: r.u32()?, class: r.u8()?, pin: r.u8()?, port: r.u16()?, copies: r.u8()?, rx: Some(r.u8()?) },
         B_DGRAM => Msg::Dgram { tag: r.u32()?, payload: r.rest() },
         B_CLOSE => Msg::Close { tag: r.u32()? },
         B_MEMBER => Msg::Member { wire: r.u8()?, index: r.u8()? },
@@ -488,6 +492,8 @@ mod tests {
     /// wire 3 (6 members, 5 up, proof 120 ms ago) and pool 0 (8, 8, none).
     const RECEIVER_GOLDEN: &str = "11010a00000208";
     const ACTIVE_GOLDEN: &str = "1201";
+    // B_OPEN_RX: tag 7, class 1, any wire, the echo (port 0), one copy, receiver 1 (msg_test.go).
+    const OPEN_RX_GOLDEN: &str = "140700000001ff00000101";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
@@ -498,6 +504,8 @@ mod tests {
             _ => panic!("not a receiver"),
         }
         assert!(matches!(parse(&unhex(ACTIVE_GOLDEN)), Some(Msg::Active { rx: 1 })));
+        assert!(matches!(parse(&unhex(OPEN_RX_GOLDEN)), Some(Msg::Open { tag: 7, class: 1, pin: 255, port: 0, copies: 1, rx: Some(1) })));
+        assert!(matches!(parse(&unhex(&OPEN_RX_GOLDEN[..20])), None), "a B_OPEN_RX without its receiver");
         assert!(parse(&unhex("11010a000002")).is_none(), "a torn receiver");
         let rs = [ReceiverTick { rx: 1, ip: "10.0.0.2".parse().unwrap(), wires: vec![(3, 6, 5, 120), (0, 8, 8, NONE_MS)] }];
         let mut out = [0u8; 64];
