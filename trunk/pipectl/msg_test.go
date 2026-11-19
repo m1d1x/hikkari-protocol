@@ -190,6 +190,16 @@ func TestReceiversGolden(t *testing.T) {
 	if got := hex.EncodeToString(putActive(1)); got != "1201" {
 		t.Fatalf("active %s", got)
 	}
+	// pointsGolden: the border points 10.0.0.1 and 10.0.0.2.
+	if b, err := putPoints([]netip.Addr{netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("10.0.0.2")}); err != nil || hex.EncodeToString(b) != "14020a0000010a000002" {
+		t.Fatalf("points %x %v", b, err)
+	}
+	if b, _ := putPoints(nil); hex.EncodeToString(b) != "1400" {
+		t.Fatalf("no points %x", b)
+	}
+	if _, err := putPoints([]netip.Addr{netip.MustParseAddr("::1")}); err == nil {
+		t.Fatal("an IPv6 point taken")
+	}
 	m, _ := hex.DecodeString("8a0001010a0000020203060578000000000808ffffffff")
 	r, err := parseReceivers(m)
 	if err != nil {

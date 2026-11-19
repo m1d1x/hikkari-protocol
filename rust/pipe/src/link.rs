@@ -174,7 +174,7 @@ impl Link {
     /// answers. A tunnel takes the hello once the relay has answered its
     /// CONNECT. A port whose bind finds it busy goes back to the book and
     /// another is tried at once (trunk Entry.slot on EADDRINUSE).
-    pub fn dial(&mut self, reach: &Reach, session: &[u8; 16], book: &mut Book, now: u64) -> Dialed {
+    pub fn dial(&mut self, reach: &Reach, to: Option<std::net::Ipv4Addr>, session: &[u8; 16], book: &mut Book, now: u64) -> Dialed {
         self.drop_sock(book);
         self.gen = self.gen.wrapping_add(1);
         self.dialed_at = now;
@@ -183,6 +183,9 @@ impl Link {
             Reach::Plain(exit) => *exit,
             Reach::Chromium(engine) => engine.form().exit,
         };
+        // A border point (the pipe's points.rs): the socket goes to it, the
+        // engine names the exit.
+        let exit = to.map_or(exit, |ip| SocketAddrV4::new(ip, exit.port()));
         for _ in 0..BUSY_TRIES {
             let mut r = [0u8; 8];
             sys::urandom(&mut r);
@@ -293,6 +296,8 @@ pub struct StreamWire {
     pub proof: u64,
     /// The member the wire last sent a datagram on (carry.rs).
     pub rr: usize,
+    /// How many border points its members are spread over (member.rs Wire).
+    pub points: u8,
     /// Its members of copies and their window (copies.rs).
     pub copies: crate::copies::Copies,
     pub t: WireTick,
@@ -308,6 +313,7 @@ impl StreamWire {
             reach,
             proof: 0,
             rr: 0,
+            points: 0,
             copies: crate::copies::Copies::default(),
             t: WireTick { id, ..Default::default() },
         }

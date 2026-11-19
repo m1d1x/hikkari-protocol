@@ -126,6 +126,19 @@ impl H3 {
         self.engine.clone()
     }
 
+    /// Member mi of session sess let go alive (points.rs: its point
+    /// changed): its port free again, and its socket taken back from the
+    /// engine's hand if Chromium has not taken it yet.
+    pub fn let_go(&mut self, sess: u8, mi: usize, port: u16) {
+        if self.dialing.is_some_and(|(s, i, _)| s == sess && i == mi) {
+            if let Some(x) = self.engine.as_ref().and_then(|e| e.hand()) {
+                x.take_back();
+            }
+            self.dialing = None;
+        }
+        self.give_back(port, false, 0);
+    }
+
     /// The port of a member gone back to the book: resting if it died,
     /// free if it was let go.
     pub fn give_back(&mut self, port: u16, died: bool, now: u64) {
@@ -141,12 +154,12 @@ impl H3 {
 
     /// Opens a tunnel from the next port of the book: its socket in the
     /// engine's hand first. Returns the tunnel and its port.
-    fn open(&mut self, e: &Arc<TunnelEngine>, now: u64) -> Result<(Tunnel, u16), String> {
+    fn open(&mut self, e: &Arc<TunnelEngine>, to: Option<std::net::Ipv4Addr>, now: u64) -> Result<(Tunnel, u16), String> {
         let hand = e.hand().expect("a wire's engine is started with own sockets");
         let mut r = [0u8; 8];
         sys::urandom(&mut r);
         let port = self.book.take(now, u64::from_le_bytes(r)).ok_or("no free source port in the book")?;
-        let fd = match bind_to(port, self.form.exit) {
+        let fd = match bind_to(port, super::points::at(self.form.exit, to)) {
             Ok(x) => x,
             Err(e) => {
                 // Held by someone else (a session Chromium still keeps):
@@ -207,7 +220,8 @@ impl Pipe {
             return u64::MAX;
         }
         let (cur, renews, brains) = (self.cur, self.renew_mask(), self.ctl.is_some());
-        let Pipe { h3s, wires, events, dirty, .. } = self;
+        let active_rx = self.sessions[cur as usize].rx;
+        let Pipe { h3s, wires, events, dirty, points, .. } = self;
         let mut next = u64::MAX;
         for h in h3s.iter_mut() {
             let engine = h.engine();
@@ -238,7 +252,8 @@ impl Pipe {
                 }
                 let Some(e) = &engine else { continue };
                 let Some(mi) = w.members.iter().position(|m| m.tun.is_none() && m.renew_at == 0) else { continue };
-                match h.open(e, now) {
+                let to = if rx == active_rx { super::points::point(points, mi) } else { None };
+                match h.open(e, to, now) {
                     Ok((t, port)) => {
                         w.members[mi].set_tunnel(Some(t), port);
                         h.dialing = Some((w.sess, mi, now));

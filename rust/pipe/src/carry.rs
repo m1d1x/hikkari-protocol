@@ -19,7 +19,9 @@
 //! datagram in N, not every one (trunk sendOnLocked takes the member that
 //! sent the longest ago). A datagram is never owed, so a stream member
 //! carrying it is not held to account for it; one whose out buffer is full
-//! drops it. The members are those of the flow's session (the pipe's
+//! drops it. Members spread over border points (the pipe's points.rs) take
+//! a datagram's copies at points it did not reach yet first, over all its
+//! wires (choose). The members are those of the flow's session (the pipe's
 //! session.rs): the session of a draining exit's old process reaches only
 //! that process.
 //!
@@ -225,7 +227,7 @@ impl Later {
         while self.q.front().is_some_and(|d| d.due <= now) {
             let d = self.q.pop_front().expect("a front");
             let p = &d.buf[..d.len as usize];
-            send_on(wires, swires, d.sess, d.wire, d.copies as usize, d.id, d.seq, d.port, p, now);
+            send_on(wires, swires, d.sess, d.wire, d.copies as usize, d.id, d.seq, d.port, p, now, &mut 0);
         }
     }
 }
@@ -249,6 +251,8 @@ pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later
     // 0 is the trunk's default, as a Go flow opened with Copies 0.
     let own = if f.copies == 0 { COPIES } else { f.copies };
     let (mut sent, mut queued) = (0, false);
+    // The border points its copies went to, a bit each (choose).
+    let mut used = 0u32;
     for c in set.carries() {
         let copies = if c.copies == 0 { own } else { c.copies };
         if c.after_ns > 0 {
@@ -256,13 +260,13 @@ pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later
             queued = true;
             continue;
         }
-        sent += send_on(wires, swires, f.sess, c.wire, copies as usize, id, f.seq, f.port, p, now);
+        sent += send_on(wires, swires, f.sess, c.wire, copies as usize, id, f.seq, f.port, p, now, &mut used);
     }
     if sent > 0 || queued {
         return;
     }
     // The set's wires all went down since: any member up.
-    if !strict && send_on(wires, swires, f.sess, ANY_WIRE, own as usize, id, f.seq, f.port, p, now) > 0 {
+    if !strict && send_on(wires, swires, f.sess, ANY_WIRE, own as usize, id, f.seq, f.port, p, now, &mut used) > 0 {
         return;
     }
     // Nothing can carry it: dropped, counted on the wire it wanted: its pin
@@ -290,17 +294,17 @@ pub fn carry(wires: &mut [Wire], swires: &mut [StreamWire], route: &Route, later
 /// `sess` (of any of its wires for ANY_WIRE, packet wires first), each wire's
 /// members in turn; says on how many (trunk sendOnLocked).
 #[allow(clippy::too_many_arguments)]
-fn send_on(wires: &mut [Wire], swires: &mut [StreamWire], sess: u8, wire: u8, copies: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+fn send_on(wires: &mut [Wire], swires: &mut [StreamWire], sess: u8, wire: u8, copies: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64, used: &mut u32) -> usize {
     let takes = |wid: u8, ws: u8| ws == sess && (wire == ANY_WIRE || wid == wire);
     let mut n = 0;
     for w in wires.iter_mut().filter(|w| takes(w.id, w.sess)) {
-        n += on_packets(w, copies - n, id, seq, port, p, now);
+        n += on_packets(w, copies - n, id, seq, port, p, now, used);
         if n == copies {
             return n;
         }
     }
     for w in swires.iter_mut().filter(|w| takes(w.id, w.sess)) {
-        n += on_streams(w, copies - n, id, seq, port, p, now);
+        n += on_streams(w, copies - n, id, seq, port, p, now, used);
         if n == copies {
             break;
         }
@@ -308,22 +312,60 @@ fn send_on(wires: &mut [Wire], swires: &mut [StreamWire], sess: u8, wire: u8, co
     n
 }
 
-/// The next `want` packet members up after the wire's last one.
-fn on_packets(w: &mut Wire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
-    let (len, glue_max, start) = (w.members.len(), w.glue_max, w.rr);
+/// Most copies of one datagram on one wire.
+const MAX_COPIES: usize = 16;
+
+/// The members that carry `want` copies of one datagram, into out: the
+/// members up from after `start` in turn (the wire's members go round),
+/// the ones at a border point no copy of it went to yet first, then the
+/// others (spec/trunk.md, "Border points": member i at point i mod
+/// points). `used` is the datagram's points so far, a bit each, over every
+/// wire it goes on: a point that freezes holds one copy of it at most while
+/// another point is up. Without points, the members up in turn as they are.
+#[allow(clippy::too_many_arguments)]
+fn choose(len: usize, start: usize, want: usize, points: u8, used: &mut u32, up: impl Fn(usize) -> bool, out: &mut [usize; MAX_COPIES]) -> usize {
+    let (want, np) = (want.min(MAX_COPIES), points as usize);
     let mut n = 0;
+    if np > 1 {
+        for k in 1..=len {
+            if n == want {
+                break;
+            }
+            let i = (start + k) % len;
+            let bit = 1u32 << (i % np);
+            if *used & bit == 0 && up(i) {
+                out[n] = i;
+                n += 1;
+                *used |= bit;
+            }
+        }
+    }
     for k in 1..=len {
         if n == want {
             break;
         }
-        let mi = (start + k) % len;
-        let m = &mut w.members[mi];
-        if !m.h.up {
-            continue;
+        let i = (start + k) % len;
+        if up(i) && !out[..n].contains(&i) {
+            out[n] = i;
+            n += 1;
+            if np > 1 {
+                *used |= 1 << (i % np);
+            }
         }
-        m.frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
+    }
+    n
+}
+
+/// The next `want` packet members up after the wire's last one, at points
+/// the datagram did not reach yet first (choose).
+#[allow(clippy::too_many_arguments)]
+fn on_packets(w: &mut Wire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64, used: &mut u32) -> usize {
+    let mut at = [0usize; MAX_COPIES];
+    let n = choose(w.members.len(), w.rr, want, w.points, used, |i| w.members[i].h.up, &mut at);
+    let glue_max = w.glue_max;
+    for &mi in &at[..n] {
+        w.members[mi].frame(Class::Flow(id), DGRAM_HEAD + p.len(), glue_max, now, |b| frame::put_dgram(b, id, seq, port, p));
         w.rr = mi;
-        n += 1;
     }
     if n > 0 {
         w.t.up_pkts += 1;
@@ -334,30 +376,24 @@ fn on_packets(w: &mut Wire, want: usize, id: u32, seq: u32, port: u16, p: &[u8],
 
 /// The next `want` stream members up after the wire's last one, or its
 /// window's member of copies and the ones after it (copies.rs); a member
-/// whose out buffer is full drops it.
+/// whose out buffer is full drops it. Members at points the datagram did
+/// not reach yet go first (choose).
 #[allow(clippy::too_many_arguments)]
-fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64) -> usize {
+fn on_streams(w: &mut StreamWire, want: usize, id: u32, seq: u32, port: u16, p: &[u8], now: u64, used: &mut u32) -> usize {
     if let Some(first) = w.window_member(now) {
         return on_copies(w, first, want, id, seq, port, p, now);
     }
-    let (len, start) = (w.links.len(), w.rr);
-    let (mut n, mut put) = (0, false);
-    for k in 1..=len {
-        if n == want {
-            break;
-        }
-        let li = (start + k) % len;
+    let mut at = [0usize; MAX_COPIES];
+    let n = choose(w.links.len(), w.rr, want, w.points, used, |i| w.links[i].h.up, &mut at);
+    let mut put = false;
+    for &li in &at[..n] {
         let l = &mut w.links[li];
-        if !l.h.up {
-            continue;
-        }
         if l.out.frame(DGRAM_HEAD + p.len(), |b| frame::put_dgram(b, id, seq, port, p)) {
             put = true;
         } else {
             w.t.dropped += 1;
         }
         w.rr = li;
-        n += 1;
     }
     if put {
         w.t.up_pkts += 1;

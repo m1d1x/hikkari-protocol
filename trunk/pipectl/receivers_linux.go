@@ -37,6 +37,8 @@ func (p *Pipe) SetActive(rx byte, ip netip.Addr) error {
 	}
 	p.mu.Lock()
 	p.activeIP = ip
+	// Border points are the old receiver's: the pipe drops them too.
+	p.points = nil
 	p.mu.Unlock()
 	return p.send(putActive(rx))
 }

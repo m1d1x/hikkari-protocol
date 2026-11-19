@@ -337,6 +337,10 @@ pub struct Wire {
     /// The member the wire last sent a datagram on: the next goes on the
     /// next one up (carry.rs).
     pub rr: usize,
+    /// How many border points its members are spread over, member i at
+    /// point i mod points (the pipe's points.rs); 0 or 1: none. A
+    /// datagram's copies go to members at different points first (carry.rs).
+    pub points: u8,
     pub t: WireTick,
 }
 
@@ -355,6 +359,7 @@ impl Wire {
             proof: 0,
             h3: false,
             rr: 0,
+            points: 0,
             t: WireTick { id, ..Default::default() },
         }
     }

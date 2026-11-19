@@ -246,6 +246,8 @@ impl Pipe {
             Some((_, ip, _)) => SocketAddrV4::new(ip, e.port()),
             None => e,
         };
+        // The current receiver's session goes to its border points (points.rs).
+        let points = if to.is_none() { self.points_of(rx).to_vec() } else { Vec::new() };
         let mut add = Vec::new();
         for w in self.wires.iter().filter(|w| w.sess == cur) {
             let mut nw = Wire::new(w.id, w.key, w.stall_ns);
@@ -255,9 +257,10 @@ impl Pipe {
             nw.glue_max = w.glue_max;
             nw.exit = w.exit.map(at);
             nw.h3 = w.h3;
-            for _ in 0..w.members.len() {
+            for i in 0..w.members.len() {
                 // The QUIC wire's members open their tunnels (h3.rs).
-                let m = if w.h3 { Member::plain(&w.key, w.members.first().map_or(0, |m| m.frames_max)) } else { Member::new(nw.exit.and_then(|e| member_to(e).ok()), &w.key) };
+                let p = super::points::point(&points, i);
+                let m = if w.h3 { Member::plain(&w.key, w.members.first().map_or(0, |m| m.frames_max)) } else { Member::new(nw.exit.and_then(|e| member_to(super::points::at(e, p)).ok()), &w.key) };
                 nw.members.push(m);
             }
             add.push(nw);
@@ -419,6 +422,8 @@ impl Pipe {
         self.sessions[n as usize].standby = false;
         self.flows.move_brains(old, n);
         self.cur = n;
+        // Border points are the old receiver's (points.rs).
+        self.points.clear();
         self.next = None;
         let (mut streams, mut flows) = (0, 0);
         let gone: Vec<u8> = (0..self.sessions.len() as u8).filter(|&s| self.sessions[s as usize].live && self.sessions[s as usize].rx == old_rx).collect();

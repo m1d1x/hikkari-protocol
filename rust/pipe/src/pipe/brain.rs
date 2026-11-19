@@ -108,6 +108,11 @@ impl Pipe {
             // The receivers (session.rs).
             Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
             Some(Msg::Active { rx }) => return self.set_active(rx),
+            Some(Msg::Points(b)) => {
+                let ps = ctl::points(b);
+                self.set_points(ps, now_ns());
+                return Ok(());
+            }
             Some(Msg::Unwire { id }) => self.unpool(id),
             Some(Msg::Wire { h3: Some(_), .. }) => {
                 // The QUIC wire's strings point into the message buffer.
@@ -236,7 +241,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } => {
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } | Msg::Points(_) => {
                 unreachable!("taken above")
             }
             Msg::Member { wire, index } => {

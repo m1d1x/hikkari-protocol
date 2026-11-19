@@ -112,6 +112,9 @@ type Pipe struct {
 	receivers   Receivers
 	receiversAt time.Time
 	activeIP    netip.Addr
+	// points is the active receiver's border points (points_linux.go):
+	// member i of a bare UDP wire dials points[i mod n].
+	points []netip.Addr
 }
 
 // listenConf is a client port as the brain gave it, to give it again to
@@ -336,15 +339,19 @@ func (p *Pipe) SetWire(w Wire) error {
 	if old := p.wires[w.ID]; old != nil && old.w.H3 == nil && old.w.Exit == w.Exit && old.w.Key == w.Key {
 		kept = old.members
 	}
+	to := make([]netip.AddrPort, w.Members)
+	for i := range to {
+		to[i] = p.pointAddrLocked(w.Exit, i)
+	}
 	p.mu.Unlock()
 	members := make([]*net.UDPConn, 0, w.Members)
 	var dialed []*net.UDPConn
 	for i := 0; i < w.Members; i++ {
-		if i < len(kept) && kept[i] != nil {
+		if i < len(kept) && kept[i] != nil && dialedTo(kept[i]) == to[i] {
 			members = append(members, kept[i])
 			continue
 		}
-		c, err := dialMember(w.Exit)
+		c, err := dialMember(to[i])
 		if err != nil {
 			closeAll(dialed)
 			return err
@@ -359,7 +366,7 @@ func (p *Pipe) SetWire(w Wire) error {
 	p.mu.Lock()
 	if old := p.wires[w.ID]; old != nil {
 		for i, c := range old.members {
-			if i >= len(kept) || i >= w.Members || c != kept[i] {
+			if i >= len(members) || c != members[i] {
 				if c != nil {
 					c.Close()
 				}
@@ -601,11 +608,8 @@ func (p *Pipe) renew(id trunk.WireID, index int) {
 	if wc == nil || wc.w.H3 != nil || index >= len(wc.members) {
 		return
 	}
-	exit := wc.w.Exit
 	p.mu.Lock()
-	if p.activeIP.IsValid() {
-		exit = netip.AddrPortFrom(p.activeIP, exit.Port())
-	}
+	exit := p.memberAddrLocked(wc.w.Exit, index)
 	p.mu.Unlock()
 	c, err := dialMember(exit)
 	if err != nil {

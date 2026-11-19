@@ -27,7 +27,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 10
+const Version = 11
 
 // Brain → pipe.
 const (
@@ -54,6 +54,9 @@ const (
 	// demand: the voice class's copies on the pool on demand
 	// (rust/trunk/src/demand.rs, spec/trunk.md "Copies on demand").
 	bDemand = 0x13 // hold_ms u32: held this long after a loss; 0: copies always
+	// points: the active receiver's border points (spec/trunk.md "Border
+	// points", rust/pipe/src/pipe/points.rs).
+	bPoints = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -421,6 +424,26 @@ func putReceiver(rx byte, ip netip.Addr, poolMembers int) ([]byte, error) {
 }
 
 func putActive(rx byte) []byte { return []byte{bActive, rx} }
+
+// MaxPoints is the most border points a receiver has.
+const MaxPoints = 8
+
+// putPoints is the active receiver's border points, the core's own address
+// first.
+func putPoints(ips []netip.Addr) ([]byte, error) {
+	if len(ips) > MaxPoints {
+		return nil, fmt.Errorf("pipectl: %d border points, at most %d", len(ips), MaxPoints)
+	}
+	b := []byte{bPoints, byte(len(ips))}
+	for _, ip := range ips {
+		if !ip.Is4() {
+			return nil, fmt.Errorf("pipectl: border point %s is not IPv4", ip)
+		}
+		a := ip.As4()
+		b = append(b, a[:]...)
+	}
+	return b, nil
+}
 
 // Receivers is the pipe's word on the receivers after each tick: the active
 // one, and each on standby with its wires and pools (ID, Members, Up and

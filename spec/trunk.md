@@ -165,6 +165,25 @@ the whole path did. Then members die only after Quiet: 1 s on the entry, 30 s on
 for the entry to. A clock tick more than 100 ms late is the side's own pause: every member's debt counts from the end of it,
 and the entry logs `trunk: paused <duration>`.
 
+## Border points
+
+An exit (the core: `hk-exit`, the relay, the keys) may be reached at more than one address: its own, and border points, boxes
+that only forward the trunk's ports to it (hikkari-client plans/2026-11-19-border-forwarders.md: nft DNAT and SNAT, no
+process, no key, no state of anyone's). The entry spreads the members of each wire over the points: member `i` of a wire goes
+to point `i mod n` on the wire's port, pool and packet wires alike, under one session id. The exit joins every member to its
+session by its hello, whatever address it comes from (a packet wire's member is an entry address and port, a pool's member a
+connection), so nothing changes on the exit. A point that freezes or dies takes down its own members alone, by their health
+as above; the others carry the session and every stream and flow on it, and a member down dials its own point again, as any
+member does. A datagram's copies ("Datagrams") go to members at points it did not reach yet first, over every wire it goes
+on, then to the others: a point that freezes holds one copy of it at most while another point is up, so a call with two
+copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
+(its domain, its certificate): the entry's socket goes to the point, the engine names the core.
+
+The first point is the core's own address. Points are the active receiver's (the pipe's receivers, rust/pipe/src/pipe/
+session.rs): a move to another receiver drops them, and a receiver on standby is reached at its own address alone. Points
+given anew move only the members whose point changed: each is closed (what it carried goes again on the others) and dialed to
+its new point.
+
 ## Datagrams
 
 A flow is one client UDP association (entry: one client address on one listened port; exit: one socket to the loopback port).
