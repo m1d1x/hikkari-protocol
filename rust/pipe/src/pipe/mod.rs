@@ -35,6 +35,7 @@ mod death;
 mod generation;
 mod h3;
 mod marks;
+mod points;
 mod pool;
 mod session;
 mod tcp;
@@ -154,6 +155,8 @@ pub struct Pipe {
     next: Option<u8>,
     /// The receivers on standby (session.rs): the brain's B_RECEIVER.
     receivers: Vec<Receiver>,
+    /// The active receiver's border points, the brain's B_POINTS (points.rs).
+    points: Vec<std::net::Ipv4Addr>,
     drains: u32,
     /// The exits' epochs the members' hellos said this turn, by session
     /// (session.rs saw_epochs).
@@ -246,6 +249,7 @@ impl Pipe {
             cur: 0,
             next: None,
             receivers: Vec::new(),
+            points: Vec::new(),
             drains: 0,
             epochs: Vec::new(),
             marks: Vec::new(),

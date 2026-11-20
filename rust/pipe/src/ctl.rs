@@ -7,7 +7,7 @@
 
 use crate::route::Route;
 
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -29,6 +29,7 @@ pub const B_POOL: u8 = 0x0d; // id u8, form u8, members u8, dead_ms u16, lo u16,
 pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver on standby at ip, the active one's ports (0.0.0.0: taken away)
 pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
 pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
+pub const B_POINTS: u8 = 0x14; // n u8 + n × ip [4]: the active receiver's border points, member i of every wire to point i mod n (spec/trunk.md, "Border points"); n 0: none
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -93,6 +94,16 @@ pub enum Msg<'a> {
     Stats,
     Receiver { rx: u8, ip: std::net::Ipv4Addr, pool_members: u8 },
     Active { rx: u8 },
+    /// The border points' addresses, n × ip [4] (points reads them).
+    Points(&'a [u8]),
+}
+
+/// Most border points a receiver has (B_POINTS).
+pub const MAX_POINTS: usize = 8;
+
+/// The addresses of a B_POINTS message's body.
+pub fn points(b: &[u8]) -> Vec<std::net::Ipv4Addr> {
+    b.chunks_exact(4).map(|a| std::net::Ipv4Addr::new(a[0], a[1], a[2], a[3])).collect()
 }
 
 /// A wire of stream members (B_POOL): its members, their stall and source
@@ -191,6 +202,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
             Msg::Receiver { rx, ip: ip.into(), pool_members: r.u8()? }
         }
         B_ACTIVE if m.len() == 2 => Msg::Active { rx: r.u8()? },
+        B_POINTS if m.len() >= 2 && m[1] as usize <= MAX_POINTS && m.len() == 2 + 4 * m[1] as usize => Msg::Points(&m[2..]),
         _ => return None,
     })
 }
@@ -488,6 +500,8 @@ mod tests {
     /// wire 3 (6 members, 5 up, proof 120 ms ago) and pool 0 (8, 8, none).
     const RECEIVER_GOLDEN: &str = "11010a00000208";
     const ACTIVE_GOLDEN: &str = "1201";
+    /// pointsGolden: the border points 10.0.0.1 and 10.0.0.2.
+    const POINTS_GOLDEN: &str = "14020a0000010a000002";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
@@ -498,6 +512,12 @@ mod tests {
             _ => panic!("not a receiver"),
         }
         assert!(matches!(parse(&unhex(ACTIVE_GOLDEN)), Some(Msg::Active { rx: 1 })));
+        match parse(&unhex(POINTS_GOLDEN)) {
+            Some(Msg::Points(b)) => assert_eq!(points(b), ["10.0.0.1".parse::<std::net::Ipv4Addr>().unwrap(), "10.0.0.2".parse().unwrap()]),
+            _ => panic!("not points"),
+        }
+        assert!(matches!(parse(&unhex("1400")), Some(Msg::Points(b)) if b.is_empty()), "no points");
+        assert!(parse(&unhex("14020a0000010a0000")).is_none(), "torn points");
         assert!(parse(&unhex("11010a000002")).is_none(), "a torn receiver");
         let rs = [ReceiverTick { rx: 1, ip: "10.0.0.2".parse().unwrap(), wires: vec![(3, 6, 5, 120), (0, 8, 8, NONE_MS)] }];
         let mut out = [0u8; 64];

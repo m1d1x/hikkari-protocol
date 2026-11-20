@@ -199,11 +199,13 @@ impl Pipe {
     /// Member li of wire wi dials now; a dial that could not begin waits
     /// as a failed one.
     pub(super) fn redial(&mut self, wi: usize, li: usize, now: u64) {
+        let rx = self.sessions[self.swires[wi].sess as usize].rx;
+        let to = super::points::point(self.points_of(rx), li);
         let Pipe { swires, ports, sessions, dirty, .. } = self;
         let w = &mut swires[wi];
         let l = &mut w.links[li];
         *dirty = true;
-        match l.dial(&w.reach, &sessions[w.sess as usize].id, ports, now) {
+        match l.dial(&w.reach, to, &sessions[w.sess as usize].id, ports, now) {
             Dialed::Begun => {}
             Dialed::NoPort => {
                 let (dead, _) = ports.counts(now);

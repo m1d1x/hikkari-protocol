@@ -246,6 +246,8 @@ impl Pipe {
             Some((_, ip, _)) => SocketAddrV4::new(ip, e.port()),
             None => e,
         };
+        // The current receiver's session goes to its border points (points.rs).
+        let points = if to.is_none() { self.points_of(rx).to_vec() } else { Vec::new() };
         let mut add = Vec::new();
         for w in self.wires.iter().filter(|w| w.sess == cur) {
             let mut nw = Wire::new(w.id, w.key, w.stall_ns);
@@ -255,9 +257,10 @@ impl Pipe {
             nw.glue_max = w.glue_max;
             nw.exit = w.exit.map(at);
             nw.h3 = w.h3;
-            for _ in 0..w.members.len() {
+            for i in 0..w.members.len() {
                 // The QUIC wire's members open their tunnels (h3.rs).
-                let m = if w.h3 { Member::plain(&w.key, w.members.first().map_or(0, |m| m.frames_max)) } else { Member::new(nw.exit.and_then(|e| member_to(e).ok()), &w.key) };
+                let p = super::points::point(&points, i);
+                let m = if w.h3 { Member::plain(&w.key, w.members.first().map_or(0, |m| m.frames_max)) } else { Member::new(nw.exit.and_then(|e| member_to(super::points::at(e, p)).ok()), &w.key) };
                 nw.members.push(m);
             }
             add.push(nw);
@@ -412,13 +415,20 @@ impl Pipe {
         let Some(n) = self.receivers[i].sess else {
             return Err(format!("receiver {rx}: its standby session is not open yet"));
         };
-        let old_ip = self.cur_ip();
+        // A receiver reached through border points alone (spec/trunk.md,
+        // "Border points": its own address may be out of the entry's reach)
+        // does not go on standby at its own address: the brain gives it
+        // again if it wants it.
+        let through_points = !self.points.is_empty();
+        let old_ip = if through_points { None } else { self.cur_ip() };
         let members = self.receivers[i].pool_members;
         self.receivers.remove(i);
         let now = sys::now_ns();
         self.sessions[n as usize].standby = false;
         self.flows.move_brains(old, n);
         self.cur = n;
+        // Border points are the old receiver's (points.rs).
+        self.points.clear();
         self.next = None;
         let (mut streams, mut flows) = (0, 0);
         let gone: Vec<u8> = (0..self.sessions.len() as u8).filter(|&s| self.sessions[s as usize].live && self.sessions[s as usize].rx == old_rx).collect();
@@ -428,6 +438,9 @@ impl Pipe {
             self.close_session(s);
         }
         eprintln!("hk-pipe: trunk: receiver {rx} is the active one; receiver {old_rx} cut: {streams} stream(s) and {flows} flow(s) ended");
+        if through_points {
+            eprintln!("hk-pipe: trunk: receiver {old_rx} was reached through border points: not on standby");
+        }
         // Its pools were a standby's: the active one carries everything on
         // the brain's number of members.
         self.pools_as_the_brain_gave(n, now);

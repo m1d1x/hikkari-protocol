@@ -291,3 +291,37 @@ fn no_members_of_copies_go_round_due_at_once() {
     assert_eq!(carried(&[], &ps).len(), 4);
     assert!(ps[0].links.iter().all(|l| l.out.due(10)));
 }
+
+/// spec/trunk.md, "Border points": a datagram's copies go to members at
+/// different points first. Wire 1's members at points A B A B (member i at
+/// point i mod 2), member 1 down, the wire's last member 3: in turn the two
+/// copies would both go to A (members 0 and 2); they go to 0 (A) and 3 (B).
+#[test]
+fn copies_go_to_different_border_points_first() {
+    let (mut ws, mut ps) = (wires(&[(1, 4)], &[(1, 1)]), [pool(POOL, 4, &[])]);
+    ws[0].points = 2;
+    ws[0].rr = 3;
+    let mut later = Later::new();
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_VOICE, ANY_WIRE, 2), 4, b"hi", 10, false);
+    assert_eq!(carried(&ws, &ps), ["1/0×1", "1/3×1"], "one copy at each point");
+    // Without points, the members up in turn, as before.
+    let (mut ws, mut ps) = (wires(&[(1, 4)], &[(1, 1)]), [pool(POOL, 4, &[])]);
+    ws[0].rr = 3;
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_VOICE, ANY_WIRE, 2), 4, b"hi", 10, false);
+    assert_eq!(carried(&ws, &ps), ["1/0×1", "1/2×1"]);
+}
+
+/// The datagram's points count over its wires: one copy on wire 1 at A,
+/// its copy on the pool goes to a member at B, not to the pool's next one
+/// at A.
+#[test]
+fn the_pools_copy_goes_to_a_point_the_wire_did_not_reach() {
+    let (mut ws, mut ps) = (wires(&[(1, 2)], &[]), [pool(POOL, 4, &[])]);
+    ws[0].points = 2;
+    ws[0].rr = 1;
+    ps[0].points = 2;
+    ps[0].rr = 1;
+    let mut later = Later::new();
+    carry(&mut ws, &mut ps, &route(1, POOL), &mut later, &mut flow(CLASS_VOICE, ANY_WIRE, 1), 4, b"hi", 10, true);
+    assert_eq!(carried(&ws, &ps), ["1/0×1", "0/3×1"], "the wire at A, the pool at B");
+}

@@ -31,6 +31,7 @@ impl Pipe {
     /// hikkari_trunk::health), the brain's tick, the stats line; returns when
     /// the next of them is due.
     pub(super) fn timers(&mut self, now: u64) -> u64 {
+        self.mark_points();
         let clock = now >= self.clock_at;
         if clock {
             self.clock_at = if self.clock_at + CLOCK > now { self.clock_at + CLOCK } else { now + CLOCK };
@@ -38,7 +39,8 @@ impl Pipe {
         let mut next = self.step_sessions(now).min(self.clock_at).min(self.h3_members(now));
         let alone = self.ctl.is_none();
         let (cur, renews) = (self.cur, self.renew_mask());
-        let Pipe { wires, judge, tok, events, sessions, dirty, h3s, .. } = self;
+        let active_rx = self.sessions[cur as usize].rx;
+        let Pipe { wires, judge, tok, events, sessions, dirty, h3s, points, .. } = self;
         for w in wires.iter_mut() {
             // The brain hears and renews the current session's members; the
             // members of one coming up are the pipe's own (session.rs), and
@@ -53,7 +55,8 @@ impl Pipe {
                     } else if now >= m.renew_at {
                         // Alone the pipe dials its own: a new socket is a
                         // new peer to the exit, joined by its hello.
-                        let sock = w.exit.and_then(|exit| member_to(exit).ok());
+                        let p = if w.rx == active_rx { super::points::point(points, mi) } else { None };
+                        let sock = w.exit.and_then(|exit| member_to(super::points::at(exit, p)).ok());
                         m.set_sock(sock);
                         *dirty = true;
                     } else {
