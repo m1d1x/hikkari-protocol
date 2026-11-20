@@ -1,11 +1,13 @@
 //! Border points (spec/trunk.md, "Border points"; hikkari-client
-//! plans/2026-11-19-border-forwarders.md): the active receiver reached at
-//! more than one address, boxes that only forward its ports. Member i of
-//! every wire and pool of the active receiver's sessions goes to point
-//! i mod n on its wire's port, under the session's one id; the exit joins
-//! each by its hello. A point that freezes or dies takes down its own
-//! members alone, by their health, and they dial it again as any member
-//! does: nothing here chooses a point.
+//! plans/2026-11-19-border-forwarders.md): the active receiver, the core,
+//! reached through boxes that only forward its ports. The core's own
+//! address (its wires' and pools' exit) may be one of them or none: the
+//! core may be out of the entry's reach, and with points given nothing
+//! dials it. Member i of every wire and pool of the active receiver's
+//! sessions goes to point i mod n on its wire's port, under the session's
+//! one id; the exit joins each by its hello. A point that freezes or dies
+//! takes down its own members alone, by their health, and they dial it
+//! again as any member does: nothing here chooses a point.
 //!
 //! The brain dials the members of the current session's bare UDP wires
 //! (pipectl SetPoints gives them anew with B_WIRE); the pipe dials every
@@ -61,7 +63,10 @@ impl Pipe {
     /// changed go to their new one, the others stay as they are. A pool's
     /// member is taken down (what it carried goes again on the others) and
     /// dialed anew; a QUIC wire's member opens its tunnel anew; a bare UDP
-    /// member of a session the pipe dials for itself gets a new socket.
+    /// member of a session the pipe dials for itself gets a new socket. A
+    /// member that waits to dial again (its old address did not answer: the
+    /// core out of reach before the points came) dials its new point now:
+    /// its backoff was the old address's.
     pub(super) fn set_points(&mut self, ips: Vec<Ipv4Addr>, now: u64) {
         let old = std::mem::replace(&mut self.points, ips);
         if old == self.points {
@@ -70,11 +75,18 @@ impl Pipe {
         let rx = self.sessions[self.cur as usize].rx;
         let moved = |i: usize| point(&old, i) != point(&self.points, i);
         let mut downs = Vec::new();
+        let mut waits = Vec::new();
         for (wi, w) in self.swires.iter().enumerate() {
             if w.sess == NO_SESSION || self.sessions[w.sess as usize].rx != rx {
                 continue;
             }
-            downs.extend(w.links.iter().enumerate().filter(|(li, l)| l.sock.is_some() && moved(*li)).map(|(li, _)| (wi, li)));
+            for (li, l) in w.links.iter().enumerate().filter(|(li, _)| moved(*li)) {
+                if l.sock.is_some() {
+                    downs.push((wi, li));
+                } else if l.renew_at != 0 {
+                    waits.push((wi, li));
+                }
+            }
         }
         let (cur, brains) = (self.cur, self.ctl.is_some());
         let mut events = Vec::new();
@@ -85,6 +97,8 @@ impl Pipe {
                 }
                 if w.h3 {
                     if m.tun.is_none() {
+                        // Waiting to open: it opens to its new point now.
+                        m.renew_at = 0;
                         continue;
                     }
                     if let Some(h) = self.h3s.iter_mut().find(|h| h.id == w.id && h.rx == w.rx) {
@@ -103,8 +117,17 @@ impl Pipe {
         }
         self.events.extend(events);
         let n = downs.len();
-        for (wi, li) in downs {
+        for &(wi, li) in &downs {
             self.link_down(wi, li, Down::Lost, now);
+        }
+        // A new address owes nothing of the old one's backoff: each member
+        // the pipe dials again dials after the spread alone.
+        for (wi, li) in downs.into_iter().chain(waits) {
+            let l = &mut self.swires[wi].links[li];
+            l.backoff_ns = 0;
+            if l.renew_at != 0 {
+                self.renew(wi, li, now);
+            }
         }
         eprintln!("hk-pipe: trunk: border points {:?}: {n} pool member(s) move", self.points);
         self.dirty = true;

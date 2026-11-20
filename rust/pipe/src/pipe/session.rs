@@ -415,7 +415,12 @@ impl Pipe {
         let Some(n) = self.receivers[i].sess else {
             return Err(format!("receiver {rx}: its standby session is not open yet"));
         };
-        let old_ip = self.cur_ip();
+        // A receiver reached through border points alone (spec/trunk.md,
+        // "Border points": its own address may be out of the entry's reach)
+        // does not go on standby at its own address: the brain gives it
+        // again if it wants it.
+        let through_points = !self.points.is_empty();
+        let old_ip = if through_points { None } else { self.cur_ip() };
         let members = self.receivers[i].pool_members;
         self.receivers.remove(i);
         let now = sys::now_ns();
@@ -433,6 +438,9 @@ impl Pipe {
             self.close_session(s);
         }
         eprintln!("hk-pipe: trunk: receiver {rx} is the active one; receiver {old_rx} cut: {streams} stream(s) and {flows} flow(s) ended");
+        if through_points {
+            eprintln!("hk-pipe: trunk: receiver {old_rx} was reached through border points: not on standby");
+        }
         // Its pools were a standby's: the active one carries everything on
         // the brain's number of members.
         self.pools_as_the_brain_gave(n, now);

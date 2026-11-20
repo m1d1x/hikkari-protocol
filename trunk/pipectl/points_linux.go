@@ -2,8 +2,9 @@ package pipectl
 
 // Border points (spec/trunk.md, "Border points"; the pipe's
 // rust/pipe/src/pipe/points.rs; hikkari-client
-// plans/2026-11-19-border-forwarders.md): the active receiver reached at
-// more than one address, boxes that only forward its ports to it. Member i
+// plans/2026-11-19-border-forwarders.md): the active receiver, the core,
+// reached through boxes that only forward its ports to it; its own address
+// may be out of the entry's reach, and with points given nothing dials it. Member i
 // of every wire goes to point i mod n under one session, so a point that
 // freezes or dies takes down its own members alone and the call on the
 // others is not heard to pause. The brain dials the bare UDP wires'
@@ -15,7 +16,8 @@ import (
 )
 
 // SetPoints gives the active receiver's border points, its own address
-// first; none: the receiver's own address alone. The members whose point
+// among them or not; none: the receiver's own address alone. Give them
+// before the wires, so that no member dials the core first. The members whose point
 // changed go to their new one (the pipe moves its own, the brain dials the
 // bare UDP wires' anew), the others stay as they are. A move to another
 // receiver (SetActive) drops them.

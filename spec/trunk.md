@@ -167,9 +167,11 @@ and the entry logs `trunk: paused <duration>`.
 
 ## Border points
 
-An exit (the core: `hk-exit`, the relay, the keys) may be reached at more than one address: its own, and border points, boxes
-that only forward the trunk's ports to it (hikkari-client plans/2026-11-19-border-forwarders.md: nft DNAT and SNAT, no
-process, no key, no state of anyone's). The entry spreads the members of each wire over the points: member `i` of a wire goes
+An exit (the core: `hk-exit`, the relay, the keys) may be reached through border points, boxes that only forward the trunk's
+ports to it (hikkari-client plans/2026-11-19-border-forwarders.md: nft DNAT and SNAT, no process, no key, no state of
+anyone's). The core's own address, the exit its wires and pools are given with, may be one of the points or none of them: the
+core may be out of the entry's reach (the egress that holds everyone's sessions, reached from Russia through the points
+alone), and with points given no member dials it. The entry spreads the members of each wire over the points: member `i` of a wire goes
 to point `i mod n` on the wire's port, pool and packet wires alike, under one session id. The exit joins every member to its
 session by its hello, whatever address it comes from (a packet wire's member is an entry address and port, a pool's member a
 connection), so nothing changes on the exit. A point that freezes or dies takes down its own members alone, by their health
@@ -179,10 +181,12 @@ on, then to the others: a point that freezes holds one copy of it at most while 
 copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
 (its domain, its certificate): the entry's socket goes to the point, the engine names the core.
 
-The first point is the core's own address. Points are the active receiver's (the pipe's receivers, rust/pipe/src/pipe/
-session.rs): a move to another receiver drops them, and a receiver on standby is reached at its own address alone. Points
-given anew move only the members whose point changed: each is closed (what it carried goes again on the others) and dialed to
-its new point.
+The brain gives the points before the wires, so that no member dials the core's own address first; points given later move
+every member to them. Points are the active receiver's (the pipe's receivers, rust/pipe/src/pipe/session.rs): a move to
+another receiver drops them, a receiver on standby is reached at its own address alone, and a receiver that was reached
+through points does not go on standby at its own address once another is active. Points given anew move only the members
+whose point changed: each is closed (what it carried goes again on the others) and dialed to its new point after the spread
+alone, as is a member that was waiting to dial again: the backoff was its old address's.
 
 ## Datagrams
 
