@@ -43,6 +43,14 @@ func (p *Pipe) SetActive(rx byte, ip netip.Addr) error {
 	return p.send(putActive(rx))
 }
 
+// Points is the pipe's latest word on the border points and when it came
+// (zero before the first, and with no points given).
+func (p *Pipe) Points() ([]PointTick, time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pointTicks, p.pointTicksAt
+}
+
 // Receivers is the pipe's latest word on the receivers and when it came
 // (zero before the first: no receiver on standby yet).
 func (p *Pipe) Receivers() (Receivers, time.Time) {

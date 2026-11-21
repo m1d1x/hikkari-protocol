@@ -42,6 +42,7 @@ pub const P_OBSERVED: u8 = 0x88; // a report of a tester's stream or flow: see p
 pub const P_STATS: u8 = 0x89; // see put_stats
 pub const P_CLIENTS: u8 = 0x87; // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (NONE_MS: none)
 pub const P_RECEIVERS: u8 = 0x8a; // active u8, n u8 + n × (rx u8, ip [4], k u8 + k × (wire u8, members u8, up u8, proof_ago_ms u32)): see put_receivers
+pub const P_POINTS: u8 = 0x8b; // n u8 + n × (ip [4], members u8, up u8, proof_ago_ms u32): see put_points
 
 /// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
 pub const FORM_UDP: u8 = 1;
@@ -466,6 +467,34 @@ pub fn put_receivers(out: &mut [u8], active: u8, rs: &[ReceiverTick]) -> usize {
     at
 }
 
+/// A border point in a tick (P_POINTS): every member of the current
+/// session's wires and pools at that point (member i at point i mod n),
+/// how many are up, and how long ago one of them last proved its round
+/// trip (NONE_MS: none ever did). A point whose members are all down is
+/// one the entry cannot reach the core through: dead, frozen, or cut.
+#[derive(Clone, Copy)]
+pub struct PointTick {
+    pub ip: std::net::Ipv4Addr,
+    pub members: u8,
+    pub up: u8,
+    pub proof_ago_ms: u32,
+}
+
+/// P_POINTS: each border point in order. out must hold 2 + 10 × points.
+pub fn put_points(out: &mut [u8], ps: &[PointTick]) -> usize {
+    out[0] = P_POINTS;
+    out[1] = ps.len() as u8;
+    let mut at = 2;
+    for p in ps {
+        out[at..at + 4].copy_from_slice(&p.ip.octets());
+        out[at + 4] = p.members;
+        out[at + 5] = p.up;
+        out[at + 6..at + 10].copy_from_slice(&p.proof_ago_ms.to_le_bytes());
+        at += 10;
+    }
+    at
+}
+
 pub fn put_dgram(out: &mut [u8], tag: u32, payload: &[u8]) -> usize {
     out[0] = P_DGRAM;
     out[1..5].copy_from_slice(&tag.to_le_bytes());
@@ -503,6 +532,20 @@ mod tests {
     /// pointsGolden: the border points 10.0.0.1 and 10.0.0.2.
     const POINTS_GOLDEN: &str = "14020a0000010a000002";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
+    /// trunk/pipectl msg_test.go TestPointTicksGolden: 10.0.0.1 with 6
+    /// members, 3 up, proof 100 ms ago; 10.0.0.2 with 6, none up, none ever.
+    const POINT_TICKS_GOLDEN: &str = "8b020a0000010603640000000a0000020600ffffffff";
+
+    #[test]
+    fn puts_the_points_the_brain_reads() {
+        let ps = [
+            PointTick { ip: "10.0.0.1".parse().unwrap(), members: 6, up: 3, proof_ago_ms: 100 },
+            PointTick { ip: "10.0.0.2".parse().unwrap(), members: 6, up: 0, proof_ago_ms: NONE_MS },
+        ];
+        let mut out = [0u8; 32];
+        let n = put_points(&mut out, &ps);
+        assert_eq!(out[..n], unhex(POINT_TICKS_GOLDEN)[..]);
+    }
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c01000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0400204eff7f7f0000015d110a686b2e6578616d706c6511002f6f70742f6c696263726f6e65742e736f50454d";
 
     #[test]
