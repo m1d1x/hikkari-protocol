@@ -128,7 +128,11 @@ impl Send {
     /// (spec/trunk.md, "An entry's own process replaced"). No credit until
     /// the other end's first ack says it.
     pub fn at(off: u64) -> Send {
-        Send { sent: off, credit: off, ..Send::default() }
+        // The kept bytes start where the numbering does: the next chunk's
+        // bytes are at `off`, and a chunk that goes again after its member
+        // died is read back from there (21.11 the people's pipe aborted on
+        // the first one after a reload: kept from 0, asked for 1.3 MB on).
+        Send { sent: off, credit: off, kept: Kept { base: off, ..Kept::default() }, ..Send::default() }
     }
 
     /// Everything it numbered is confirmed: nothing of the open or the
@@ -314,6 +318,25 @@ impl Recv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stream handed over at `off` keeps the bytes it numbers after, and
+    /// a chunk of them goes again from where it was numbered when its
+    /// member dies (21.11: kept from 0, the pipe aborted on the slice).
+    #[test]
+    fn an_adopted_stream_sends_a_chunk_again_from_its_own_offset() {
+        let mut s = Send::at(1_322_355);
+        s.credit = s.sent + WINDOW;
+        let off = s.chunk(b"abcdefghij", 3, 1);
+        assert_eq!(off, 1_322_355);
+        let off2 = s.chunk(b"klmno", 4, 2);
+        assert!(s.strand(3));
+        let i = s.next_stranded().unwrap();
+        let o = s.owed[i];
+        assert_eq!(s.kept.get(o.off, o.len as usize), b"abcdefghij");
+        assert_eq!(s.kept.get(off2, 5), b"klmno");
+        s.acked(off2, off2 + WINDOW, 0, NO_GOT, |_| {});
+        assert_eq!(s.kept.get(off2, 5), b"klmno", "the bytes still owed stay after an ack of the ones before");
+    }
 
     #[test]
     fn an_ack_confirms_the_open_chunks_by_got_or_received_and_the_fin_by_its_flag() {
