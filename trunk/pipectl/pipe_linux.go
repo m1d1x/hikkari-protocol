@@ -111,7 +111,11 @@ type Pipe struct {
 	// the brain's new members dial it on their wire's port.
 	receivers   Receivers
 	receiversAt time.Time
-	activeIP    netip.Addr
+	// points is the pipe's latest word on the border points and when it
+	// came (pPoints, after each tick while points are given).
+	pointTicks   []PointTick
+	pointTicksAt time.Time
+	activeIP     netip.Addr
 	// points is the active receiver's border points (points_linux.go):
 	// member i of a bare UDP wire dials points[i mod n].
 	points []netip.Addr
@@ -575,6 +579,15 @@ func (p *Pipe) read() {
 			}
 			p.mu.Lock()
 			p.receivers, p.receiversAt = r, time.Now()
+			p.mu.Unlock()
+		case pPoints:
+			ps, err := parsePoints(m)
+			if err != nil {
+				p.cfg.Logf("%v", err)
+				continue
+			}
+			p.mu.Lock()
+			p.pointTicks, p.pointTicksAt = ps, time.Now()
 			p.mu.Unlock()
 		case pClients, pStats:
 			select {

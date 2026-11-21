@@ -408,5 +408,14 @@ impl Pipe {
                 c.send(&self.out[..len]);
             }
         }
+        // The border points after it: the brain names a point that carries
+        // nothing (points.rs).
+        if !self.points.is_empty() {
+            let ps = self.point_ticks(now);
+            let len = ctl::put_points(&mut self.out, &ps);
+            if let Some(c) = &mut self.ctl {
+                c.send(&self.out[..len]);
+            }
+        }
     }
 }

@@ -59,6 +59,41 @@ impl Pipe {
         }
     }
 
+    /// The border points for the brain's tick (P_POINTS): per point, the
+    /// members of the current session's wires and pools there (member i at
+    /// point i mod n), how many are up and the latest round trip one of
+    /// them proved (a member's join counts: the exit answered its hello). Members count up to 255 a point.
+    pub(super) fn point_ticks(&self, now: u64) -> Vec<crate::ctl::PointTick> {
+        let n = self.points.len();
+        let (mut members, mut up, mut proof) = (vec![0u32; n], vec![0u32; n], vec![0u64; n]);
+        let mut add = |i: usize, is_up: bool, progress: u64| {
+            let k = i % n;
+            members[k] += 1;
+            if is_up {
+                up[k] += 1;
+            }
+            proof[k] = proof[k].max(progress);
+        };
+        for w in self.wires.iter().filter(|w| w.sess == self.cur) {
+            for (i, m) in w.members.iter().enumerate() {
+                add(i, m.h.up, m.h.progress);
+            }
+        }
+        for w in self.swires.iter().filter(|w| w.sess == self.cur) {
+            for (i, l) in w.links.iter().enumerate() {
+                add(i, l.h.up, l.h.progress);
+            }
+        }
+        (0..n)
+            .map(|k| crate::ctl::PointTick {
+                ip: self.points[k],
+                members: members[k].min(255) as u8,
+                up: up[k].min(255) as u8,
+                proof_ago_ms: if proof[k] == 0 { crate::ctl::NONE_MS } else { super::ms(now.saturating_sub(proof[k])) },
+            })
+            .collect()
+    }
+
     /// The brain's border points (B_POINTS): the members whose point
     /// changed go to their new one, the others stay as they are. A pool's
     /// member is taken down (what it carried goes again on the others) and
