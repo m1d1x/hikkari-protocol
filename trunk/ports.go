@@ -11,12 +11,12 @@ import (
 // PortBook hands out source ports for members and remembers the ones the
 // path killed. A flow killed by source port dies again on that port (the
 // same verdict 62 s later, plans/2026-11-02-tcp-flow-loss.md), so a dead port
-// is not offered again for DeadFor.
+// is rested, with a longer rest for a recent repeat.
 //
 // Members die about once a second on a bad hour, and in 1-3 h most of the
 // range is dead (11457 of 12768 on 12.11). So every call is O(1): the free
-// ports are a list, a take is one random index into it, and the dead come
-// back in the order they died, from the head of a queue.
+// ports are a list, a take is one random index into it, and each rest
+// duration has its own expiry queue.
 type PortBook struct {
 	lo, hi  int
 	deadFor time.Duration
@@ -26,8 +26,9 @@ type PortBook struct {
 	pos   []int32 // pos[port-lo]: index in free, or -1
 	inUse []bool
 	until []time.Time // until[port-lo]: dead until then; zero when not dead
-	queue []deadPort  // kills in time order; an entry is stale once until moved on
-	head  int
+	last  []time.Time // previous kill, even after the port became free
+	short deadQueue
+	long  deadQueue
 	dead  int
 	kills int64
 	now   func() time.Time
@@ -38,8 +39,15 @@ type deadPort struct {
 	until time.Time
 }
 
-// DefaultDeadFor is how long a killed port stays out of use.
-const DefaultDeadFor = time.Hour
+type deadQueue struct {
+	items []deadPort
+	head  int
+}
+
+// DefaultDeadFor is the rest after a first kill. A repeat within an hour of
+// its previous kill rests for the full hour.
+const DefaultDeadFor = 15 * time.Minute
+const repeatDeadFor = time.Hour
 
 // ErrNoPorts is Take's answer when every port is dead or in use.
 var ErrNoPorts = errors.New("trunk: no source port free")
@@ -49,9 +57,6 @@ func NewPortBook(lo, hi int, deadFor time.Duration) (*PortBook, error) {
 	if lo < 1024 || hi > 65535 || hi-lo < 256 {
 		return nil, fmt.Errorf("trunk: source ports %d-%d: need at least 256 above 1023", lo, hi)
 	}
-	if deadFor <= 0 {
-		deadFor = DefaultDeadFor
-	}
 	span := hi - lo + 1
 	b := &PortBook{
 		lo: lo, hi: hi, deadFor: deadFor,
@@ -60,6 +65,9 @@ func NewPortBook(lo, hi int, deadFor time.Duration) (*PortBook, error) {
 		inUse: make([]bool, span),
 		until: make([]time.Time, span),
 		now:   time.Now,
+	}
+	if deadFor <= 0 {
+		b.last = make([]time.Time, span)
 	}
 	for i := range span {
 		b.free[i] = int32(lo + i)
@@ -94,8 +102,7 @@ func (b *PortBook) Take() (int, func(), error) {
 	}, nil
 }
 
-// Dead marks a port the path killed. A port killed again stays out for
-// DeadFor from the last kill.
+// Dead marks a port the path killed. Its rest begins at this kill.
 func (b *PortBook) Dead(port int) {
 	if port < b.lo || port > b.hi {
 		return
@@ -109,8 +116,17 @@ func (b *PortBook) Dead(port int) {
 		b.dead++
 		b.unfree(port)
 	}
-	b.until[i] = now.Add(b.deadFor)
-	b.queue = append(b.queue, deadPort{int32(port), b.until[i]})
+	duration, queue := b.deadFor, &b.long
+	if b.last != nil {
+		if !b.last[i].IsZero() && now.Sub(b.last[i]) < repeatDeadFor {
+			duration = repeatDeadFor
+		} else {
+			duration, queue = DefaultDeadFor, &b.short
+		}
+		b.last[i] = now
+	}
+	b.until[i] = now.Add(duration)
+	queue.items = append(queue.items, deadPort{int32(port), b.until[i]})
 	b.kills++
 }
 
@@ -122,11 +138,16 @@ func (b *PortBook) Counts() (dead int, kills int64) {
 	return b.dead, b.kills
 }
 
-// expire brings back the ports whose time is up, from the head of the queue.
 func (b *PortBook) expire(now time.Time) {
-	for b.head < len(b.queue) && !b.queue[b.head].until.After(now) {
-		d := b.queue[b.head]
-		b.head++
+	b.expireQueue(&b.short, now)
+	b.expireQueue(&b.long, now)
+}
+
+// Each queue has a fixed duration, so it expires in insertion order.
+func (b *PortBook) expireQueue(queue *deadQueue, now time.Time) {
+	for queue.head < len(queue.items) && !queue.items[queue.head].until.After(now) {
+		d := queue.items[queue.head]
+		queue.head++
 		i := int(d.port) - b.lo
 		if !b.until[i].Equal(d.until) {
 			continue // killed again later: a later entry brings it back
@@ -137,11 +158,9 @@ func (b *PortBook) expire(now time.Time) {
 			b.addFree(int(d.port))
 		}
 	}
-	// Drop the spent head once it is most of the queue, so the queue holds
-	// about one entry per kill of the last DeadFor.
-	if b.head > 1024 && b.head*2 > len(b.queue) {
-		b.queue = append(b.queue[:0], b.queue[b.head:]...)
-		b.head = 0
+	if queue.head > 1024 && queue.head*2 > len(queue.items) {
+		queue.items = append(queue.items[:0], queue.items[queue.head:]...)
+		queue.head = 0
 	}
 }
 

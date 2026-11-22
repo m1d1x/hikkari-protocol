@@ -56,7 +56,7 @@ func newPoint(t *testing.T, ip, core netip.Addr, wirePort, poolPort uint16) (*po
 	f := &point{ip: ip, core: core, udp: u, tcp: l, peers: map[netip.AddrPort]*net.UDPConn{}}
 	t.Cleanup(f.kill)
 	go f.upUDP(wirePort)
-	go f.acceptTCP(poolPort)
+	go f.acceptTCP(l, poolPort)
 	return f, nil
 }
 
@@ -105,9 +105,9 @@ func (f *point) downUDP(c *net.UDPConn, to netip.AddrPort) {
 	}
 }
 
-func (f *point) acceptTCP(port uint16) {
+func (f *point) acceptTCP(l net.Listener, port uint16) {
 	for {
-		c, err := f.tcp.Accept()
+		c, err := l.Accept()
 		if err != nil {
 			return
 		}
@@ -179,6 +179,108 @@ func (f *point) peersSeen() (udp, tcp int) {
 // unreached is the core's own address as the entry is given it: nothing
 // answers there.
 var unreached = netip.MustParseAddr("127.0.0.9")
+
+func TestBothPointsPauseWithoutBuryingThePool(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	core, a, b, wp, pp := coreAndPoints(t, ctx)
+	downs := make(chan netip.Addr, 16)
+	p, err := Start(Config{Bin: pipeBin(t), Stderr: os.Stderr, Logf: t.Logf,
+		OnMemberEvent: func(wire trunk.WireID, index int, up bool, why byte, point netip.Addr) {
+			if wire == trunk.PoolWire && !up {
+				downs <- point
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	if err := p.SetPoints(pointsOf(a, b)); err != nil {
+		t.Fatal(err)
+	}
+	wires(t, p, wp, pp)
+	waitFor(t, 5*time.Second, "all TCP members up", func() bool { return wireUp(p, trunk.PoolWire, 4) })
+	s, err := net.Dial("tcp", streams0(t, p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := echoOpen(s, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	a.freeze(2 * time.Second)
+	b.freeze(2 * time.Second)
+	at := time.Now()
+	if err := echoOpen(s, 1<<20); err != nil {
+		t.Fatalf("same stream after both points froze: %v", err)
+	}
+	t.Logf("1 MiB on the same stream after a 2 s freeze: %v", time.Since(at).Round(time.Millisecond))
+	select {
+	case pt := <-downs:
+		t.Fatalf("a member at %v was buried during the pause", pt)
+	default:
+	}
+	b.kill()
+	for range 2 {
+		select {
+		case pt := <-downs:
+			if pt != b.ip {
+				t.Fatalf("death named %v, want point %v", pt, b.ip)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("missing death of a pool member at the dead point")
+		}
+	}
+	if err := echoOpen(s, 64<<10); err != nil {
+		t.Fatalf("same stream after a point died: %v", err)
+	}
+	if _, stats := core.x.Stats(); stats.StreamsOpened != 1 || stats.StreamsReset != 0 {
+		t.Fatalf("core streams opened=%d reset=%d", stats.StreamsOpened, stats.StreamsReset)
+	}
+}
+
+func TestPoolPortChangesAtThePointsAndKeepsTheStream(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	core, a, b, wp, pp := coreAndPoints(t, ctx)
+	p, _, streams := pointsPipe(t, a, b, wp, pp, 1)
+	port := uint16(0)
+	for _, point := range []*point{a, b} {
+		l, err := net.Listen("tcp4", netip.AddrPortFrom(point.ip, port).String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { l.Close() })
+		port = l.Addr().(*net.TCPAddr).AddrPort().Port()
+		go point.acceptTCP(l, pp)
+	}
+	s, err := net.Dial("tcp", streams)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := echoOpen(s, 64<<10); err != nil {
+		t.Fatal(err)
+	}
+	for _, pointPort := range []uint16{port, 0} {
+		_, fromA := a.peersSeen()
+		_, fromB := b.peersSeen()
+		if err := p.SetPool(Pool{ID: trunk.PoolWire, Members: 4, Exit: netip.AddrPortFrom(unreached, pp), PointPort: pointPort}); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, 5*time.Second, "redialed on both points", func() bool {
+			_, nowA := a.peersSeen()
+			_, nowB := b.peersSeen()
+			return nowA >= fromA+2 && nowB >= fromB+2 && wireUp(p, trunk.PoolWire, 4)
+		})
+		if err := echoOpen(s, 1<<20); err != nil {
+			t.Fatalf("same stream through point port %d: %v", pointPort, err)
+		}
+	}
+	if _, stats := core.x.Stats(); stats.StreamsOpened != 1 || stats.StreamsReset != 0 {
+		t.Fatalf("core streams opened=%d reset=%d", stats.StreamsOpened, stats.StreamsReset)
+	}
+}
 
 // coreAndPoints stands the core at 127.0.0.1 and border points at
 // 127.0.0.2 and 127.0.0.3 on one pair of free ports.

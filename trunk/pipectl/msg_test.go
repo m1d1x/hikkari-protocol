@@ -64,6 +64,11 @@ func TestGolden(t *testing.T) {
 	if err != nil || hex.EncodeToString(pp) != poolPlainGolden {
 		t.Fatalf("plain pool %x %v, want %s", pp, err, poolPlainGolden)
 	}
+	via, err := putPool(Pool{ID: 0, Members: 32, Stall: 300 * time.Millisecond, Ports: [2]uint16{20000, 32767},
+		Exit: netip.MustParseAddrPort("127.0.0.1:20446"), PointPort: 2053})
+	if err != nil || hex.EncodeToString(via) != "150508"+poolPlainGolden[2:] {
+		t.Fatalf("pool via alternate point port: %x %v", via, err)
+	}
 	pc, err := putPool(Pool{ID: 0, Members: 4, Stall: 300 * time.Millisecond, Ports: [2]uint16{20000, 32767},
 		Exit:     netip.MustParseAddrPort("127.0.0.1:443"),
 		Chromium: &ChromiumForm{SNI: "hk.example", Key: "golden-test-key-0123456789", Cronet: "/opt/libcronet.so", Roots: "PEM"}})

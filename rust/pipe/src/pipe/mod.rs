@@ -102,6 +102,7 @@ struct Event {
     index: u8,
     up: bool,
     why: u8,
+    point: Option<std::net::Ipv4Addr>,
 }
 
 /// Flags of a pipe without a brain (the bench).
@@ -269,7 +270,7 @@ impl Pipe {
             flows: Flows::new(),
             tcp_listens: Vec::new(),
             swires: Vec::new(),
-            ports: Book::new(ports::LO, ports::HI, ports::DEAD_FOR_NS).expect("the default range is a valid one"),
+            ports: Book::new(ports::LO, ports::HI, 0).expect("the default range is a valid one"),
             ports_range: (ports::LO, ports::HI),
             streams: Streams::new(),
             released: Vec::with_capacity(256),
@@ -358,7 +359,7 @@ impl Pipe {
                 Some(engine) => Reach::Chromium(engine.clone()),
                 None => Reach::Plain(a.tcp_exit),
             };
-            p.ports = Book::new(a.ports.0, a.ports.1, ports::DEAD_FOR_NS).map_err(io::Error::other)?;
+            p.ports = Book::new(a.ports.0, a.ports.1, 0).map_err(io::Error::other)?;
             p.ports_range = a.ports;
             let mut w = StreamWire::new(POOL_WIRE, reach, a.tcp_members, health::STALL);
             w.set_copies(a.copy_members, a.copy_window_ns);

@@ -6,6 +6,30 @@ import (
 	"time"
 )
 
+func TestAFirstKillExpiresBeforeAnOlderRepeat(t *testing.T) {
+	b, err := NewPortBook(20000, 20256, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1, 0)
+	b.now = func() time.Time { return now }
+	b.Dead(20000)
+	now = now.Add(15 * time.Minute)
+	if dead, _ := b.Counts(); dead != 0 {
+		t.Fatalf("first kill still rested after 15 minutes")
+	}
+	b.Dead(20000)
+	b.Dead(20001)
+	now = now.Add(15 * time.Minute)
+	if dead, _ := b.Counts(); dead != 1 || b.pos[0] >= 0 || b.pos[1] < 0 {
+		t.Fatalf("only the repeat should still be rested, dead=%d", dead)
+	}
+	now = now.Add(45 * time.Minute)
+	if dead, _ := b.Counts(); dead != 0 {
+		t.Fatalf("repeat still rested after an hour")
+	}
+}
+
 type fakeClock struct{ t time.Time }
 
 func (c *fakeClock) now() time.Time      { return c.t }
@@ -129,10 +153,10 @@ func TestTheQueueHoldsOnlyTheLastHour(t *testing.T) {
 		b.Dead(20000 + i%257)
 		c.add(time.Second)
 	}
-	if n := len(b.queue) - b.head; n > 3600+1 {
+	if n := len(b.long.items) - b.long.head; n > 3600+1 {
 		t.Fatalf("queue holds %d live entries, want about 3600", n)
 	}
-	if cap(b.queue) > 3*3600+2048 {
-		t.Fatalf("queue cap %d after 100000 kills", cap(b.queue))
+	if cap(b.long.items) > 3*3600+2048 {
+		t.Fatalf("queue cap %d after 100000 kills", cap(b.long.items))
 	}
 }

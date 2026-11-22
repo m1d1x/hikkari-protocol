@@ -140,7 +140,7 @@ impl Pipe {
                         h.let_go(w.sess, mi, m.port);
                     }
                     if m.h.up && brains && w.sess == cur {
-                        events.push(super::Event { wire: w.id, index: mi as u8, up: false, why: crate::ctl::WHY_GONE });
+                        events.push(super::Event { wire: w.id, index: mi as u8, up: false, why: crate::ctl::WHY_GONE, point: None });
                     }
                     m.set_tunnel(None, 0);
                     m.renew_at = 0;

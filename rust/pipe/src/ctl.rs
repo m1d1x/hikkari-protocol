@@ -30,11 +30,12 @@ pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver o
 pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
 pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
 pub const B_POINTS: u8 = 0x14; // n u8 + n × ip [4]: the active receiver's border points, member i of every wire to point i mod n (spec/trunk.md, "Border points"); n 0: none
+pub const B_POOL_VIA: u8 = 0x15; // point port u16, then the body of B_POOL
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
 pub const P_TICK: u8 = 0x82; // see put_tick
-pub const P_MEMBER: u8 = 0x83; // wire u8, index u8, up u8, why u8
+pub const P_MEMBER: u8 = 0x83; // wire u8, index u8, up u8, why u8 [, point IPv4]
 pub const P_DGRAM: u8 = 0x84; // tag u32, payload
 pub const P_ERROR: u8 = 0x85; // text
 pub const P_DRAINED: u8 = 0x86; // a pipe draining carries nothing more: no client's flow, no stream
@@ -116,6 +117,7 @@ pub struct Pool<'a> {
     pub dead_ms: u16,
     pub ports: (u16, u16),
     pub exit: std::net::SocketAddrV4,
+    pub point_port: u16,
     pub sni: &'a str,
     pub key: &'a str,
     /// libcronet's path; empty: found as the Go entry finds it.
@@ -193,6 +195,12 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_ADOPT if m.len() == 1 => Msg::Adopt,
         B_TCP_LISTEN => Msg::TcpListen { id: r.u8()?, to: r.u16()? },
         B_POOL => Msg::Pool(pool(&mut r)?),
+        B_POOL_VIA => {
+            let point_port = r.u16()?;
+            let mut p = pool(&mut r)?;
+            p.point_port = point_port;
+            Msg::Pool(p)
+        }
         B_COPIES if m.len() == 6 => Msg::Copies { members: r.u8()?, window_us: r.u32()? },
         B_DEMAND if m.len() == 5 => Msg::Demand { hold_ms: r.u32()? },
         B_CLIENTS if m.len() == 1 => Msg::Clients,
@@ -231,7 +239,7 @@ fn pool<'a>(r: &mut Rd<'a>) -> Option<Pool<'a>> {
     let ip: [u8; 4] = r.take(4)?.try_into().ok()?;
     let exit = std::net::SocketAddrV4::new(ip.into(), r.u16()?);
     let text = |b: &'a [u8]| std::str::from_utf8(b).ok();
-    let mut p = Pool { id, form, members, dead_ms, ports, exit, sni: "", key: "", cronet: "", roots: "" };
+    let mut p = Pool { id, form, members, dead_ms, ports, exit, point_port: 0, sni: "", key: "", cronet: "", roots: "" };
     match form {
         POOL_PLAIN if r.at == r.p.len() => {}
         POOL_CHROMIUM => {
@@ -342,9 +350,14 @@ pub fn put_hello(out: &mut [u8], pid: u32) -> usize {
     7
 }
 
-pub fn put_member(out: &mut [u8], wire: u8, index: u8, up: bool, why: u8) -> usize {
+pub fn put_member(out: &mut [u8], wire: u8, index: u8, up: bool, why: u8, point: Option<std::net::Ipv4Addr>) -> usize {
     out[..5].copy_from_slice(&[P_MEMBER, wire, index, up as u8, why]);
-    5
+    if let Some(point) = point {
+        out[5..9].copy_from_slice(&point.octets());
+        9
+    } else {
+        5
+    }
 }
 
 /// The counters of the brain's minute line that ticks do not carry
@@ -586,6 +599,11 @@ mod tests {
             _ => panic!("not a pool"),
         }
         assert!(parse(&m[..20]).is_none(), "a torn pool");
+        let via = unhex(&format!("150508{}", &POOL_PLAIN_GOLDEN[2..]));
+        match parse(&via) {
+            Some(Msg::Pool(p)) => assert_eq!((p.exit.port(), p.point_port), (20446, 2053)),
+            _ => panic!("not a pool through a point"),
+        }
         let mut plain = unhex(POOL_PLAIN_GOLDEN);
         plain.push(0);
         assert!(parse(&plain).is_none(), "a plain pool carries nothing after its exit");

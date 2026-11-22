@@ -8,7 +8,7 @@
 use std::os::fd::OwnedFd;
 
 use hikkari_sys as sys;
-use hikkari_trunk::ports::{self, Book};
+use hikkari_trunk::ports::Book;
 
 use super::death::Down;
 use super::tcp::TcpListen;
@@ -70,7 +70,7 @@ impl Pipe {
         };
         let now = sys::now_ns();
         if p.ports != self.ports_range {
-            let book = Book::new(p.ports.0, p.ports.1, ports::DEAD_FOR_NS).map_err(|e| format!("pool {id}: {e}"))?;
+            let book = Book::new(p.ports.0, p.ports.1, 0).map_err(|e| format!("pool {id}: {e}"))?;
             self.all_links_down(now);
             self.ports = book;
             self.ports_range = p.ports;
@@ -84,6 +84,7 @@ impl Pipe {
         let Some(wi) = self.swires.iter().position(|w| w.id == id && w.sess == sess) else {
             let mut w = StreamWire::new(id, reach, members, stall_ns);
             w.sess = sess;
+            w.point_port = p.point_port;
             w.set_copies(self.pool_copies.0, self.pool_copies.1);
             let wi = match self.swires.iter().position(|w| w.sess == crate::link::NO_SESSION) {
                 Some(i) => {
@@ -102,7 +103,7 @@ impl Pipe {
             return Ok(());
         };
         self.swires[wi].stall_ns = stall_ns;
-        if self.swires[wi].links.len() == members && same_reach(&self.swires[wi].reach, &reach) {
+        if self.swires[wi].links.len() == members && self.swires[wi].point_port == p.point_port && same_reach(&self.swires[wi].reach, &reach) {
             return Ok(());
         }
         for li in 0..self.swires[wi].links.len() {
@@ -112,6 +113,7 @@ impl Pipe {
         }
         let w = &mut self.swires[wi];
         w.reach = reach;
+        w.point_port = p.point_port;
         w.links.truncate(members);
         while w.links.len() < members {
             w.links.push(Link::new());
