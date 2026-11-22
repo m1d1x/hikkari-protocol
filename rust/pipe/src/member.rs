@@ -331,6 +331,8 @@ pub struct Wire {
     pub exit: Option<SocketAddrV4>,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
+    /// When the wire first answered after common silence.
+    pub resumed: u64,
     /// The Chromium QUIC wire: its members are tunnels the pipe opens
     /// itself (h3.rs), never the brain's sockets.
     pub h3: bool,
@@ -357,6 +359,7 @@ impl Wire {
             members: Vec::new(),
             exit: None,
             proof: 0,
+            resumed: 0,
             h3: false,
             rr: 0,
             points: 0,
@@ -371,6 +374,28 @@ impl Wire {
     pub fn any_up(&self) -> bool {
         self.members.iter().any(|m| m.h.up)
     }
+}
+
+/// With several paths to one core, progress on a different transport
+/// cannot establish that this wire's connections are passing packets.
+pub fn point_health_judge(
+    points: u8, proof: u64, resumed: u64, mut judge: hikkari_trunk::health::Judge,
+) -> hikkari_trunk::health::Judge {
+    if points > 1 {
+        judge.proof = proof;
+        judge.quiet = 3_000_000_000;
+        judge.resumed = judge.resumed.max(resumed);
+    }
+    judge
+}
+
+/// The first answer after common silence starts a fresh stall interval for
+/// the other members, so the first pong cannot bury its peers.
+pub fn point_proof(points: u8, proof: &mut u64, resumed: &mut u64, now: u64) {
+    if points > 1 && *proof != 0 && now.saturating_sub(*proof) >= hikkari_trunk::health::QUIET {
+        *resumed = now;
+    }
+    *proof = now;
 }
 
 /// A member's socket to the exit, bound by the pipe (no brain).
