@@ -112,6 +112,7 @@ impl Pipe {
         }
         let w = &mut self.swires[wi];
         w.reach = reach;
+        w.point_reaches.clear();
         w.links.truncate(members);
         while w.links.len() < members {
             w.links.push(Link::new());

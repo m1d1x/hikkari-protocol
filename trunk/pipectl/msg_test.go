@@ -218,6 +218,20 @@ func TestReceiversGolden(t *testing.T) {
 	if _, err := putPoints([]netip.Addr{netip.MustParseAddr("::1")}); err == nil {
 		t.Fatal("an IPv6 point taken")
 	}
+	// namedPointsGolden (rust/pipe/src/ctl.rs NAMED_POINTS_GOLDEN): 10.0.0.1
+	// under p1.example.com, 10.0.0.2 under the core's own name.
+	named := []BorderPoint{{IP: netip.MustParseAddr("10.0.0.1"), SNI: "p1.example.com"}, {IP: netip.MustParseAddr("10.0.0.2")}}
+	if b, ips, err := putBorderPoints(named); err != nil || hex.EncodeToString(b) != "15020a0000010e70312e6578616d706c652e636f6d0a00000200" || len(ips) != 2 {
+		t.Fatalf("named points %x %v", b, err)
+	}
+	if b, _, err := putBorderPoints([]BorderPoint{{IP: netip.MustParseAddr("10.0.0.1")}, {IP: netip.MustParseAddr("10.0.0.2")}}); err != nil || hex.EncodeToString(b) != "14020a0000010a000002" {
+		t.Fatalf("points without names go as before: %x %v", b, err)
+	}
+	for _, bad := range []string{"P1.example.com", "nodot", "10.0.0.9", "-a.example.com", "a..example.com"} {
+		if _, _, err := putBorderPoints([]BorderPoint{{IP: netip.MustParseAddr("10.0.0.1"), SNI: bad}}); err == nil {
+			t.Fatalf("a point named %q taken", bad)
+		}
+	}
 	m, _ := hex.DecodeString("8a0001010a0000020203060578000000000808ffffffff")
 	r, err := parseReceivers(m)
 	if err != nil {

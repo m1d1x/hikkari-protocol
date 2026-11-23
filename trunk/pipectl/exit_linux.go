@@ -45,6 +45,8 @@ type ExitWire struct {
 	// CertFile and KeyFile are the QUIC wire's TLS certificate chain and
 	// key (PEM), which the exit reads; the UDP wire has none.
 	CertFile, KeyFile string
+	// PointTLS restricts H3 names to their forwarding addresses.
+	PointTLS *ExitPointTLS
 	// Stall is how long a member may owe an answer while another member of
 	// its session proves the entry alive (the pipe adds the ping interval
 	// and raises it to 4 × the member's smoothed RTT); Quiet how long every

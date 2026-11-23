@@ -48,7 +48,7 @@ pub enum Msg<'a> {
     /// keys (udpwire.Key or h3dgram.Token of each trunk key: the exit never
     /// sees a trunk key); `cert` and `key` are the QUIC wire's files, empty
     /// for the UDP wire.
-    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, quiet_ms: u32, keys: &'a [u8], cert: &'a [u8], key: &'a [u8] },
+    Wire { id: u8, form: u8, glue_us: u32, glue_max: u16, dead_ms: u16, quiet_ms: u32, keys: &'a [u8], cert: &'a [u8], key: &'a [u8], tls: Option<PointTls<'a>> },
     /// The loopback ports open to the trunk (trunk Local.DialFlow and
     /// DialStream refuse the others); the set replaces the one before.
     Ports { ports: &'a [u8] },
@@ -76,6 +76,19 @@ pub enum Msg<'a> {
     Mark { kind: u8, session: [u8; 16], stream: u32, id: u64 },
 }
 
+pub struct PointTls<'a> {
+    pub core_name: &'a str,
+    pub legacy: bool,
+    pub points: Vec<PointCert<'a>>,
+}
+
+pub struct PointCert<'a> {
+    pub ip: std::net::Ipv4Addr,
+    pub name: &'a str,
+    pub cert: &'a str,
+    pub key: &'a str,
+}
+
 struct Rd<'a> {
     p: &'a [u8],
     at: usize,
@@ -98,6 +111,33 @@ impl<'a> Rd<'a> {
     }
     fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn name(&mut self) -> Option<&'a str> {
+        let n = self.u8()? as usize;
+        std::str::from_utf8(self.take(n)?).ok().filter(|s| !s.is_empty())
+    }
+    fn path(&mut self) -> Option<&'a str> {
+        let n = self.u16()? as usize;
+        std::str::from_utf8(self.take(n)?).ok().filter(|s| !s.is_empty())
+    }
+
+    fn point_tls(&mut self) -> Option<PointTls<'a>> {
+        let legacy = match self.u8()? { 0 => false, 1 => true, _ => return None };
+        let n = self.u8()? as usize;
+        if !(1..=8).contains(&n) {
+            return None;
+        }
+        let core_name = self.name()?;
+        let mut points = Vec::<PointCert>::with_capacity(n);
+        for _ in 0..n {
+            let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(self.take(4)?).ok()?);
+            let name = self.name()?;
+            if name == core_name || points.iter().any(|p| p.ip == ip || p.name == name) {
+                return None;
+            }
+            points.push(PointCert { ip, name, cert: self.path()?, key: self.path()? });
+        }
+        Some(PointTls { core_name, legacy, points })
     }
 }
 
@@ -124,7 +164,8 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
             if form == FORM_H3DGRAM && (cert.is_empty() || key.is_empty()) {
                 return None;
             }
-            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key }
+            let tls = if form == FORM_H3DGRAM && r.at != m.len() { Some(r.point_tls()?) } else { None };
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key, tls }
         }
         B_PORTS => {
             let n = r.u16()? as usize;
@@ -368,6 +409,10 @@ mod tests {
     /// trunk/pipectl exitmsg_test.go exitH3WireGolden: wire 6, one token
     /// (0xcc), the files /c.pem and /k.pem.
     const H3_WIRE_GOLDEN: &str = "030602e8030000b0042c013075000001cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc06002f632e70656d06002f6b2e70656d";
+    /// trunk/pipectl exitmsg_test.go exitPointTLSGolden: core.example.com
+    /// taken during the transition, 10.0.0.1 under p1.example.com with
+    /// /p.pem and /q.pem.
+    const POINT_TLS_GOLDEN: &str = "010110636f72652e6578616d706c652e636f6d0a0000010e70312e6578616d706c652e636f6d06002f702e70656d06002f712e70656d";
 
     /// trunk/pipectl exitmsg_test.go exitObservedGolden, exitLocalGolden,
     /// exitMarkGolden: a stream's report at its mark (id 0x1122334455667788,
@@ -403,7 +448,7 @@ mod tests {
     fn messages_match_the_go_side() {
         let wire = unhex(WIRE_GOLDEN);
         match parse(&wire) {
-            Some(Msg::Wire { id: 2, form: FORM_UDP, glue_us: 1000, glue_max: 1200, dead_ms: 300, quiet_ms: 30000, keys, cert: b"", key: b"" }) => {
+            Some(Msg::Wire { id: 2, form: FORM_UDP, glue_us: 1000, glue_max: 1200, dead_ms: 300, quiet_ms: 30000, keys, cert: b"", key: b"", tls: None }) => {
                 assert_eq!(keys.len(), 64);
                 assert_eq!((keys[0], keys[32]), (0xaa, 0xbb));
             }
@@ -418,6 +463,16 @@ mod tests {
             _ => panic!("h3dgram wire"),
         }
         assert!(parse(&h3[..h3.len() - 1]).is_none(), "a key file's path torn short");
+        let named = unhex(&format!("{H3_WIRE_GOLDEN}{POINT_TLS_GOLDEN}"));
+        match parse(&named) {
+            Some(Msg::Wire { id: 6, tls: Some(t), .. }) => {
+                assert_eq!((t.core_name, t.legacy, t.points.len()), ("core.example.com", true, 1));
+                let p = &t.points[0];
+                assert_eq!((p.ip, p.name, p.cert, p.key), ("10.0.0.1".parse().unwrap(), "p1.example.com", "/p.pem", "/q.pem"));
+            }
+            _ => panic!("h3dgram wire with point names"),
+        }
+        assert!(parse(&named[..named.len() - 1]).is_none(), "point names torn short");
         let ports = [B_PORTS, 2, 0, 0xfb, 0x20, 0x50, 0x00];
         match parse(&ports) {
             Some(Msg::Ports { ports }) => assert_eq!((port_at(ports, 0), port_at(ports, 1)), (8443, 80)),

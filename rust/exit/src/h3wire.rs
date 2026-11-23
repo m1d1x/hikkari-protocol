@@ -174,10 +174,12 @@ pub struct Down {
     pub limited: usize,
 }
 
+mod tls;
+
 pub struct H3Wire {
     sock: UdpSocket,
     local: SocketAddr,
-    config: quiche::Config,
+    config: tls::Configs,
     h3c: h3::Config,
     tokens: Vec<[u8; TOKEN]>,
     conns: Vec<Option<Conn>>,
@@ -195,14 +197,7 @@ pub struct H3Wire {
     pub n: Counts,
 }
 
-impl H3Wire {
-    /// The wire on `sock` with the certificate and key in PEM files and the
-    /// tokens of its trunk keys (h3dgram::token).
-    pub fn new(sock: UdpSocket, cert: &str, key: &str, tokens: Vec<[u8; TOKEN]>) -> Result<H3Wire, String> {
-        let local = sock.local_addr().map_err(|e| format!("h3dgram: the socket: {e}"))?;
-        let mut c = quiche::Config::new(quiche::PROTOCOL_VERSION).map_err(|e| format!("h3dgram: QUIC: {e}"))?;
-        c.load_cert_chain_from_pem_file(cert).map_err(|e| format!("h3dgram: certificate {cert}: {e}"))?;
-        c.load_priv_key_from_pem_file(key).map_err(|e| format!("h3dgram: key {key}: {e}"))?;
+fn configure(mut c: quiche::Config) -> Result<quiche::Config, String> {
         c.set_application_protos(h3::APPLICATION_PROTOCOL).map_err(|e| format!("h3dgram: ALPN: {e}"))?;
         c.set_max_idle_timeout(IDLE_MS);
         c.set_max_recv_udp_payload_size(PKT);
@@ -218,12 +213,20 @@ impl H3Wire {
         c.set_cc_algorithm(quiche::CongestionControlAlgorithm::CongestionWindowUnchecked);
         c.set_unchecked_congestion_window(WINDOW);
         c.enable_pacing(false);
+        Ok(c)
+}
+
+impl H3Wire {
+    /// The wire on `sock` with the configured TLS identities and trunk tokens.
+    pub fn new(sock: UdpSocket, cert: &str, key: &str, tokens: Vec<[u8; TOKEN]>, points: Option<crate::ctl::PointTls<'_>>) -> Result<H3Wire, String> {
+        let local = sock.local_addr().map_err(|e| format!("h3dgram: the socket: {e}"))?;
+        let config = tls::Configs::new(cert, key, points)?;
         let mut h3c = h3::Config::new().map_err(|e| format!("h3dgram: HTTP/3: {e}"))?;
         h3c.enable_extended_connect(true);
         Ok(H3Wire {
             sock,
             local,
-            config: c,
+            config,
             h3c,
             tokens,
             conns: Vec::new(),
@@ -300,8 +303,9 @@ impl H3Wire {
         sys::urandom(&mut id);
         id[0] = id[1] ^ self.gen;
         let scid = quiche::ConnectionId::from_ref(&id);
-        let peer = SocketAddr::V4(addr_of(&from));
-        let q = quiche::accept_with_buf_factory::<Bufs>(&scid, None, self.local, peer, &mut self.config).ok()?;
+        let peer = addr_of(&from);
+        let config = self.config.for_peer(*peer.ip())?;
+        let q = quiche::accept_with_buf_factory::<Bufs>(&scid, None, self.local, SocketAddr::V4(peer), config).ok()?;
         let keys = [cid_key(&id)?, cid_key(&hdr.dcid)?];
         let ci = self.free.pop().unwrap_or_else(|| {
             self.conns.push(None);

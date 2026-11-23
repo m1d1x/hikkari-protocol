@@ -13,6 +13,7 @@ package pipectl
 import (
 	"net"
 	"net/netip"
+	"slices"
 )
 
 // SetPoints gives the active receiver's border points, its own address
@@ -22,22 +23,35 @@ import (
 // bare UDP wires' anew), the others stay as they are. A move to another
 // receiver (SetActive) drops them.
 func (p *Pipe) SetPoints(ips []netip.Addr) error {
-	b, err := putPoints(ips)
+	points := make([]BorderPoint, len(ips))
+	for i, ip := range ips {
+		points[i].IP = ip
+	}
+	return p.SetBorderPoints(points)
+}
+
+// SetBorderPoints configures the addresses and TLS names in the same message.
+func (p *Pipe) SetBorderPoints(points []BorderPoint) error {
+	b, ips, err := putBorderPoints(points)
 	if err != nil {
 		return err
 	}
 	p.mu.Lock()
-	p.points = append([]netip.Addr(nil), ips...)
+	if err := p.send(b); err != nil {
+		p.mu.Unlock()
+		return err
+	}
+	changed := !slices.Equal(p.points, ips)
+	p.points = ips
 	var udp []Wire
-	for _, wc := range p.wires {
-		if wc.w.H3 == nil {
-			udp = append(udp, wc.w)
+	if changed {
+		for _, wc := range p.wires {
+			if wc.w.H3 == nil {
+				udp = append(udp, wc.w)
+			}
 		}
 	}
 	p.mu.Unlock()
-	if err := p.send(b); err != nil {
-		return err
-	}
 	for _, w := range udp {
 		if err := p.SetWire(w); err != nil {
 			return err

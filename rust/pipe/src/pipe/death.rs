@@ -200,12 +200,28 @@ impl Pipe {
     /// as a failed one.
     pub(super) fn redial(&mut self, wi: usize, li: usize, now: u64) {
         let rx = self.sessions[self.swires[wi].sess as usize].rx;
-        let to = super::points::point(self.points_of(rx), li);
-        let Pipe { swires, ports, sessions, dirty, .. } = self;
+        let active_rx = self.sessions[self.cur as usize].rx;
+        let Pipe { swires, ports, sessions, dirty, points, .. } = self;
+        let point = if rx == active_rx { super::points::endpoint(points, li) } else { None };
+        let to = point.map(|p| p.ip);
         let w = &mut swires[wi];
+        let reach = match (&w.reach, point.filter(|p| !p.sni.is_empty())) {
+            (crate::link::Reach::Chromium(engine), Some(p)) => {
+                let at = w.point_reaches.iter().position(|(known, _)| known == p).unwrap_or_else(|| {
+                    let f = engine.form();
+                    let addr = super::points::at(f.exit, to);
+                    let form = hikkari_cronet::Form::new(addr, &p.sni, &f.key, f.roots.clone())
+                        .expect("a validated point and a configured Chromium pool");
+                    w.point_reaches.push((p.clone(), crate::link::Reach::Chromium(hikkari_cronet::Engine::new(form))));
+                    w.point_reaches.len() - 1
+                });
+                &w.point_reaches[at].1
+            }
+            _ => &w.reach,
+        };
         let l = &mut w.links[li];
         *dirty = true;
-        match l.dial(&w.reach, to, &sessions[w.sess as usize].id, ports, now) {
+        match l.dial(reach, to, &sessions[w.sess as usize].id, ports, now) {
             Dialed::Begun => {}
             Dialed::NoPort => {
                 let (dead, _) = ports.counts(now);

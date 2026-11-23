@@ -156,7 +156,7 @@ pub struct Pipe {
     /// The receivers on standby (session.rs): the brain's B_RECEIVER.
     receivers: Vec<Receiver>,
     /// The active receiver's border points, the brain's B_POINTS (points.rs).
-    points: Vec<std::net::Ipv4Addr>,
+    points: Vec<crate::ctl::BorderPoint>,
     drains: u32,
     /// The exits' epochs the members' hellos said this turn, by session
     /// (session.rs saw_epochs).

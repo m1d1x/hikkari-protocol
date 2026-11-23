@@ -31,6 +31,7 @@ use hikkari_trunk::ports::{self, Book};
 
 use super::{timers, Event, Pipe};
 use crate::ctl;
+use crate::ctl::BorderPoint;
 use crate::member::Wire;
 
 /// How long a tunnel's socket may wait in the hand. Chromium dials when the
@@ -76,12 +77,12 @@ pub(super) struct H3 {
     pub rx: u8,
     pub form: Form,
     auth: String,
-    starting: Option<Starting>,
-    engine: Option<Arc<TunnelEngine>>,
+    core: EngineSlot,
+    points: Vec<(BorderPoint, EngineSlot)>,
     book: Book,
     /// The member whose socket waits in the hand: its session, its index,
     /// since when.
-    dialing: Option<(u8, usize, u64)>,
+    dialing: Option<(u8, usize, u64, Arc<TunnelEngine>)>,
     /// Numbers the members' isolation keys: every tunnel a QUIC session of
     /// its own, never one shared with another member.
     keys: u64,
@@ -91,17 +92,53 @@ pub(super) struct H3 {
     pub failed: u64,
 }
 
+#[derive(Default)]
+struct EngineSlot {
+    started: bool,
+    starting: Option<Starting>,
+    engine: Option<Arc<TunnelEngine>>,
+}
+
+impl EngineSlot {
+    fn ready(&mut self, form: &Form, point: Option<&BorderPoint>, id: u8) -> Option<Arc<TunnelEngine>> {
+        if !self.started {
+            let (addr, sni) = point.map_or((form.exit, form.sni.as_str()), |p| {
+                (super::points::at(form.exit, Some(p.ip)), p.sni.as_str())
+            });
+            let proxy = Proxy { sni: sni.to_owned(), addr, roots: form.roots.clone() };
+            self.starting = Some(TunnelEngine::start_off_loop(proxy, true));
+            self.started = true;
+        }
+        if let Some(s) = &self.starting {
+            match s.ready() {
+                None => return None,
+                Some(Ok(e)) => self.engine = Some(e),
+                Some(Err(e)) => eprintln!("hk-pipe: wire {id}: {e}"),
+            }
+            self.starting = None;
+        }
+        self.engine.clone()
+    }
+}
+
+impl Drop for EngineSlot {
+    fn drop(&mut self) {
+        if let Some(e) = self.engine.take() {
+            hikkari_cronet::let_go(e);
+        }
+    }
+}
+
 impl H3 {
     /// A wire's engine starting (off the loop) for form f.
     pub fn new(id: u8, rx: u8, f: Form) -> Result<H3, String> {
         let book = Book::new(f.ports.0, f.ports.1, ports::DEAD_FOR_NS).map_err(|e| format!("wire {id}: {e}"))?;
-        let proxy = Proxy { sni: f.sni.clone(), addr: f.exit, roots: f.roots.clone() };
         Ok(H3 {
             id,
             rx,
             auth: h3dgram::authorization(&f.token),
-            starting: Some(TunnelEngine::start_off_loop(proxy, true)),
-            engine: None,
+            core: EngineSlot::default(),
+            points: Vec::new(),
             book,
             dialing: None,
             keys: 0,
@@ -114,29 +151,39 @@ impl H3 {
 
     /// The engine once up; a start that failed is said once, and the wire
     /// carries nothing.
-    fn engine(&mut self) -> Option<Arc<TunnelEngine>> {
-        if let Some(s) = &self.starting {
-            match s.ready() {
-                None => return None,
-                Some(Ok(e)) => self.engine = Some(e),
-                Some(Err(e)) => eprintln!("hk-pipe: wire {}: {e}", self.id),
-            }
-            self.starting = None;
-        }
-        self.engine.clone()
+    fn engine(&mut self, point: Option<&BorderPoint>) -> Option<Arc<TunnelEngine>> {
+        let Some(p) = point.filter(|p| !p.sni.is_empty()) else {
+            return self.core.ready(&self.form, None, self.id);
+        };
+        let i = self.points.iter().position(|(known, _)| known == p).unwrap_or_else(|| {
+            self.points.push((p.clone(), EngineSlot::default()));
+            self.points.len() - 1
+        });
+        self.points[i].1.ready(&self.form, Some(p), self.id)
+    }
+
+    pub fn keep_points(&mut self, points: &[BorderPoint]) {
+        self.points.retain(|(p, _)| points.contains(p));
     }
 
     /// Member mi of session sess let go alive (points.rs: its point
     /// changed): its port free again, and its socket taken back from the
     /// engine's hand if Chromium has not taken it yet.
     pub fn let_go(&mut self, sess: u8, mi: usize, port: u16) {
-        if self.dialing.is_some_and(|(s, i, _)| s == sess && i == mi) {
-            if let Some(x) = self.engine.as_ref().and_then(|e| e.hand()) {
-                x.take_back();
+        self.cancel_dial(sess, mi);
+        self.give_back(port, false, 0);
+    }
+
+    fn cancel_dial(&mut self, sess: u8, mi: usize) {
+        if let Some((s, i, _, engine)) = &self.dialing {
+            if *s != sess || *i != mi {
+                return;
+            }
+            if let Some(hand) = engine.hand() {
+                hand.take_back();
             }
             self.dialing = None;
         }
-        self.give_back(port, false, 0);
     }
 
     /// The port of a member gone back to the book: resting if it died,
@@ -192,14 +239,6 @@ impl H3 {
     }
 }
 
-impl Drop for H3 {
-    fn drop(&mut self) {
-        if let Some(e) = self.engine.take() {
-            hikkari_cronet::let_go(e);
-        }
-    }
-}
-
 /// A UDP socket from `port`, connected to the exit, with its local address.
 fn bind_to(port: u16, exit: SocketAddrV4) -> std::io::Result<(OwnedFd, SocketAddrV4)> {
     let s = UdpSocket::bind(SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, port))?;
@@ -224,9 +263,9 @@ impl Pipe {
         let Pipe { h3s, wires, events, dirty, points, .. } = self;
         let mut next = u64::MAX;
         for h in h3s.iter_mut() {
-            let engine = h.engine();
-            if let Some((s, mi, since)) = h.dialing {
-                let hand = engine.as_ref().and_then(|e| e.hand());
+            if let Some((s, mi, since, engine)) = &h.dialing {
+                let (s, mi, since) = (*s, *mi, *since);
+                let hand = engine.hand();
                 if hand.is_none_or(|x| x.taken()) {
                     h.dialing = None;
                 } else if now - since >= DIAL_WAIT_NS {
@@ -250,13 +289,17 @@ impl Pipe {
                 if h.dialing.is_some() || renews & (1 << w.sess) == 0 {
                     continue;
                 }
-                let Some(e) = &engine else { continue };
-                let Some(mi) = w.members.iter().position(|m| m.tun.is_none() && m.renew_at == 0) else { continue };
-                let to = if rx == active_rx { super::points::point(points, mi) } else { None };
-                match h.open(e, to, now) {
+                let Some((mi, to, e)) = w.members.iter().enumerate().find_map(|(mi, m)| {
+                    if m.tun.is_some() || m.renew_at != 0 {
+                        return None;
+                    }
+                    let p = if rx == active_rx { super::points::endpoint(points, mi) } else { None };
+                    h.engine(p).map(|e| (mi, p.map(|p| p.ip), e))
+                }) else { continue };
+                match h.open(&e, to, now) {
                     Ok((t, port)) => {
                         w.members[mi].set_tunnel(Some(t), port);
-                        h.dialing = Some((w.sess, mi, now));
+                        h.dialing = Some((w.sess, mi, now, e));
                         *dirty = true;
                     }
                     Err(err) => {
@@ -266,7 +309,7 @@ impl Pipe {
                     }
                 }
             }
-            if h.dialing.is_some() || h.starting.is_some() {
+            if h.dialing.is_some() || h.core.starting.is_some() || h.points.iter().any(|(_, e)| e.starting.is_some()) {
                 next = next.min(now + timers::CLOCK);
             }
         }
@@ -290,9 +333,7 @@ fn closed_tunnels(h: &mut H3, w: &mut Wire, cur: u8, brains: bool, events: &mut 
             events.push(Event { wire: w.id, index: mi as u8, up: false, why: ctl::WHY_GONE });
         }
         eprintln!("hk-pipe: wire {} member {mi}: the tunnel closed (net error {err})", w.id);
-        if h.dialing.is_some_and(|(s, i, _)| s == w.sess && i == mi) {
-            h.dialing = None;
-        }
+        h.cancel_dial(w.sess, mi);
         h.give_back(m.port, true, now);
         m.set_tunnel(None, 0);
         m.renew_at = now + spread();
