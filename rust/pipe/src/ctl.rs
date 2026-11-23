@@ -7,7 +7,7 @@
 
 use crate::route::Route;
 
-pub const VERSION: u16 = 11;
+pub const VERSION: u16 = 12;
 
 // Brain → pipe.
 pub const B_HELLO: u8 = 0x01; // ver u16
@@ -31,6 +31,7 @@ pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything fr
 pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
 pub const B_POINTS: u8 = 0x14; // n u8 + n × ip [4]: the active receiver's border points, member i of every wire to point i mod n (spec/trunk.md, "Border points"); n 0: none
 pub const B_NAMED_POINTS: u8 = 0x15; // n u8 + n × (ip [4], name length u8, name bytes)
+pub const B_STREAM_WINDOW: u8 = 0x16; // kib u32: the window this end gives every stream it receives from now (hikkari_trunk::stream::Recv::with_window)
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -99,6 +100,7 @@ pub enum Msg<'a> {
     /// The border points' addresses, n × ip [4] (points reads them).
     Points(&'a [u8]),
     NamedPoints(Vec<BorderPoint>),
+    StreamWindow { kib: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +205,7 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         B_POOL => Msg::Pool(pool(&mut r)?),
         B_COPIES if m.len() == 6 => Msg::Copies { members: r.u8()?, window_us: r.u32()? },
         B_DEMAND if m.len() == 5 => Msg::Demand { hold_ms: r.u32()? },
+        B_STREAM_WINDOW if m.len() == 5 => Msg::StreamWindow { kib: r.u32()? },
         B_CLIENTS if m.len() == 1 => Msg::Clients,
         B_STATS if m.len() == 1 => Msg::Stats,
         B_RECEIVER if m.len() == 7 => {
@@ -569,6 +572,8 @@ mod tests {
     const POINTS_GOLDEN: &str = "14020a0000010a000002";
     /// trunk/pipectl msg_test.go namedPointsGolden: 10.0.0.1 under
     /// p1.example.com, 10.0.0.2 under the core's own name.
+    /// trunk/pipectl msg_test.go streamWindowGolden: 16 MiB.
+    const STREAM_WINDOW_GOLDEN: &str = "1600400000";
     const NAMED_POINTS_GOLDEN: &str = "15020a0000010e70312e6578616d706c652e636f6d0a00000200";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     /// trunk/pipectl msg_test.go TestPointTicksGolden: 10.0.0.1 with 6
@@ -643,6 +648,8 @@ mod tests {
         assert!(parse(&unhex(COPIES_GOLDEN)[..5]).is_none(), "a torn B_COPIES");
         assert!(matches!(parse(&unhex(DEMAND_GOLDEN)), Some(Msg::Demand { hold_ms: 300_000 })));
         assert!(parse(&unhex(DEMAND_GOLDEN)[..4]).is_none(), "a torn B_DEMAND");
+        assert!(matches!(parse(&unhex(STREAM_WINDOW_GOLDEN)), Some(Msg::StreamWindow { kib: 16384 })));
+        assert!(parse(&unhex(STREAM_WINDOW_GOLDEN)[..4]).is_none(), "a torn B_STREAM_WINDOW");
     }
 
     #[test]

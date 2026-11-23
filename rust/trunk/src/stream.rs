@@ -15,8 +15,14 @@ use crate::frame::{ACK_FIN, F_DATA, F_FIN, F_OPEN, NO_GOT};
 /// A data frame's bytes, at most (trunk DefaultChunk).
 pub const CHUNK: usize = 16 << 10;
 /// How far past what it wrote a receiver lets the sender go (trunk
-/// DefaultWindow).
+/// DefaultWindow): the window every receiver gives at least, and so the
+/// credit a sender takes before the first ack. A receiver may give more
+/// (Recv::with_window, spec/trunk.md "Streams"); the sender only follows
+/// the credit it is told.
 pub const WINDOW: u64 = 2 << 20;
+/// The largest window a receiver gives: what it may hold for one stream past
+/// a hole, and what one stream may keep unconfirmed at the sender.
+pub const WINDOW_MAX: u64 = 64 << 20;
 /// Unconfirmed chunk bytes one member carries, at most (trunk
 /// DefaultInflight); a member owing nothing takes a chunk whatever its size.
 pub const INFLIGHT: usize = 256 << 10;
@@ -235,20 +241,38 @@ pub struct Recv {
     pub fin_at: Option<u64>,
     /// The credit last told.
     pub advertise: u64,
+    /// How far past what it wrote it lets the sender go: WINDOW to
+    /// WINDOW_MAX.
+    window: u64,
     ahead: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Default for Recv {
     fn default() -> Recv {
-        Recv { received: 0, written: 0, fin_at: None, advertise: WINDOW, ahead: BTreeMap::new() }
+        Recv::with_window(WINDOW)
     }
 }
 
 impl Recv {
+    /// A receiving half that gives `window` (clamped to WINDOW..=WINDOW_MAX):
+    /// one stream's bytes in flight to it, so its speed is at most the window
+    /// over the time a chunk takes to be confirmed (23.11: 2 MiB over the
+    /// ~190 ms of a cascade's loop held a person at 85-120 Mbit/s).
+    pub fn with_window(window: u64) -> Recv {
+        let window = window.clamp(WINDOW, WINDOW_MAX);
+        Recv { received: 0, written: 0, fin_at: None, advertise: WINDOW, window, ahead: BTreeMap::new() }
+    }
+
     /// A receiving half that has `off` bytes, all written on: a stream an
-    /// older process handed over.
-    pub fn at(off: u64) -> Recv {
-        Recv { received: off, written: off, advertise: off + WINDOW, ..Recv::default() }
+    /// older process handed over. The credit it told there is not known, so
+    /// it tells no less than WINDOW past them.
+    pub fn at(off: u64, window: u64) -> Recv {
+        Recv { received: off, written: off, advertise: off + WINDOW, ..Recv::with_window(window) }
+    }
+
+    /// The window it gives.
+    pub fn window(&self) -> u64 {
+        self.window
     }
 
     /// No chunk past a hole is kept.
@@ -267,7 +291,7 @@ impl Recv {
             return off; // a copy of what is here
         }
         if off > self.received {
-            if off < self.written + WINDOW + CHUNK as u64 {
+            if off < self.written + self.window + CHUNK as u64 {
                 self.ahead.insert(off, p.to_vec());
                 return off;
             }
@@ -303,7 +327,7 @@ impl Recv {
     /// What an ack says now (trunk ackGotLocked): received, the credit (and
     /// the credit is then told), the flags.
     pub fn ack(&mut self) -> (u64, u64, u8) {
-        self.advertise = self.written + WINDOW;
+        self.advertise = self.written + self.window;
         (self.received, self.advertise, if self.all_in() { ACK_FIN } else { 0 })
     }
 
@@ -311,7 +335,7 @@ impl Recv {
     /// by a quarter since it was last told, so an ack must tell it.
     pub fn wrote(&mut self, n: usize) -> bool {
         self.written += n as u64;
-        self.written + WINDOW >= self.advertise + WINDOW / 4
+        self.written + self.window >= self.advertise + self.window / 4
     }
 }
 
@@ -453,5 +477,24 @@ mod tests {
         let mut r = Recv::default();
         r.fin(10);
         assert_eq!(r.ack().2, 0, "the FIN is not confirmed before the bytes before it");
+    }
+
+    /// A receiver that gives more than WINDOW keeps chunks and tells credit
+    /// as far as its own window, tells it with its first write (the sender
+    /// starts at WINDOW), and never gives less than WINDOW nor more than
+    /// WINDOW_MAX.
+    #[test]
+    fn a_wider_window_is_kept_and_told_and_held_to_its_bounds() {
+        let w = 16 << 20;
+        let mut r = Recv::with_window(w);
+        let far = w + CHUNK as u64;
+        assert_eq!(r.chunk(far - 1, b"x", |_| {}), far - 1, "kept inside its own window");
+        assert_eq!(r.chunk(far, b"x", |_| unreachable!()), NO_GOT);
+        assert!(r.wrote(0), "the wider credit goes at once, past the sender's WINDOW");
+        assert_eq!(r.ack().1, w);
+        assert_eq!(Recv::with_window(1).window(), WINDOW);
+        assert_eq!(Recv::with_window(u64::MAX).window(), WINDOW_MAX);
+        let r = Recv::at(1000, w);
+        assert_eq!((r.window(), r.advertise), (w, 1000 + WINDOW), "a handed stream tells no less than it surely did");
     }
 }

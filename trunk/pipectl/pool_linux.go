@@ -77,6 +77,18 @@ func (p *Pipe) SetDemand(hold time.Duration) error {
 	return sendWith(p.conn, &p.wmu, msg)
 }
 
+// SetStreamWindow sets the window the pipe gives every stream it receives
+// from now (spec/trunk.md, "Streams"): one person's speed down through the
+// entry is at most it over the time a chunk takes to be confirmed. The
+// streams open keep theirs. No new process.
+func (p *Pipe) SetStreamWindow(bytes int) error {
+	msg, err := putStreamWindow(bytes)
+	if err != nil {
+		return err
+	}
+	return sendWith(p.conn, &p.wmu, msg)
+}
+
 // tcpListensCopy is the client ports of streams, for a reload.
 func (p *Pipe) tcpListensCopy() map[byte]*tcpListenConf {
 	p.mu.Lock()
