@@ -43,6 +43,10 @@ type DatagramOptions struct {
 	// ConnectionIDs, when set, issues the channel's connection IDs
 	// (GenerationIDs, so packets find their generation).
 	ConnectionIDs quic.ConnectionIDGenerator
+	// StatelessResetKey, when set, is the channel's stateless reset key
+	// (GroupResetKey: the group's relays reset each other's connections);
+	// random when nil.
+	StatelessResetKey *quic.StatelessResetKey
 	// Certificate serves the TLS certificate (the relay domain's, the same the
 	// Naive channel shows).
 	Certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
@@ -115,6 +119,7 @@ func ListenDatagram(ctx context.Context, opts DatagramOptions) (*Datagram, error
 		Handler:            d,
 		MasqueradeHandler:  opts.Masquerade,
 		ConnectionIDs:      opts.ConnectionIDs,
+		StatelessResetKey:  opts.StatelessResetKey,
 		Sender:             opts.Sender,
 		Ceiling: func(user any) *datagram.Ceiling {
 			key, _ := user.(string)
