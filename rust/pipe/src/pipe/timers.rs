@@ -42,7 +42,6 @@ impl Pipe {
         let active_rx = self.sessions[cur as usize].rx;
         let Pipe { wires, judge, tok, events, sessions, dirty, h3s, points, .. } = self;
         for w in wires.iter_mut() {
-            let health = crate::member::point_health_judge(w.points, w.proof, w.resumed, *judge);
             // The brain hears and renews the current session's members; the
             // members of one coming up are the pipe's own (session.rs), and
             // only the session that takes everything new and the receivers'
@@ -81,7 +80,7 @@ impl Pipe {
                     }
                     next = next.min(m.hello_at);
                 } else if clock {
-                    match m.h.tick(&health, w.stall_ns, now, tok) {
+                    match m.h.tick(judge, w.stall_ns, now, tok) {
                         Verdict::Fine => {}
                         Verdict::Ping(t) => {
                             m.frame(Class::Own, 9, w.glue_max, now, |b| frame::put_ping(b, frame::F_PING, t));

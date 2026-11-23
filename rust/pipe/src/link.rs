@@ -331,13 +331,21 @@ impl StreamWire {
     }
 
     pub fn note_proof(&mut self, now: u64) {
-        crate::member::point_proof(self.points, &mut self.proof, &mut self.resumed, now);
+        if self.points > 1 && self.proof != 0 && now - self.proof >= hikkari_trunk::health::QUIET {
+            self.resumed = now;
+        }
+        self.proof = now;
     }
 
     /// Multiple border points share one pool. Proof on UDP or QUIC does not
     /// tell whether its TCP members can make progress.
-    pub fn health_judge(&self, judge: hikkari_trunk::health::Judge) -> hikkari_trunk::health::Judge {
-        crate::member::point_health_judge(self.points, self.proof, self.resumed, judge)
+    pub fn health_judge(&self, mut judge: hikkari_trunk::health::Judge) -> hikkari_trunk::health::Judge {
+        if self.points > 1 {
+            judge.proof = self.proof;
+            judge.quiet = 3_000_000_000;
+            judge.resumed = judge.resumed.max(self.resumed);
+        }
+        judge
     }
 
     pub fn up(&self) -> usize {

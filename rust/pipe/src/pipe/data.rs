@@ -95,9 +95,6 @@ impl Pipe {
                                 }
                                 if !m.h.up {
                                     m.h.join(now);
-                                    if w.points > 1 {
-                                        crate::member::point_proof(w.points, &mut w.proof, &mut w.resumed, now);
-                                    }
                                     if sess == *cur {
                                         events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO, point: None });
                                     }
@@ -113,7 +110,7 @@ impl Pipe {
                             }
                             Frame::Pong(t) => {
                                 if m.h.pong(judge, t, now) {
-                                    crate::member::point_proof(w.points, &mut w.proof, &mut w.resumed, now);
+                                    w.proof = now;
                                 }
                             }
                             // A packet member without the streams flag carries

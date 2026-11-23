@@ -185,10 +185,10 @@ on, then to the others: a point that freezes holds one copy of it at most while 
 copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
 (its domain, its certificate): the entry's socket goes to the point, the engine names the core.
 
-With multiple points, each wire and stream pool uses its own proofs for member health and waits 3 s for common silence.
-After it first makes progress following at least 1 s without a proof, outstanding debts count from that progress, giving
-the other members their normal stall interval to answer. A live wire still replaces an individual unresponsive member
-by its usual stall rule. Broken sockets still go down immediately. The point reached by the failed TCP connection accompanies
+With multiple points, a stream pool uses its own proofs for member health and waits 3 s for common silence. After the
+pool first makes progress following at least 1 s without a proof, outstanding debts count from that progress, giving the
+other members their normal stall interval to answer. A live pool still replaces an individual unresponsive member by its
+usual stall rule. Broken sockets still go down immediately. The point reached by the failed TCP connection accompanies
 the pipe's member-down event to its brain, even if the list of points was reordered while that member was up.
 
 For a port comparison the brain can give a TCP pool a different port to dial on its points. The exit address and port

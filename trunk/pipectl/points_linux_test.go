@@ -185,14 +185,10 @@ func TestBothPointsPauseWithoutBuryingThePool(t *testing.T) {
 	t.Cleanup(cancel)
 	core, a, b, wp, pp := coreAndPoints(t, ctx)
 	downs := make(chan netip.Addr, 16)
-	var packetDowns atomic.Int32
 	p, err := Start(Config{Bin: pipeBin(t), Stderr: os.Stderr, Logf: t.Logf,
 		OnMemberEvent: func(wire trunk.WireID, index int, up bool, why byte, point netip.Addr) {
 			if wire == trunk.PoolWire && !up {
 				downs <- point
-			}
-			if wire == dgramWire && !up {
-				packetDowns.Add(1)
 			}
 		}})
 	if err != nil {
@@ -203,9 +199,7 @@ func TestBothPointsPauseWithoutBuryingThePool(t *testing.T) {
 		t.Fatal(err)
 	}
 	wires(t, p, wp, pp)
-	waitFor(t, 5*time.Second, "all TCP and UDP members up", func() bool {
-		return wireUp(p, trunk.PoolWire, 4) && wireUp(p, dgramWire, 4)
-	})
+	waitFor(t, 5*time.Second, "all TCP members up", func() bool { return wireUp(p, trunk.PoolWire, 4) })
 	s, err := net.Dial("tcp", streams0(t, p))
 	if err != nil {
 		t.Fatal(err)
@@ -214,9 +208,6 @@ func TestBothPointsPauseWithoutBuryingThePool(t *testing.T) {
 	if err := echoOpen(s, 64<<10); err != nil {
 		t.Fatal(err)
 	}
-	call := newCaller(t, voice0(t, p, 2))
-	call.call()
-	time.Sleep(200 * time.Millisecond)
 	a.freeze(2 * time.Second)
 	b.freeze(2 * time.Second)
 	at := time.Now()
@@ -224,16 +215,6 @@ func TestBothPointsPauseWithoutBuryingThePool(t *testing.T) {
 		t.Fatalf("same stream after both points froze: %v", err)
 	}
 	t.Logf("1 MiB on the same stream after a 2 s freeze: %v", time.Since(at).Round(time.Millisecond))
-	time.Sleep(200 * time.Millisecond)
-	call.hangUp()
-	sent, heard, gap := call.heard()
-	t.Logf("UDP call: %d/%d answers, longest gap %v", heard, sent, gap.Round(time.Millisecond))
-	if gap < 1800*time.Millisecond || gap > 2300*time.Millisecond {
-		t.Fatalf("a 2 s freeze left a gap of %v", gap)
-	}
-	if n := packetDowns.Load(); n != 0 {
-		t.Fatalf("%d packet members were buried during the pause", n)
-	}
 	select {
 	case pt := <-downs:
 		t.Fatalf("a member at %v was buried during the pause", pt)
