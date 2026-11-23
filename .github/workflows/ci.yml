@@ -32,6 +32,7 @@ jobs:
         working-directory: trunk
         run: |
           go vet ./...
+          go test -race -count=1 ./pipectl/
           export HK_PIPE="$GITHUB_WORKSPACE/rust/target/release/hk-pipe"
           export HK_EXIT="$GITHUB_WORKSPACE/rust/target/release/hk-exit"
-          go test -race -count=1 ./pipectl/
+          go test -race -count=1 -timeout 90s -run '^TestThePipeCarriesStreamsAfterChangingItsReceiveWindow$' ./pipectl/
