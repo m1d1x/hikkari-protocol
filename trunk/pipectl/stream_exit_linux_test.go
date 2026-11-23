@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"sync"
@@ -369,6 +370,47 @@ func TestStreamsCrossTheExitByteForByte(t *testing.T) {
 					t.Errorf("exit opened %d streams, reset %d; want 4, 0", opened, reset)
 				}
 			})
+		}
+	})
+}
+
+func TestThePipeCarriesStreamsAfterChangingItsReceiveWindow(t *testing.T) {
+	bin := pipeBin(t)
+	onEachStreamExit(t, func(t *testing.T, mk func(*testing.T, context.Context, ...uint16) *streamExit) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		echo := tcpEcho(t)
+		x := mk(t, ctx, echo)
+		p, err := Start(Config{Bin: bin, Stderr: os.Stderr, Logf: t.Logf})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer p.Close()
+		if err := p.SetPool(Pool{ID: trunk.PoolWire, Members: 4, Exit: netip.MustParseAddrPort(x.pool)}); err != nil {
+			t.Fatal(err)
+		}
+		l, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer l.Close()
+		if err := p.TCPListen(1, l, echo); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, 5*time.Second, "the pipe's pool up", func() bool { return wireUp(p, trunk.PoolWire, 4) })
+		for _, window := range []int{DefaultStreamWindow, 8 << 20, 16 << 20, DefaultStreamWindow} {
+			if err := p.SetStreamWindow(window); err != nil {
+				t.Fatal(err)
+			}
+			c, err := net.DialTimeout("tcp", l.Addr().String(), 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = echoed(c, 20<<20, nil)
+			c.Close()
+			if err != nil {
+				t.Fatalf("stream at %d MiB: %v", window>>20, err)
+			}
 		}
 	})
 }

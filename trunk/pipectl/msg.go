@@ -28,7 +28,7 @@ import (
 )
 
 // Version is the socket's version; brain and pipe say it in their hellos.
-const Version = 11
+const Version = 12
 
 // Brain → pipe.
 const (
@@ -57,8 +57,11 @@ const (
 	bDemand = 0x13 // hold_ms u32: held this long after a loss; 0: copies always
 	// points: the active receiver's border points (spec/trunk.md "Border
 	// points", rust/pipe/src/pipe/points.rs).
-	bPoints = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
+	bPoints      = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
 	bNamedPoints = 0x15 // n u8 + n × (ip [4], name length u8, name bytes)
+	// stream window: the window the pipe gives every stream it receives
+	// from now (rust/trunk/src/stream.rs Recv::with_window).
+	bStreamWindow = 0x16 // kib u32
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -217,6 +220,23 @@ func putCopies(c Copies) ([]byte, error) {
 		return nil, fmt.Errorf("pipectl: copies: %d members, window %v; want 0-255 and at most 1s", c.Members, c.Window)
 	}
 	return binary.LittleEndian.AppendUint32([]byte{bCopies, byte(c.Members)}, uint32(c.Window/time.Microsecond)), nil
+}
+
+// The stream window's bounds, as the pipe holds them: what every receiver
+// gives at least (DefaultWindow) and the most one stream may keep.
+const (
+	MinStreamWindow = DefaultStreamWindow
+	MaxStreamWindow = 64 << 20
+	// DefaultStreamWindow is the window every stream gives unless told
+	// (rust stream::WINDOW).
+	DefaultStreamWindow = trunk.DefaultWindow
+)
+
+func putStreamWindow(bytes int) ([]byte, error) {
+	if bytes < MinStreamWindow || bytes > MaxStreamWindow || bytes%1024 != 0 {
+		return nil, fmt.Errorf("pipectl: stream window %d bytes; want whole KiB from %d to %d", bytes, MinStreamWindow, MaxStreamWindow)
+	}
+	return binary.LittleEndian.AppendUint32([]byte{bStreamWindow}, uint32(bytes/1024)), nil
 }
 
 // MaxDemandHold is the longest hold of copies on demand the pipe takes.

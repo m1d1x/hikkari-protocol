@@ -105,6 +105,10 @@ impl Pipe {
                 self.flows.n.demand.set_hold(hold_ms as u64 * 1_000_000);
                 return Ok(());
             }
+            Some(Msg::StreamWindow { kib }) => {
+                self.streams.set_window(kib as u64 * 1024);
+                return Ok(());
+            }
             // The receivers (session.rs).
             Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
             Some(Msg::Active { rx }) => return self.set_active(rx),
@@ -245,7 +249,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } | Msg::Points(_) | Msg::NamedPoints(_) => {
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } | Msg::Points(_) | Msg::NamedPoints(_) | Msg::StreamWindow { .. } => {
                 unreachable!("taken above")
             }
             Msg::Member { wire, index } => {

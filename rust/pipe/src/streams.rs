@@ -15,7 +15,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 use hikkari_sys::{self as sys, Io};
 use hikkari_trunk::buf::Behind;
-use hikkari_trunk::stream::{Recv, Send};
+use hikkari_trunk::stream::{Recv, Send, WINDOW, WINDOW_MAX};
 
 use crate::flow::FxMap;
 use crate::observe::{Report, StreamObs, END_NONE, PHASE_END, PHASE_MARK};
@@ -144,6 +144,10 @@ pub struct Streams {
     /// Reports of observed streams for the brain (observe.rs), sent after
     /// the turn that made them.
     pub reports: Vec<Report>,
+    /// The window the streams it receives from now give (the brain's
+    /// B_STREAM_WINDOW): their speed down is at most it over the time a
+    /// chunk takes to be confirmed.
+    window: u64,
 }
 
 impl Streams {
@@ -158,7 +162,13 @@ impl Streams {
             n: StreamCounts::default(),
             leg: Leg::default(),
             reports: Vec::new(),
+            window: WINDOW,
         }
+    }
+
+    /// The window of the streams added from now; the streams open keep theirs.
+    pub fn set_window(&mut self, bytes: u64) {
+        self.window = bytes.clamp(WINDOW, WINDOW_MAX);
     }
 
     /// A new client connection to the exit's port, on session `sess`: its
@@ -171,7 +181,7 @@ impl Streams {
             port,
             opened: false,
             send: Send::default(),
-            recv: Recv::default(),
+            recv: Recv::with_window(self.window),
             read_done: false,
             sess,
             write_done: false,
@@ -199,7 +209,7 @@ impl Streams {
             port,
             opened: true,
             send: Send::at(up),
-            recv: Recv::at(down),
+            recv: Recv::at(down, self.window),
             read_done: false,
             sess,
             write_done: false,

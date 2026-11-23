@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  trunk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: trunk/go.mod
+          cache: false
+      - name: Install Rust and build dependencies
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component clippy
+          sudo apt-get update
+          sudo apt-get install -y cmake libclang-dev
+      - name: Rust pipe and exit
+        working-directory: rust
+        run: |
+          cargo +1.97.1 clippy --locked --release --all-targets -- -D warnings
+          cargo +1.97.1 test --locked --release
+          cargo +1.97.1 build --locked --release -p hikkari-pipe -p hikkari-exit
+      - name: Go trunk and pipe integration
+        working-directory: trunk
+        run: |
+          go vet ./...
+          go test -race -count=1 ./pipectl/
+          export HK_PIPE="$GITHUB_WORKSPACE/rust/target/release/hk-pipe"
+          export HK_EXIT="$GITHUB_WORKSPACE/rust/target/release/hk-exit"
+          go test -race -count=1 -timeout 90s -run '^TestThePipeCarriesStreamsAfterChangingItsReceiveWindow$' ./pipectl/

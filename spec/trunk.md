@@ -137,7 +137,10 @@ to the new one: a member there that says no hello carries nothing, dies by its h
 A stream is one client TCP connection to an exit loopback port, opened by the entry. Its bytes are numbered by offset; data
 frames are chunks of up to 16 KiB on any member. The receiver answers every chunk with an ack on the member it came on:
 `received` is how far it has every byte, `credit` how far the sender may send (bytes written to the local connection plus
-the window, 2 MiB), `got` the offset of the chunk this ack answers (all ones for none). A chunk is confirmed by `got` or by
+the window), `got` the offset of the chunk this ack answers (all ones for none). The window is 2 MiB unless the
+receiving end is told a wider one (2 to 64 MiB; the pipe's brain says it, `B_STREAM_WINDOW`): a sender starts at 2 MiB
+and then only follows the credit, so a wider window needs nothing of the other end. One stream carries at most its
+window over the time a chunk takes to be confirmed. A chunk is confirmed by `got` or by
 `received` passing its end. `fin` carries the final offset; the ack flag confirms it. A stream ends when both FINs are
 confirmed and written; `rst` ends it at once.
 
