@@ -52,6 +52,11 @@ type ServiceOptions struct {
 	// (server/generation.go: the relay process's generation is readable from
 	// it, so a packet finds its process across a hitless rollout).
 	ConnectionIDs quic.ConnectionIDGenerator
+	// StatelessResetKey, when set, is the key of the server's stateless
+	// resets (spec/v1.md, relay behaviour): servers sharing it reset each
+	// other's connections, so a client whose packets reach another server
+	// learns at once that its connection is gone. Random when nil.
+	StatelessResetKey *quic.StatelessResetKey
 }
 
 type ServerHandler interface {
@@ -75,6 +80,7 @@ type Service[U comparable] struct {
 	ceiling            func(user any) *Ceiling
 	onAuth             func(user any, conn *quic.Conn)
 	connectionIDs      quic.ConnectionIDGenerator
+	resetKey           *quic.StatelessResetKey
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -120,6 +126,7 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		masqueradeHandler:  options.MasqueradeHandler,
 		onAuth:             options.OnAuth,
 		connectionIDs:      options.ConnectionIDs,
+		resetKey:           options.StatelessResetKey,
 		bbrProfile:         bbrProfile,
 		sender:             sender,
 		ceiling:            options.Ceiling,
@@ -147,8 +154,8 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	}
 	obfsEnabled := s.salamanderPassword != ""
 	var listener qtls.Listener
-	if s.connectionIDs != nil {
-		listener, err = s.listenWithConnectionIDs(conn, obfsEnabled)
+	if s.connectionIDs != nil || s.resetKey != nil {
+		listener, err = s.listenWithTransport(conn, obfsEnabled)
 	} else {
 		listener, err = qtls.ListenWithOptions(conn, s.tlsConfig, s.quicConfig, qtls.ListenOptions{
 			DisableVersionNegotiationPackets: obfsEnabled,
@@ -163,9 +170,10 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 	return nil
 }
 
-// listenWithConnectionIDs is qtls.ListenWithOptions with the service's own
-// connection IDs: sing-quic builds its quic.Transport without a generator.
-func (s *Service[U]) listenWithConnectionIDs(conn net.PacketConn, obfs bool) (qtls.Listener, error) {
+// listenWithTransport is qtls.ListenWithOptions with the service's own
+// connection IDs and reset key: sing-quic builds its quic.Transport without
+// either.
+func (s *Service[U]) listenWithTransport(conn net.PacketConn, obfs bool) (qtls.Listener, error) {
 	tlsConfig, err := s.tlsConfig.STDConfig()
 	if err != nil {
 		return nil, err
@@ -178,9 +186,12 @@ func (s *Service[U]) listenWithConnectionIDs(conn net.PacketConn, obfs bool) (qt
 	transport := &quic.Transport{Conn: conn, ConnectionIDGenerator: s.connectionIDs, DisableVersionNegotiationPackets: obfs}
 	transport.SetSingleUse(true)
 	if !obfs {
-		transport.StatelessResetKey = new(quic.StatelessResetKey)
-		if _, err := rand.Read(transport.StatelessResetKey[:]); err != nil {
-			return nil, err
+		transport.StatelessResetKey = s.resetKey
+		if transport.StatelessResetKey == nil {
+			transport.StatelessResetKey = new(quic.StatelessResetKey)
+			if _, err := rand.Read(transport.StatelessResetKey[:]); err != nil {
+				return nil, err
+			}
 		}
 	}
 	listener, err := transport.Listen(tlsConfig, quicConfig)
