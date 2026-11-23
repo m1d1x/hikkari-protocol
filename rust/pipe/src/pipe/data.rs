@@ -96,7 +96,7 @@ impl Pipe {
                                 if !m.h.up {
                                     m.h.join(now);
                                     if sess == *cur {
-                                        events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO });
+                                        events.push(Event { wire: wid, index: mi as u8, up: true, why: ctl::WHY_HELLO, point: None });
                                     }
                                 }
                             }

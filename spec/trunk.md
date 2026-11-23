@@ -152,7 +152,7 @@ A member owes progress while it carries unconfirmed chunks or an unanswered ping
 of its own chunks or the pong of its own ping: frames that merely arrive on it prove nothing about its way out. A member that
 owes progress and proves none for max(300 ms, 4 × smoothed RTT) while another member proved progress after its debt began is
 dead: closed, its chunks sent again on the other members oldest first as they have room (256 KiB unconfirmed per member), its
-source port kept out of use for an hour, and a member on a new port opened within a second (replacements are spread over that
+source port kept out of use, and a member on a new port opened within a second (replacements are spread over that
 second, so members that die together do not come back as one burst). An idle member is pinged every second. The pipe also
 keeps each pool's proof fresh at rest: when none of its members proved progress for 250 ms, and none owes a ping, carries a
 chunk unconfirmed, has frames waiting to go or heard the exit in that time, the idle member that sent least lately pings at
@@ -164,6 +164,10 @@ When every member is silent at once, no member is to blame: the other end paused
 the whole path did. Then members die only after Quiet: 1 s on the entry, 30 s on the exit, which cannot open members and waits
 for the entry to. A clock tick more than 100 ms late is the side's own pause: every member's debt counts from the end of it,
 and the entry logs `trunk: paused <duration>`.
+
+The default source port book rests a port for 15 minutes after its first kill and for one hour after any kill within one
+hour of the previous kill on that port, including after a port has been put back into use. An explicitly configured fixed
+duration applies to every kill. A port still held by a member is available only after that member releases it.
 
 ## Border points
 
@@ -180,6 +184,16 @@ member does. A datagram's copies ("Datagrams") go to members at points it did no
 on, then to the others: a point that freezes holds one copy of it at most while another point is up, so a call with two
 copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
 (its domain, its certificate): the entry's socket goes to the point, the engine names the core.
+
+With multiple points, a stream pool uses its own proofs for member health and waits 3 s for common silence. After the
+pool first makes progress following at least 1 s without a proof, outstanding debts count from that progress, giving the
+other members their normal stall interval to answer. A live pool still replaces an individual unresponsive member by its
+usual stall rule. Broken sockets still go down immediately. The point reached by the failed TCP connection accompanies
+the pipe's member-down event to its brain, even if the list of points was reordered while that member was up.
+
+For a port comparison the brain can give a TCP pool a different port to dial on its points. The exit address and port
+used by the connection's Chromium engine stay the core's, including the CONNECT authority. A port override never
+applies to a direct dial or a packet wire.
 
 The brain gives the points before the wires, so that no member dials the core's own address first; points given later move
 every member to them. Points are the active receiver's (the pipe's receivers, rust/pipe/src/pipe/session.rs): a move to

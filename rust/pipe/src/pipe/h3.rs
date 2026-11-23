@@ -94,7 +94,7 @@ pub(super) struct H3 {
 impl H3 {
     /// A wire's engine starting (off the loop) for form f.
     pub fn new(id: u8, rx: u8, f: Form) -> Result<H3, String> {
-        let book = Book::new(f.ports.0, f.ports.1, ports::DEAD_FOR_NS).map_err(|e| format!("wire {id}: {e}"))?;
+        let book = Book::new(f.ports.0, f.ports.1, ports::REPEAT_DEAD_NS).map_err(|e| format!("wire {id}: {e}"))?;
         let proxy = Proxy { sni: f.sni.clone(), addr: f.exit, roots: f.roots.clone() };
         Ok(H3 {
             id,
@@ -287,7 +287,7 @@ fn closed_tunnels(h: &mut H3, w: &mut Wire, cur: u8, brains: bool, events: &mut 
         let State::Closed(err) = t.state() else { continue };
         h.closed += 1;
         if m.h.up && brains && w.sess == cur {
-            events.push(Event { wire: w.id, index: mi as u8, up: false, why: ctl::WHY_GONE });
+            events.push(Event { wire: w.id, index: mi as u8, up: false, why: ctl::WHY_GONE, point: None });
         }
         eprintln!("hk-pipe: wire {} member {mi}: the tunnel closed (net error {err})", w.id);
         if h.dialing.is_some_and(|(s, i, _)| s == w.sess && i == mi) {

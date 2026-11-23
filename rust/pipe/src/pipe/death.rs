@@ -86,12 +86,13 @@ impl Pipe {
     /// elsewhere (the acks it carried may be lost), and it is dialed anew
     /// after its backoff, spread over a second as the UDP members are. A
     /// port the path killed (the member stalled, or its dial or hello got no
-    /// answer) stays out of use for an hour (spec/trunk.md, "Members'
+    /// answer) is rested by the port book (spec/trunk.md, "Members'
     /// health"; trunk Entry.slot).
     pub(super) fn link_down(&mut self, wi: usize, li: usize, down: Down, now: u64) {
         let Pipe { swires, ports, .. } = self;
         let l = &mut swires[wi].links[li];
         let (was_up, c) = (l.h.up, carrier(wi, li, l.gen));
+        let point = l.point;
         if matches!(down, Down::Stalled { .. } | Down::Silent) && l.port != 0 {
             ports.dead(l.port, now);
         }
@@ -127,7 +128,7 @@ impl Pipe {
         let why = down.why();
         if sess == self.cur && (was_up || matches!(down, Down::Stalled { .. }) || why == ctl::WHY_GONE) {
             let wid = self.swires[wi].id;
-            self.events.push(Event { wire: wid, index: li as u8, up: false, why });
+            self.events.push(Event { wire: wid, index: li as u8, up: false, why, point });
         }
         let Pipe { streams, stranded, .. } = self;
         let mut hit = 0;
@@ -205,7 +206,7 @@ impl Pipe {
         let w = &mut swires[wi];
         let l = &mut w.links[li];
         *dirty = true;
-        match l.dial(&w.reach, to, &sessions[w.sess as usize].id, ports, now) {
+        match l.dial(&w.reach, to, w.point_port, &sessions[w.sess as usize].id, ports, now) {
             Dialed::Begun => {}
             Dialed::NoPort => {
                 let (dead, _) = ports.counts(now);

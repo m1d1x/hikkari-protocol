@@ -89,7 +89,7 @@ impl Pipe {
                         Verdict::Dead { quiet } => {
                             let why = if quiet { ctl::WHY_QUIET } else { ctl::WHY_SILENT };
                             if brains {
-                                events.push(Event { wire: w.id, index: mi as u8, up: false, why });
+                                events.push(Event { wire: w.id, index: mi as u8, up: false, why, point: None });
                             }
                             // Its socket goes now: what comes on it is no
                             // member's. The brain answers the event with a

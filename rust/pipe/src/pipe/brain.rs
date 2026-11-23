@@ -280,8 +280,8 @@ impl Pipe {
         for e in std::mem::take(&mut self.events) {
             match &mut self.ctl {
                 Some(c) => {
-                    let mut b = [0u8; 8];
-                    let n = ctl::put_member(&mut b, e.wire, e.index, e.up, e.why);
+                    let mut b = [0u8; 9];
+                    let n = ctl::put_member(&mut b, e.wire, e.index, e.up, e.why, e.point);
                     c.send(&b[..n]);
                 }
                 None => eprintln!("hk-pipe: wire {} member {} {} (why {})", e.wire, e.index, if e.up { "up" } else { "down" }, e.why),

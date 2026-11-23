@@ -56,7 +56,8 @@ const (
 	bDemand = 0x13 // hold_ms u32: held this long after a loss; 0: copies always
 	// points: the active receiver's border points (spec/trunk.md "Border
 	// points", rust/pipe/src/pipe/points.rs).
-	bPoints = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
+	bPoints  = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
+	bPoolVia = 0x15 // point port u16, then the body of bPool
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -70,7 +71,7 @@ const (
 const (
 	pHello     = 0x81 // ver u16, pid u32
 	pTick      = 0x82
-	pMember    = 0x83 // wire u8, index u8, up u8, why u8
+	pMember    = 0x83 // wire u8, index u8, up u8, why u8 [, point IPv4]
 	pDgram     = 0x84 // tag u32, payload
 	pError     = 0x85 // text
 	pDrained   = 0x86 // a pipe draining carries nothing more
@@ -184,6 +185,8 @@ type Pool struct {
 	// Exit is the exit's member port (plain TCP), or its relay for
 	// Chromium's form.
 	Exit netip.AddrPort
+	// PointPort overrides only the TCP destination port on border points.
+	PointPort uint16
 	// Chromium, when set, is the pool's form: Chromium's CONNECT to the
 	// relay (trunk/chromium); nil is plain TCP (tests, the bench).
 	Chromium *ChromiumForm
@@ -242,7 +245,12 @@ func putPool(w Pool) ([]byte, error) {
 	if w.Chromium != nil {
 		form = poolChromium
 	}
-	b := []byte{bPool, byte(w.ID), form, byte(w.Members)}
+	b := []byte{bPool}
+	if w.PointPort != 0 {
+		b[0] = bPoolVia
+		b = binary.LittleEndian.AppendUint16(b, w.PointPort)
+	}
+	b = append(b, byte(w.ID), form, byte(w.Members))
 	b = binary.LittleEndian.AppendUint16(b, uint16(w.Stall/time.Millisecond))
 	b = binary.LittleEndian.AppendUint16(b, w.Ports[0])
 	b = binary.LittleEndian.AppendUint16(b, w.Ports[1])

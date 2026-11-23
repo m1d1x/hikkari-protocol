@@ -117,6 +117,8 @@ pub struct Link {
     pub renew_at: u64,
     /// Its connection's source port, taken from the pipe's book (0: none).
     pub port: u16,
+    /// The point this socket actually dialed, independent of later point lists.
+    pub point: Option<std::net::Ipv4Addr>,
     /// When the exit's hello came on its connection (0: not yet).
     pub up_at: u64,
     /// The exit's epoch its hello said (zero before it): the process whose
@@ -161,6 +163,7 @@ impl Link {
             dialed_at: 0,
             renew_at: 0,
             port: 0,
+            point: None,
             up_at: 0,
             epoch: [0; 8],
             backoff_ns: 0,
@@ -174,7 +177,7 @@ impl Link {
     /// answers. A tunnel takes the hello once the relay has answered its
     /// CONNECT. A port whose bind finds it busy goes back to the book and
     /// another is tried at once (trunk Entry.slot on EADDRINUSE).
-    pub fn dial(&mut self, reach: &Reach, to: Option<std::net::Ipv4Addr>, session: &[u8; 16], book: &mut Book, now: u64) -> Dialed {
+    pub fn dial(&mut self, reach: &Reach, to: Option<std::net::Ipv4Addr>, point_port: u16, session: &[u8; 16], book: &mut Book, now: u64) -> Dialed {
         self.drop_sock(book);
         self.gen = self.gen.wrapping_add(1);
         self.dialed_at = now;
@@ -185,7 +188,7 @@ impl Link {
         };
         // A border point (the pipe's points.rs): the socket goes to it, the
         // engine names the exit.
-        let exit = to.map_or(exit, |ip| SocketAddrV4::new(ip, exit.port()));
+        let exit = to.map_or(exit, |ip| SocketAddrV4::new(ip, if point_port == 0 { exit.port() } else { point_port }));
         for _ in 0..BUSY_TRIES {
             let mut r = [0u8; 8];
             sys::urandom(&mut r);
@@ -193,6 +196,7 @@ impl Link {
             match sys::member_connect(exit, port) {
                 Ok(fd) => {
                     self.port = port;
+                    self.point = to;
                     self.sock = Some(match reach {
                         Reach::Plain(_) => Sock::Tcp(fd),
                         Reach::Chromium(engine) => Sock::Dialing(fd, engine.clone()),
@@ -249,6 +253,7 @@ impl Link {
     /// killed it) and what it held forgotten.
     pub fn drop_sock(&mut self, book: &mut Book) {
         self.sock = None;
+        self.point = None;
         if self.port != 0 {
             book.release(self.port);
             self.port = 0;
@@ -292,8 +297,12 @@ pub struct StreamWire {
     pub links: Vec<Link>,
     /// How a member's new connection reaches the exit.
     pub reach: Reach,
+    /// Public TCP port on border points, zero to use the core's port.
+    pub point_port: u16,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
+    /// When the pool first answered after common silence.
+    pub resumed: u64,
     /// The member the wire last sent a datagram on (carry.rs).
     pub rr: usize,
     /// How many border points its members are spread over (member.rs Wire).
@@ -311,12 +320,32 @@ impl StreamWire {
             stall_ns,
             links: (0..members).map(|_| Link::new()).collect(),
             reach,
+            point_port: 0,
             proof: 0,
+            resumed: 0,
             rr: 0,
             points: 0,
             copies: crate::copies::Copies::default(),
             t: WireTick { id, ..Default::default() },
         }
+    }
+
+    pub fn note_proof(&mut self, now: u64) {
+        if self.points > 1 && self.proof != 0 && now - self.proof >= hikkari_trunk::health::QUIET {
+            self.resumed = now;
+        }
+        self.proof = now;
+    }
+
+    /// Multiple border points share one pool. Proof on UDP or QUIC does not
+    /// tell whether its TCP members can make progress.
+    pub fn health_judge(&self, mut judge: hikkari_trunk::health::Judge) -> hikkari_trunk::health::Judge {
+        if self.points > 1 {
+            judge.proof = self.proof;
+            judge.quiet = 3_000_000_000;
+            judge.resumed = judge.resumed.max(self.resumed);
+        }
+        judge
     }
 
     pub fn up(&self) -> usize {
@@ -334,4 +363,34 @@ pub fn carrier(wi: usize, li: usize, gen: u16) -> u32 {
 #[inline]
 pub fn carrier_of(c: u32) -> (usize, usize, u16) {
     ((c >> 24) as usize, ((c >> 16) & 0xff) as usize, c as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hikkari_trunk::health::{Judge, Verdict, QUIET, STALL};
+
+    #[test]
+    fn pool_waits_for_common_silence_and_gives_members_time_to_recover() {
+        let mut pool = StreamWire::new(0, Reach::Plain("127.0.0.1:8443".parse().unwrap()), 1, STALL);
+        pool.points = 2;
+        let mut session = Judge::new(QUIET);
+        let mut health = Health::new(false);
+        let mut token = 0;
+        let start = QUIET;
+        health.join(start);
+        health.busy_since = start;
+        pool.note_proof(start);
+        let back = start + 2 * QUIET;
+        session.proof = back; // a datagram wire stayed alive
+        assert_eq!(health.tick(&pool.health_judge(session), STALL, back, &mut token), Verdict::Fine);
+        let mut cut = health;
+        assert_eq!(cut.tick(&pool.health_judge(session), STALL, start + 3 * QUIET + 1, &mut token),
+            Verdict::Dead { quiet: true });
+        pool.note_proof(back);
+        assert_eq!(health.tick(&pool.health_judge(session), STALL, back, &mut token), Verdict::Fine);
+        pool.note_proof(back + STALL);
+        assert_eq!(health.tick(&pool.health_judge(session), STALL, back + STALL + 1, &mut token),
+            Verdict::Dead { quiet: false });
+    }
 }

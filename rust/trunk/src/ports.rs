@@ -1,22 +1,22 @@
 //! The entry's book of members' source ports (spec/trunk.md, "Members'
-//! health": a dead member's source port is kept out of use for an hour). A
+//! health": a dead member's source port is rested). A
 //! flow the path killed by its source port dies again on that port, the
 //! same verdict a minute later (plans/2026-11-02-tcp-flow-loss.md), so a
-//! port that took a member down is not offered again for `dead_for`.
+//! port that took a member down rests for 15 minutes, or one hour for a repeat.
 //!
 //! Members die about once a second on a bad hour, and in 1-3 h most of the
 //! range is dead (11457 of 12768 on 12.11), so every call is O(1): the free
 //! ports are a list, a take is one random index into it, the dead come back
-//! in the order they died from the head of a queue, and a book with nothing
+//! from one expiry queue per rest duration, and a book with nothing
 //! free says so instead of looking. The reference is trunk ports.go
 //! (PortBook); like the rest of this crate it reads no clock and draws no
 //! randomness of its own: each call takes `now`, a take its random number.
 
 use std::collections::VecDeque;
 
-/// How long a port that took a member down stays out of use (trunk
-/// DefaultDeadFor).
-pub const DEAD_FOR_NS: u64 = 3_600_000_000_000;
+/// The default rest for a first kill and a recent repeat (trunk ports.go).
+const FIRST_DEAD_NS: u64 = 900_000_000_000;
+pub const REPEAT_DEAD_NS: u64 = 3_600_000_000_000;
 
 /// The entry's range of source ports (bench goentry's, trunk's default).
 pub const LO: u16 = 20000;
@@ -35,9 +35,10 @@ pub struct Book {
     in_use: Vec<bool>,
     /// until[port - lo]: dead until then; 0 when not dead.
     until: Vec<u64>,
-    /// Kills in time order, (port, until); an entry is stale once the
-    /// port's until moved on (killed again later).
-    queue: VecDeque<(u16, u64)>,
+    /// Previous kill, even after expiry. Empty for a fixed duration.
+    last: Vec<Option<u64>>,
+    /// Short and long expiry queues. Entries with an old deadline are stale.
+    queues: [VecDeque<(u16, u64)>; 2],
     dead: usize,
     kills: u64,
 }
@@ -51,12 +52,13 @@ impl Book {
         let span = (hi - lo) as usize + 1;
         Ok(Book {
             lo,
-            dead_for_ns: if dead_for_ns == 0 { DEAD_FOR_NS } else { dead_for_ns },
+            dead_for_ns,
             free: (lo..=hi).collect(),
             pos: (0..span as u32).collect(),
             in_use: vec![false; span],
             until: vec![0; span],
-            queue: VecDeque::new(),
+            last: if dead_for_ns == 0 { vec![None; span] } else { Vec::new() },
+            queues: Default::default(),
             dead: 0,
             kills: 0,
         })
@@ -90,8 +92,7 @@ impl Book {
         }
     }
 
-    /// A port the path killed: out of use for dead_for from now, from this
-    /// kill if it was killed before.
+    /// A port the path killed: its rest starts at this kill.
     pub fn dead(&mut self, port: u16, now: u64) {
         let Some(i) = self.index(port) else { return };
         self.expire(now);
@@ -99,9 +100,16 @@ impl Book {
             self.dead += 1;
             self.unfree(port);
         }
-        let until = now + self.dead_for_ns;
+        let (duration, queue) = if let Some(last) = self.last.get_mut(i) {
+            let repeat = last.is_some_and(|t| now - t < REPEAT_DEAD_NS);
+            *last = Some(now);
+            if repeat { (REPEAT_DEAD_NS, 1) } else { (FIRST_DEAD_NS, 0) }
+        } else {
+            (self.dead_for_ns, 1)
+        };
+        let until = now + duration;
         self.until[i] = until;
-        self.queue.push_back((port, until));
+        self.queues[queue].push_back((port, until));
         self.kills += 1;
     }
 
@@ -120,21 +128,23 @@ impl Book {
         (self.dead, self.kills)
     }
 
-    /// Brings back the ports whose time is up, from the head of the queue.
+    /// Each queue has a fixed duration and expires in insertion order.
     fn expire(&mut self, now: u64) {
-        while let Some(&(port, until)) = self.queue.front() {
-            if until > now {
-                break;
-            }
-            self.queue.pop_front();
-            let i = self.at(port);
-            if self.until[i] != until {
-                continue; // killed again later: a later entry brings it back
-            }
-            self.until[i] = 0;
-            self.dead -= 1;
-            if !self.in_use[i] {
-                self.add_free(port);
+        for queue in 0..self.queues.len() {
+            while let Some(&(port, until)) = self.queues[queue].front() {
+                if until > now {
+                    break;
+                }
+                self.queues[queue].pop_front();
+                let i = self.at(port);
+                if self.until[i] != until {
+                    continue; // killed again later: a later entry brings it back
+                }
+                self.until[i] = 0;
+                self.dead -= 1;
+                if !self.in_use[i] {
+                    self.add_free(port);
+                }
             }
         }
     }
@@ -177,7 +187,7 @@ impl Book {
 mod tests {
     use super::*;
 
-    const HOUR: u64 = DEAD_FOR_NS;
+    const HOUR: u64 = REPEAT_DEAD_NS;
     const T0: u64 = 1_000_000_000;
 
     /// 257 ports, as trunk ports_test.go bookAt.
@@ -239,6 +249,20 @@ mod tests {
         assert!(!frees(&b).contains(&port), "a port in use came back as free");
         b.release(port);
         assert!(frees(&b).contains(&port), "an expired port in use did not come back on release");
+    }
+
+    #[test]
+    fn a_first_kill_expires_before_an_older_repeat() {
+        let mut b = Book::new(20000, 20256, 0).unwrap();
+        b.dead(20000, T0);
+        let retry = T0 + FIRST_DEAD_NS;
+        assert_eq!(b.counts(retry), (0, 1));
+        b.dead(20000, retry);
+        b.dead(20001, retry + 1);
+        assert_eq!(b.counts(retry + FIRST_DEAD_NS + 1), (1, 3));
+        assert!(!frees(&b).contains(&20000));
+        assert!(frees(&b).contains(&20001));
+        assert_eq!(b.counts(retry + HOUR), (0, 3));
     }
 
     /// The list and its index agree after any mix of takes, kills, releases

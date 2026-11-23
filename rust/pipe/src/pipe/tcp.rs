@@ -276,10 +276,11 @@ impl Pipe {
     /// are no frame (the member is not the exit's).
     fn link_frames(&mut self, wi: usize, li: usize, now: u64) -> bool {
         let Pipe { swires, streams, judge, events, released, doomed, moved, flows, listens, ctl, out: msg, drains, cur, epochs, marks, adopted, .. } = self;
-        let StreamWire { links, t, proof, id: wid, sess, .. } = &mut swires[wi];
+        let StreamWire { links, t, id: wid, sess, .. } = &mut swires[wi];
         let sess = *sess;
         let Link { inb, in_n, out, h, up_at, epoch, .. } = &mut links[li];
         let mut joined = false;
+        let mut proved = false;
         let mut at = 0;
         while at < *in_n {
             let Some((fr, next)) = frame::next_frame(&inb[..*in_n], at) else {
@@ -299,7 +300,7 @@ impl Pipe {
                         *up_at = now;
                         joined = true;
                         if sess == *cur {
-                            events.push(Event { wire: *wid, index: li as u8, up: true, why: ctl::WHY_HELLO });
+                            events.push(Event { wire: *wid, index: li as u8, up: true, why: ctl::WHY_HELLO, point: None });
                         }
                     }
                 }
@@ -307,9 +308,7 @@ impl Pipe {
                     out.frame(9, |b| frame::put_ping(b, frame::F_PONG, tok));
                 }
                 Frame::Pong(tok) => {
-                    if h.pong(judge, tok, now) {
-                        *proof = now;
-                    }
+                    proved |= h.pong(judge, tok, now);
                 }
                 Frame::Data { len, .. } => {
                     t.down_pkts += 1;
@@ -357,6 +356,9 @@ impl Pipe {
                 }
             }
         }
+        if proved || joined {
+            swires[wi].note_proof(now);
+        }
         self.confirm(now);
         self.end_doomed();
         true
@@ -376,7 +378,7 @@ impl Pipe {
             l.inflight -= len as usize;
             l.owing -= 1;
             l.h.confirmed(judge, now, l.owing > 0);
-            w.proof = now;
+            w.note_proof(now);
         }
     }
 
@@ -501,6 +503,7 @@ impl Pipe {
     /// member's (hikkari_trunk::health). Returns when the next is due.
     pub(super) fn link_timers(&mut self, now: u64, clock: bool, mut next: u64) -> u64 {
         for wi in 0..self.swires.len() {
+            let judge = self.swires[wi].health_judge(self.judge);
             for li in 0..self.swires[wi].links.len() {
                 let renew_at = self.swires[wi].links[li].renew_at;
                 if renew_at != 0 {
@@ -512,7 +515,7 @@ impl Pipe {
                         next = next.min(renew_at);
                     }
                 }
-                let Pipe { swires, judge, tok, .. } = self;
+                let Pipe { swires, tok, .. } = self;
                 let w = &mut swires[wi];
                 let l = &mut w.links[li];
                 if l.sock.is_none() {
@@ -527,7 +530,7 @@ impl Pipe {
                 if !clock {
                     continue;
                 }
-                match l.h.tick(judge, w.stall_ns, now, tok) {
+                match l.h.tick(&judge, w.stall_ns, now, tok) {
                     Verdict::Fine => {}
                     Verdict::Ping(t) => {
                         l.out.frame(9, |b| frame::put_ping(b, frame::F_PING, t));

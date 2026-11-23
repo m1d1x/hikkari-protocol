@@ -28,6 +28,9 @@ type Config struct {
 	Logf   func(format string, a ...any)
 	// OnMember, when set, hears every member event of the pipe (why: Why*).
 	OnMember func(wire trunk.WireID, index int, up bool, why byte)
+	// OnMemberEvent includes the address of the point the failed TCP socket
+	// used, when the pipe knows it.
+	OnMemberEvent func(wire trunk.WireID, index int, up bool, why byte, point netip.Addr)
 	// OnObserved, when set, hears every report of a tester's stream or flow
 	// (the exit's marks).
 	OnObserved func(Observed)
@@ -545,6 +548,13 @@ func (p *Pipe) read() {
 			p.cfg.Logf("pipectl: wire %d member %d up=%v why=%d", id, index, up, why)
 			if p.cfg.OnMember != nil {
 				p.cfg.OnMember(id, index, up, why)
+			}
+			if p.cfg.OnMemberEvent != nil {
+				var point netip.Addr
+				if n == 9 {
+					point = netip.AddrFrom4([4]byte(m[5:9]))
+				}
+				p.cfg.OnMemberEvent(id, index, up, why, point)
 			}
 			if !up {
 				go p.renew(id, index)
