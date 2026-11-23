@@ -43,7 +43,7 @@ impl Exit {
         match ctl::parse(m).ok_or_else(|| format!("exit: a message it cannot read (type {:#x})", m.first().copied().unwrap_or(0)))? {
             Msg::Hello { ver } if ver == ctl::VERSION => Ok(()),
             Msg::Hello { ver } => Err(format!("exit: the brain speaks version {ver}, the exit {}", ctl::VERSION)),
-            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key } => {
+            Msg::Wire { id, form, glue_us, glue_max, dead_ms, quiet_ms, keys, cert, key, tls } => {
                 if form != ctl::FORM_UDP && form != ctl::FORM_H3DGRAM {
                     return Err(format!("exit: wire {id}: form {form} is not one the exit carries"));
                 }
@@ -61,7 +61,7 @@ impl Exit {
                     Wire::udp(id, sock, keys, stall, quiet, glue, glue_max as usize)
                 } else {
                     let path = |b: &[u8]| std::str::from_utf8(b).map(str::to_owned).map_err(|_| format!("exit: wire {id}: a file's path is not UTF-8"));
-                    let mut h = H3Wire::new(sock, &path(cert)?, &path(key)?, keys).map_err(|e| format!("exit: wire {id}: {e}"))?;
+                    let mut h = H3Wire::new(sock, &path(cert)?, &path(key)?, keys, tls).map_err(|e| format!("exit: wire {id}: {e}"))?;
                     h.set_gen(self.gens.gen);
                     Wire::h3dgram(id, h, stall, quiet, glue, glue_max as usize)
                 };

@@ -30,6 +30,7 @@ pub const B_RECEIVER: u8 = 0x11; // rx u8, ip [4], pool_members u8: a receiver o
 pub const B_ACTIVE: u8 = 0x12; // rx u8: the receiver that carries everything from now (session.rs)
 pub const B_DEMAND: u8 = 0x13; // hold_ms u32: the voice class's copies of the other fate on demand, held this long after a loss (hikkari_trunk::demand); 0: always
 pub const B_POINTS: u8 = 0x14; // n u8 + n × ip [4]: the active receiver's border points, member i of every wire to point i mod n (spec/trunk.md, "Border points"); n 0: none
+pub const B_NAMED_POINTS: u8 = 0x15; // n u8 + n × (ip [4], name length u8, name bytes)
 
 // Pipe → brain.
 pub const P_HELLO: u8 = 0x81; // ver u16, pid u32
@@ -97,6 +98,13 @@ pub enum Msg<'a> {
     Active { rx: u8 },
     /// The border points' addresses, n × ip [4] (points reads them).
     Points(&'a [u8]),
+    NamedPoints(Vec<BorderPoint>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BorderPoint {
+    pub ip: std::net::Ipv4Addr,
+    pub sni: String,
 }
 
 /// Most border points a receiver has (B_POINTS).
@@ -204,8 +212,36 @@ pub fn parse(m: &[u8]) -> Option<Msg<'_>> {
         }
         B_ACTIVE if m.len() == 2 => Msg::Active { rx: r.u8()? },
         B_POINTS if m.len() >= 2 && m[1] as usize <= MAX_POINTS && m.len() == 2 + 4 * m[1] as usize => Msg::Points(&m[2..]),
+        B_NAMED_POINTS => {
+            let n = r.u8()? as usize;
+            if n > MAX_POINTS {
+                return None;
+            }
+            let mut points = Vec::<BorderPoint>::with_capacity(n);
+            for _ in 0..n {
+                let ip = std::net::Ipv4Addr::from(<[u8; 4]>::try_from(r.take(4)?).ok()?);
+                let len = r.u8()? as usize;
+                let sni = std::str::from_utf8(r.take(len)?).ok()?;
+                if points.iter().any(|p| p.ip == ip) || !valid_point_sni(sni) {
+                    return None;
+                }
+                points.push(BorderPoint { ip, sni: sni.to_owned() });
+            }
+            if !r.rest().is_empty() {
+                return None;
+            }
+            Msg::NamedPoints(points)
+        }
         _ => return None,
     })
+}
+
+fn valid_point_sni(sni: &str) -> bool {
+    sni.is_empty() || (sni.len() <= 253 && sni.contains('.') && sni.parse::<std::net::IpAddr>().is_err()
+        && sni.split('.').all(|label| {
+            !label.is_empty() && label.len() <= 63 && !label.starts_with('-') && !label.ends_with('-')
+                && label.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        }))
 }
 
 fn h3<'a>(r: &mut Rd<'a>) -> Option<H3<'a>> {
@@ -531,6 +567,9 @@ mod tests {
     const ACTIVE_GOLDEN: &str = "1201";
     /// pointsGolden: the border points 10.0.0.1 and 10.0.0.2.
     const POINTS_GOLDEN: &str = "14020a0000010a000002";
+    /// trunk/pipectl msg_test.go namedPointsGolden: 10.0.0.1 under
+    /// p1.example.com, 10.0.0.2 under the core's own name.
+    const NAMED_POINTS_GOLDEN: &str = "15020a0000010e70312e6578616d706c652e636f6d0a00000200";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     /// trunk/pipectl msg_test.go TestPointTicksGolden: 10.0.0.1 with 6
     /// members, 3 up, proof 100 ms ago; 10.0.0.2 with 6, none up, none ever.
@@ -561,6 +600,16 @@ mod tests {
         }
         assert!(matches!(parse(&unhex("1400")), Some(Msg::Points(b)) if b.is_empty()), "no points");
         assert!(parse(&unhex("14020a0000010a0000")).is_none(), "torn points");
+        match parse(&unhex(NAMED_POINTS_GOLDEN)) {
+            Some(Msg::NamedPoints(ps)) => assert_eq!(ps, [
+                BorderPoint { ip: "10.0.0.1".parse().unwrap(), sni: "p1.example.com".into() },
+                BorderPoint { ip: "10.0.0.2".parse().unwrap(), sni: String::new() },
+            ]),
+            _ => panic!("not named points"),
+        }
+        let named = unhex(NAMED_POINTS_GOLDEN);
+        assert!(parse(&named[..named.len() - 1]).is_none(), "torn named points");
+        assert!(parse(&unhex("15010a0000010350312e")).is_none(), "a name the proxy URL cannot carry");
         assert!(parse(&unhex("11010a000002")).is_none(), "a torn receiver");
         let rs = [ReceiverTick { rx: 1, ip: "10.0.0.2".parse().unwrap(), wires: vec![(3, 6, 5, 120), (0, 8, 8, NONE_MS)] }];
         let mut out = [0u8; 64];

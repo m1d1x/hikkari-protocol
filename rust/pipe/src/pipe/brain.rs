@@ -109,7 +109,11 @@ impl Pipe {
             Some(Msg::Receiver { rx, ip, pool_members }) => return self.set_receiver(rx, ip, pool_members),
             Some(Msg::Active { rx }) => return self.set_active(rx),
             Some(Msg::Points(b)) => {
-                let ps = ctl::points(b);
+                let ps = ctl::points(b).into_iter().map(|ip| ctl::BorderPoint { ip, sni: String::new() }).collect();
+                self.set_points(ps, now_ns());
+                return Ok(());
+            }
+            Some(Msg::NamedPoints(ps)) => {
                 self.set_points(ps, now_ns());
                 return Ok(());
             }
@@ -241,7 +245,7 @@ impl Pipe {
                 *moved += 1;
             }
             Msg::Close { tag } => flows.close(tag),
-            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } | Msg::Points(_) => {
+            Msg::Drain | Msg::Adopt | Msg::TcpListen { .. } | Msg::Pool(_) | Msg::Copies { .. } | Msg::Demand { .. } | Msg::Clients | Msg::Stats | Msg::Receiver { .. } | Msg::Active { .. } | Msg::Points(_) | Msg::NamedPoints(_) => {
                 unreachable!("taken above")
             }
             Msg::Member { wire, index } => {

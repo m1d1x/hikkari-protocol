@@ -323,6 +323,7 @@ dependencies = [
 name = "hikkari-exit"
 version = "0.1.0"
 dependencies = [
+ "boring",
  "hikkari-sys",
  "hikkari-trunk",
  "libc",

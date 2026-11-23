@@ -2,7 +2,9 @@ package pipectl
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net/netip"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
@@ -46,6 +48,48 @@ const (
 // maxExitKeys is the most trunk keys one exit wire opens under.
 const maxExitKeys = 16
 
+type ExitPointTLS struct {
+	CoreName    string
+	AllowLegacy bool
+	Points      []ExitPointCertificate
+}
+
+type ExitPointCertificate struct {
+	BorderPoint
+	CertFile, KeyFile string
+}
+
+func appendPointTLS(b []byte, tls *ExitPointTLS) ([]byte, error) {
+	if !ValidPointSNI(tls.CoreName) || len(tls.Points) == 0 || len(tls.Points) > MaxPoints {
+		return nil, errors.New("pipectl: invalid core name or point certificate count")
+	}
+	legacy := byte(0)
+	if tls.AllowLegacy {
+		legacy = 1
+	}
+	b = append(b, legacy, byte(len(tls.Points)), byte(len(tls.CoreName)))
+	b = append(b, tls.CoreName...)
+	ips, names := map[netip.Addr]bool{}, map[string]bool{tls.CoreName: true}
+	for _, p := range tls.Points {
+		if !p.IP.Is4() || !ValidPointSNI(p.SNI) || ips[p.IP] || names[p.SNI] {
+			return nil, fmt.Errorf("pipectl: invalid or repeated point TLS identity %s %q", p.IP, p.SNI)
+		}
+		ips[p.IP], names[p.SNI] = true, true
+		ip := p.IP.As4()
+		b = append(b, ip[:]...)
+		b = append(b, byte(len(p.SNI)))
+		b = append(b, p.SNI...)
+		for _, path := range []string{p.CertFile, p.KeyFile} {
+			if path == "" || len(path) > 0xffff {
+				return nil, errors.New("pipectl: point TLS certificate and key paths are required")
+			}
+			b = binary.LittleEndian.AppendUint16(b, uint16(len(path)))
+			b = append(b, path...)
+		}
+	}
+	return b, nil
+}
+
 // putExitWire is the wire message: for FormUDP each trunk key goes as
 // udpwire.Key, for FormH3Dgram as h3dgram.Token, followed by the paths of
 // the wire's certificate chain and key (PEM), which the exit reads.
@@ -84,6 +128,9 @@ func putExitWire(w ExitWire) ([]byte, error) {
 		for _, f := range []string{w.CertFile, w.KeyFile} {
 			b = le.AppendUint16(b, uint16(len(f)))
 			b = append(b, f...)
+		}
+		if w.PointTLS != nil {
+			return appendPointTLS(b, w.PointTLS)
 		}
 	}
 	return b, nil

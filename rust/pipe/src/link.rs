@@ -292,6 +292,7 @@ pub struct StreamWire {
     pub links: Vec<Link>,
     /// How a member's new connection reaches the exit.
     pub reach: Reach,
+    pub point_reaches: Vec<(crate::ctl::BorderPoint, Reach)>,
     /// When one of its members last proved its round trip (0: never).
     pub proof: u64,
     /// The member the wire last sent a datagram on (carry.rs).
@@ -311,6 +312,7 @@ impl StreamWire {
             stall_ns,
             links: (0..members).map(|_| Link::new()).collect(),
             reach,
+            point_reaches: Vec::new(),
             proof: 0,
             rr: 0,
             points: 0,

@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/m1d1x/hikkari-protocol/trunk"
@@ -57,6 +58,7 @@ const (
 	// points: the active receiver's border points (spec/trunk.md "Border
 	// points", rust/pipe/src/pipe/points.rs).
 	bPoints = 0x14 // n u8 + n × ip [4]: member i of every wire to point i mod n; n 0: none
+	bNamedPoints = 0x15 // n u8 + n × (ip [4], name length u8, name bytes)
 )
 
 // A pool's forms: stream members over plain TCP to the exit's member port,
@@ -428,6 +430,57 @@ func putActive(rx byte) []byte { return []byte{bActive, rx} }
 
 // MaxPoints is the most border points a receiver has.
 const MaxPoints = 8
+
+// BorderPoint is a forwarding address and its TLS name. Empty SNI uses the core's name.
+type BorderPoint struct {
+	IP  netip.Addr
+	SNI string
+}
+
+// ValidPointSNI permits DNS hostnames that Chromium can put in a proxy URL.
+func ValidPointSNI(name string) bool {
+	if len(name) > 253 || !strings.Contains(name, ".") {
+		return false
+	}
+	if _, err := netip.ParseAddr(name); err == nil {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func putBorderPoints(points []BorderPoint) ([]byte, []netip.Addr, error) {
+	ips := make([]netip.Addr, len(points))
+	named := false
+	for i, p := range points {
+		ips[i] = p.IP
+		named = named || p.SNI != ""
+		if p.SNI != "" && !ValidPointSNI(p.SNI) {
+			return nil, nil, fmt.Errorf("pipectl: invalid TLS name for border point %s", p.IP)
+		}
+	}
+	b, err := putPoints(ips)
+	if err != nil || !named {
+		return b, ips, err
+	}
+	b = []byte{bNamedPoints, byte(len(points))}
+	for _, p := range points {
+		ip := p.IP.As4()
+		b = append(b, ip[:]...)
+		b = append(b, byte(len(p.SNI)))
+		b = append(b, p.SNI...)
+	}
+	return b, ips, nil
+}
 
 // putPoints is the active receiver's border points, the core's own address
 // first.

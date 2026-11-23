@@ -179,14 +179,25 @@ as above; the others carry the session and every stream and flow on it, and a me
 member does. A datagram's copies ("Datagrams") go to members at points it did not reach yet first, over every wire it goes
 on, then to the others: a point that freezes holds one copy of it at most while another point is up, so a call with two
 copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
-(its domain, its certificate): the entry's socket goes to the point, the engine names the core.
+  (its certificate): the entry's socket goes to the point, and the engine uses that point's TLS name
+  for SNI, certificate verification and the proxy origin. An unnamed point uses the core's name.
+  TCP CONNECT and CONNECT-UDP still target the trunk, with the same trunk credentials.
 
 The brain gives the points before the wires, so that no member dials the core's own address first; points given later move
 every member to them. Points are the active receiver's (the pipe's receivers, rust/pipe/src/pipe/session.rs): a move to
 another receiver drops them, a receiver on standby is reached at its own address alone, and a receiver that was reached
 through points does not go on standby at its own address once another is active. Points given anew move only the members
 whose point changed: each is closed (what it carried goes again on the others) and dialed to its new point after the spread
-alone, as is a member that was waiting to dial again: the backoff was its old address's.
+  alone, as is a member that was waiting to dial again: the backoff was its old address's.
+  Changing a point's TLS name reconnects its TCP and H3 members under the same session id.
+  Bare UDP members depend only on the point's address.
+
+  The brain sends named points as local message 0x15 (count u8, then IPv4, name length u8, and DNS name
+  per point). A zero-length name uses the core name. The address-only message 0x14 remains valid.
+  A core configured for named points accepts each name only from that forwarding point, and its own name only
+  from addresses that are not points (the hub's direct checks); from a point it may accept its own name during
+  the transition. For H3 the exit wire's local message carries the original name,
+  the transition flag and each point's address, name and certificate paths.
 
 ## Datagrams
 

@@ -2,6 +2,7 @@ package pipectl
 
 import (
 	"encoding/hex"
+	"net/netip"
 	"reflect"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ const (
 	// rust/exit/src/ctl.rs H3_WIRE_GOLDEN: wire 6, one token (set to 0xcc
 	// past the derivation), the files /c.pem and /k.pem.
 	exitH3WireGolden = "030602e8030000b0042c013075000001cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc06002f632e70656d06002f6b2e70656d"
+	exitPointTLSGolden = "010110636f72652e6578616d706c652e636f6d0a0000010e70312e6578616d706c652e636f6d06002f702e70656d06002f712e70656d"
 )
 
 func TestExitGolden(t *testing.T) {
@@ -52,6 +54,26 @@ func TestExitGolden(t *testing.T) {
 	}
 	if got := hex.EncodeToString(b); got != exitH3WireGolden {
 		t.Fatalf("exit h3dgram wire %s, want %s", got, exitH3WireGolden)
+	}
+	// rust/exit/src/ctl.rs POINT_TLS_GOLDEN: the H3 wire above, its core
+	// core.example.com taken during the transition, and 10.0.0.1 under
+	// p1.example.com with /p.pem and /q.pem.
+	named := h3
+	named.PointTLS = &ExitPointTLS{CoreName: "core.example.com", AllowLegacy: true, Points: []ExitPointCertificate{{
+		BorderPoint: BorderPoint{IP: netip.MustParseAddr("10.0.0.1"), SNI: "p1.example.com"}, CertFile: "/p.pem", KeyFile: "/q.pem"}}}
+	b, err = putExitWire(named)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 32 {
+		b[16+i] = 0xcc
+	}
+	if got := hex.EncodeToString(b); got != exitH3WireGolden+exitPointTLSGolden {
+		t.Fatalf("exit h3dgram wire with point names %s", got)
+	}
+	named.PointTLS.Points = append(named.PointTLS.Points, named.PointTLS.Points[0])
+	if _, err := putExitWire(named); err == nil {
+		t.Fatal("a point named twice taken")
 	}
 	h3.KeyFile = ""
 	if _, err := putExitWire(h3); err == nil {

@@ -240,7 +240,7 @@ impl Exit {
             let sock = UdpSocket::bind(h.listen)?;
             sys::tune(&sock, false)?;
             let tokens = vec![hikkari_trunk::h3dgram::token(&a.key)];
-            let w = H3Wire::new(sock, &h.cert, &h.key, tokens).map_err(io::Error::other)?;
+            let w = H3Wire::new(sock, &h.cert, &h.key, tokens, None).map_err(io::Error::other)?;
             x.wires.push(Wire::h3dgram(h.wire, w, a.stall_ns, a.quiet_ns, a.glue_ns, a.glue_max));
         }
         for &p in &a.ports {

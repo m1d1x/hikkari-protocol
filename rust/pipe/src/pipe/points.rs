@@ -18,12 +18,17 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use super::death::Down;
 use super::Pipe;
+use crate::ctl::BorderPoint;
 use crate::link::NO_SESSION;
 use crate::member::member_to;
 
 /// Member i's point: none without points (the wire's own address).
-pub(super) fn point(points: &[Ipv4Addr], i: usize) -> Option<Ipv4Addr> {
-    (!points.is_empty()).then(|| points[i % points.len()])
+pub(super) fn endpoint(points: &[BorderPoint], i: usize) -> Option<&BorderPoint> {
+    (!points.is_empty()).then(|| &points[i % points.len()])
+}
+
+pub(super) fn point(points: &[BorderPoint], i: usize) -> Option<Ipv4Addr> {
+    endpoint(points, i).map(|p| p.ip)
 }
 
 /// The wire's address at point p, on the wire's port.
@@ -35,7 +40,7 @@ impl Pipe {
     /// The points the members of a session of receiver rx go to: the
     /// active receiver's alone; a receiver on standby is reached at its own
     /// address.
-    pub(super) fn points_of(&self, rx: u8) -> &[Ipv4Addr] {
+    pub(super) fn points_of(&self, rx: u8) -> &[BorderPoint] {
         if rx == self.sessions[self.cur as usize].rx {
             &self.points
         } else {
@@ -86,7 +91,7 @@ impl Pipe {
         }
         (0..n)
             .map(|k| crate::ctl::PointTick {
-                ip: self.points[k],
+                ip: self.points[k].ip,
                 members: members[k].min(255) as u8,
                 up: up[k].min(255) as u8,
                 proof_ago_ms: if proof[k] == 0 { crate::ctl::NONE_MS } else { super::ms(now.saturating_sub(proof[k])) },
@@ -102,20 +107,24 @@ impl Pipe {
     /// member that waits to dial again (its old address did not answer: the
     /// core out of reach before the points came) dials its new point now:
     /// its backoff was the old address's.
-    pub(super) fn set_points(&mut self, ips: Vec<Ipv4Addr>, now: u64) {
-        let old = std::mem::replace(&mut self.points, ips);
+    pub(super) fn set_points(&mut self, points: Vec<BorderPoint>, now: u64) {
+        let old = std::mem::replace(&mut self.points, points);
         if old == self.points {
             return;
         }
         let rx = self.sessions[self.cur as usize].rx;
         let moved = |i: usize| point(&old, i) != point(&self.points, i);
+        let changed = |i: usize| endpoint(&old, i) != endpoint(&self.points, i);
         let mut downs = Vec::new();
         let mut waits = Vec::new();
-        for (wi, w) in self.swires.iter().enumerate() {
+        for (wi, w) in self.swires.iter_mut().enumerate() {
             if w.sess == NO_SESSION || self.sessions[w.sess as usize].rx != rx {
                 continue;
             }
-            for (li, l) in w.links.iter().enumerate().filter(|(li, _)| moved(*li)) {
+            w.point_reaches.retain(|(p, _)| self.points.contains(p));
+            for (li, l) in w.links.iter().enumerate().filter(|(li, _)| {
+                if matches!(w.reach, crate::link::Reach::Chromium(_)) { changed(*li) } else { moved(*li) }
+            }) {
                 if l.sock.is_some() {
                     downs.push((wi, li));
                 } else if l.renew_at != 0 {
@@ -127,7 +136,7 @@ impl Pipe {
         let mut events = Vec::new();
         for w in self.wires.iter_mut().filter(|w| w.rx == rx) {
             for (mi, m) in w.members.iter_mut().enumerate() {
-                if !moved(mi) {
+                if !(if w.h3 { changed(mi) } else { moved(mi) }) {
                     continue;
                 }
                 if w.h3 {
@@ -149,6 +158,9 @@ impl Pipe {
                     m.set_sock(to.and_then(|e| member_to(e).ok()));
                 }
             }
+        }
+        for h in self.h3s.iter_mut().filter(|h| h.rx == rx) {
+            h.keep_points(&self.points);
         }
         self.events.extend(events);
         let n = downs.len();
@@ -177,7 +189,8 @@ mod tests {
     /// wire's port; no points, the wire's own address.
     #[test]
     fn members_go_to_the_points_in_turn() {
-        let ps: Vec<Ipv4Addr> = vec!["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()];
+        let ps: Vec<_> = ["10.0.0.1", "10.0.0.2"].into_iter()
+            .map(|ip| BorderPoint { ip: ip.parse().unwrap(), sni: String::new() }).collect();
         let exit: SocketAddrV4 = "10.0.0.1:20461".parse().unwrap();
         let to: Vec<SocketAddrV4> = (0..4).map(|i| at(exit, point(&ps, i))).collect();
         assert_eq!(to, ["10.0.0.1:20461", "10.0.0.2:20461", "10.0.0.1:20461", "10.0.0.2:20461"].map(|a| a.parse().unwrap()));

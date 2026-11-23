@@ -13,3 +13,4 @@ hikkari-trunk.workspace = true
 # The fixed window (spec/trunk.md, h3dgram, "How the exit sends down"):
 # the guard paces the wire, not quiche's congestion control.
 quiche = { workspace = true, features = ["congestion_window_unchecked_available"] }
+boring = "=5.5.0"
