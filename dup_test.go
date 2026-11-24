@@ -188,7 +188,9 @@ func callStats(conn net.PacketConn, to net.Addr, n, size int, gap time.Duration)
 	seen := map[byte]map[byte]bool{}
 	var mu sync.Mutex
 	done := make(chan struct{})
-	last := time.Now()
+	// Pauses are between answers: the wait for the first one is the round
+	// trip, not a pause.
+	var last time.Time
 	go func() {
 		defer close(done)
 		b := make([]byte, 2048)
@@ -210,7 +212,7 @@ func callStats(conn net.PacketConn, to net.Addr, n, size int, gap time.Duration)
 					got++
 				}
 			}
-			if d := time.Since(last); d > worst {
+			if d := time.Since(last); !last.IsZero() && d > worst {
 				worst = d
 			}
 			last = time.Now()

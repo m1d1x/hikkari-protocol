@@ -14,7 +14,7 @@
 // A frame:
 //
 //	version  uint8   1
-//	kind     uint8   0 packet, 1 attach
+//	kind     uint8   0 packet, 1 attach, 2 ping (v1.07)
 //	session  [16]byte, random, chosen by the client
 //	seq      uint64  big endian, from 1 per direction; 0 in an attach
 //	address  SOCKS address and port (packet only): the destination going up,
@@ -29,6 +29,10 @@
 // that knows lanes answers every attach with an attach naming the carrier's
 // lane; a v1.02 relay never sends an attach, and v1.02 ends ignore the lane
 // byte, so the frame keeps version 1.
+//
+// v1.07 ping: a relay sends a ping back unchanged on the carrier it came by,
+// without opening a session. A client with several entries pings each entry's
+// stream channel to tell a silent entry (client/paths.go).
 //
 // On the datagram channel a frame is one UDP message addressed to Host; on the
 // stream channel frames follow a CONNECT to Host:0, each after a uint16 big
@@ -54,6 +58,7 @@ const Version = 1
 const (
 	KindPacket uint8 = 0
 	KindAttach uint8 = 1
+	KindPing   uint8 = 2
 )
 
 // Lanes of a carrier (v1.03).
@@ -108,8 +113,11 @@ func Append(dst []byte, f Frame) ([]byte, error) {
 	dst = append(dst, Version, f.Kind)
 	dst = append(dst, f.Session[:]...)
 	dst = binary.BigEndian.AppendUint64(dst, f.Seq)
-	if f.Kind == KindAttach {
+	switch f.Kind {
+	case KindAttach:
 		return append(dst, f.Lane), nil
+	case KindPing:
+		return dst, nil
 	}
 	b := buf.NewSize(M.SocksaddrSerializer.AddrPortLen(f.Addr))
 	defer b.Release()
@@ -142,6 +150,8 @@ func Decode(data []byte) (Frame, error) {
 		if len(rest) > 0 {
 			f.Lane = rest[0]
 		}
+		return f, nil
+	case KindPing:
 		return f, nil
 	case KindPacket:
 		if f.Seq == 0 {

@@ -153,6 +153,13 @@ func (h *DupHub) serve(ctx context.Context, key, group string, c carrier) error 
 	defer c.close()
 	context.AfterFunc(ctx, c.close)
 	first, err := c.readFrame()
+	for err == nil && first.Kind == dup.KindPing {
+		// A probe carrier (v1.07) holds no session: its pings go back at
+		// once, and no exit socket opens for it.
+		if err = c.writeFrame(pong(first)); err == nil {
+			first, err = c.readFrame()
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -162,7 +169,7 @@ func (h *DupHub) serve(ctx context.Context, key, group string, c carrier) error 
 	}
 	defer s.detach(leg)
 	for f := first; ; {
-		if f.Session != s.id.id {
+		if f.Session != s.id.id && f.Kind != dup.KindPing {
 			return dup.ErrFrame
 		}
 		switch f.Kind {
@@ -170,11 +177,19 @@ func (h *DupHub) serve(ctx context.Context, key, group string, c carrier) error 
 			s.up(ctx, f, c.via())
 		case dup.KindAttach:
 			leg.join(s.id.id, f.Lane)
+		case dup.KindPing:
+			leg.queueFrame(legFrame{b: pong(f), at: time.Now(), keep: true})
 		}
 		if f, err = c.readFrame(); err != nil {
 			return nil
 		}
 	}
+}
+
+// pong is a ping sent back as it came (v1.07).
+func pong(f dup.Frame) []byte {
+	b, _ := dup.Append(nil, dup.Frame{Kind: dup.KindPing, Session: f.Session, Seq: f.Seq})
+	return b
 }
 
 // attach finds or opens the session and adds c as a leg. A session counts in

@@ -23,6 +23,27 @@ type Period struct {
 	Calls *Calls `json:"calls,omitempty"`
 	// Pauses are the duplicated sessions' pauses of live UDP (v1.06).
 	Pauses *Pauses `json:"pauses,omitempty"`
+	// Entries are a client's entries by number, when it has several (v1.07).
+	Entries map[string]*Entry `json:"entries,omitempty"`
+}
+
+// Entry is one entry of a client with several, in a period (v1.07). It names
+// the entry by its number in the link, never by address.
+type Entry struct {
+	ActiveS  float64 `json:"active_s"` // seconds new connections went by it
+	SilentS  float64 `json:"silent_s"` // seconds it was counted silent
+	Silences int64   `json:"silences"` // times it went silent
+	PingMS   Dist    `json:"ping_ms"`  // round trip of answered pings
+	Now      int64   `json:"now"`      // 1: the active entry at the period's end
+}
+
+// Merge adds o.
+func (e *Entry) Merge(o *Entry) {
+	e.ActiveS += o.ActiveS
+	e.SilentS += o.SilentS
+	e.Silences += o.Silences
+	e.PingMS.Merge(&o.PingMS)
+	e.Now = max(e.Now, o.Now)
 }
 
 // Ends counts ends by reason (EndEOF and the rest).
@@ -251,11 +272,20 @@ func (p *Period) merge(o *Period) {
 		}
 		p.Pauses.merge(o.Pauses)
 	}
+	for n, e := range o.Entries {
+		if p.Entries == nil {
+			p.Entries = map[string]*Entry{}
+		}
+		if p.Entries[n] == nil {
+			p.Entries[n] = &Entry{}
+		}
+		p.Entries[n].Merge(e)
+	}
 }
 
 // Empty reports whether the period counted nothing.
 func (p *Period) Empty() bool {
-	return p.TCP == nil && len(p.QUIC) == 0 && p.Tunnels == nil && p.Dup == nil && p.Calls == nil && p.Pauses == nil
+	return p.TCP == nil && len(p.QUIC) == 0 && p.Tunnels == nil && p.Dup == nil && p.Calls == nil && p.Pauses == nil && len(p.Entries) == 0
 }
 
 // A Source adds what it counted since its last take to p. It is called with
