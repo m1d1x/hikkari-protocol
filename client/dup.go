@@ -1,5 +1,11 @@
 package client
 
+// A duplicated session (v1.02, spec/v1.md "v1.02: duplicated UDP"): one UDP
+// association of the application, carried by several carriers at once, each
+// end delivering the first copy of every packet. With several entries (v1.07)
+// a call goes by every entry: dupsteer.go decides which carriers each entry
+// holds.
+
 import (
 	"context"
 	"crypto/rand"
@@ -12,27 +18,9 @@ import (
 
 	"github.com/m1d1x/hikkari-protocol/dup"
 	"github.com/m1d1x/hikkari-protocol/observe"
-	"github.com/m1d1x/hikkari-protocol/wire/datagram"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-)
-
-// A call is a flow of small packets at a steady rate (Opus: 20 ms frames, 50
-// per second, tens to a few hundred bytes). A second of it turns the call's
-// carriers on; VoiceOff seconds without it turn the stream copy off.
-//
-// v1.02 relays see the flow whole: a flow is a call only while all of it is
-// voice-shaped (at most VoiceMaxBytes on average), because such a relay sends
-// every answer by every carrier. With a relay that keeps lanes (v1.03) only
-// the voice-sized packets count, so a call with video in the same socket, as
-// Discord and browsers send it, is still a call; its video stays on the
-// datagram channel's whole lane.
-const (
-	VoiceMinPPS   = 15
-	VoiceMaxPPS   = 120
-	VoiceMaxBytes = 500
-	VoiceOff      = 5 * time.Second
 )
 
 // Mirror is the stream copy's state, for logs and tests.
@@ -46,40 +34,22 @@ const (
 // dupRedial is the pause between attempts to bring a carrier back.
 const dupRedial = 2 * time.Second
 
-// legQueue bounds the frames waiting for one carrier. A carrier that cannot
-// keep up loses the newest frames, as a UDP path would; the application's
-// writes never wait for a carrier. A datagram carrier hands its frames on at
-// once to the connection's scheduler, where they wait by their age (v1.05);
-// the stream copy's own queue drops a frame older than datagram.StaleAfter
-// before its write.
-const legQueue = 256
-
-// legFrame is a frame in a carrier's queue: when it was queued, and whether
-// it must go whatever its age (an attach).
-type legFrame struct {
-	b    []byte
-	at   time.Time
-	keep bool
-}
-
-// channelStats is a datagram carrier's association as the scheduler counts
-// it (wire/datagram).
-type channelStats interface {
-	TakeStats() datagram.ChannelStats
-}
-
 type inbound struct {
 	payload []byte
 	addr    M.Socksaddr
 }
 
 // dupConn is one UDP association of the application as a duplicated session.
+// On every entry (path) it may hold:
 //
-//	primary  the datagram channel, whole lane: every packet but a call's voice
+//	primary  the datagram channel: on the active entry the whole lane, every
+//	         packet but a call's voice; on another entry during a call, the
+//	         voice lane (v1.07)
 //	voice    a datagram connection of its own for calls' voice (v1.03), so
-//	         voice never queues behind bulk in one QUIC connection
+//	         voice never queues behind bulk in one QUIC connection; the
+//	         active entry's only
 //	mirror   the stream channel: a call's voice, or every packet while the
-//	         datagram channel is down
+//	         active entry's datagram channel is down
 //
 // Answers are taken from whichever carrier brings them first.
 type dupConn struct {
@@ -91,21 +61,15 @@ type dupConn struct {
 	// lanes is set once the relay answers an attach (v1.03).
 	lanes atomic.Bool
 
-	mu           sync.Mutex
-	seq          uint64
-	ledger       dup.Ledger
-	booked       bool // counted in a period already
-	closed       bool
-	unbook       func()
-	primary      *dupLeg // nil while down
-	voice        *dupLeg // nil while off
-	mirror       *dupLeg // nil while off
-	redialing    bool
-	voiceOpening bool
-	voiceErr     time.Time // last failed voice dial
-	mirrorErr    time.Time // last failed stream dial, or one running
-	det          detector
-	pauses       observe.PauseMeter
+	mu     sync.Mutex
+	seq    uint64
+	ledger dup.Ledger
+	booked bool // counted in a period already
+	closed bool
+	unbook func()
+	paths  []dupPath // by entry
+	det    detector
+	pauses observe.PauseMeter
 	// Frames a carrier's queue had no room for, by the carrier's channel.
 	fullDatagram, fullStream int64
 	// What the carriers' channels dropped and how long frames waited (v1.05),
@@ -117,69 +81,21 @@ type dupConn struct {
 	deadlineWake chan struct{}
 }
 
-// dupLeg is one carrier: a queue and the goroutine that drains it.
-type dupLeg struct {
-	lane  uint8 // guarded by dupConn.mu
-	via   dup.Via
-	send  func([]byte) error
-	shut  func()
-	stats channelStats // a datagram carrier's; nil for the stream copy
-	mu    sync.Mutex
-	done  bool
-	queue chan legFrame
+// dupPath is a session's carriers on one entry; dupConn.mu guards it.
+type dupPath struct {
+	primary, voice, mirror       *dupLeg // nil while off or down
+	primaryOpening, voiceOpening bool
+	// The last failed dial of each carrier; mirrorErr also marks a dial
+	// running.
+	primaryErr, voiceErr, mirrorErr time.Time
 }
 
-func newLeg(lane uint8, via dup.Via, send func([]byte) error, shut func()) *dupLeg {
-	return &dupLeg{lane: lane, via: via, send: send, shut: shut, queue: make(chan legFrame, legQueue)}
-}
-
-// put queues an attach without waiting; false when the carrier is gone or
-// full. An attach goes whatever its age.
-func (l *dupLeg) put(frame []byte) bool {
-	ok, _ := l.queueFrame(legFrame{b: frame, at: time.Now(), keep: true})
-	return ok
-}
-
-// offer queues a packet's frame and also says whether a refused frame found
-// the queue full, so it never reached the wire.
-func (l *dupLeg) offer(frame []byte) (ok, full bool) {
-	return l.queueFrame(legFrame{b: frame, at: time.Now()})
-}
-
-func (l *dupLeg) queueFrame(f legFrame) (ok, full bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.done {
-		return false, false
-	}
-	select {
-	case l.queue <- f:
-		return true, false
-	default:
-		return false, true
-	}
-}
-
-func (l *dupLeg) close() {
-	l.mu.Lock()
-	if !l.done {
-		l.done = true
-		close(l.queue)
-	}
-	l.mu.Unlock()
-	l.shut()
-}
-
-func attachFrame(id dup.Session, lane uint8) []byte {
-	frame, _ := dup.Append(nil, dup.Frame{Kind: dup.KindAttach, Session: id, Lane: lane})
-	return frame
-}
-
-func newDupConn(ctx context.Context, c *Client, primary net.PacketConn) *dupConn {
+func newDupConn(ctx context.Context, c *Client, at int, primary net.PacketConn) *dupConn {
 	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	d := &dupConn{c: c, ctx: ctx, cancel: cancel, in: make(chan inbound, 256), deadlineWake: make(chan struct{})}
+	d := &dupConn{c: c, ctx: ctx, cancel: cancel, in: make(chan inbound, 256), deadlineWake: make(chan struct{}),
+		paths: make([]dupPath, len(c.paths))}
 	_, _ = rand.Read(d.id[:])
-	d.primary = d.packetLeg(primary, dup.LaneAll)
+	d.paths[at].primary = d.packetLeg(primary, dup.LaneAll)
 	d.unbook = c.opts.Book.Add(Group, d.take)
 	return d
 }
@@ -207,8 +123,10 @@ func (d *dupConn) take(p *observe.Period) {
 	p.Dup.FullDatagram += d.fullDatagram
 	p.Dup.FullStream += d.fullStream
 	d.fullDatagram, d.fullStream = 0, 0
-	d.absorb(d.primary)
-	d.absorb(d.voice)
+	for i := range d.paths {
+		d.absorb(d.paths[i].primary)
+		d.absorb(d.paths[i].voice)
+	}
 	p.Dup.StaleDatagram += d.staleDatagram
 	p.Dup.StaleStream += d.staleStream
 	p.Dup.RxDrop += d.rxDrop
@@ -233,39 +151,6 @@ func (d *dupConn) absorb(leg *dupLeg) {
 	d.staleDatagram += s.Stale
 	d.rxDrop += s.RxDrop
 	d.queueMS.Merge(&s.Queue)
-}
-
-// packetLeg starts a carrier on a datagram connection, attached to lane.
-func (d *dupConn) packetLeg(p net.PacketConn, lane uint8) *dupLeg {
-	leg := newLeg(lane, dup.ViaDatagram, func(frame []byte) error {
-		_, err := p.WriteTo(frame, dup.HostAddr())
-		return err
-	}, func() { _ = p.Close() })
-	leg.stats, _ = p.(channelStats)
-	leg.put(attachFrame(d.id, lane))
-	go d.drain(leg)
-	go d.readPacket(leg, p)
-	return leg
-}
-
-// drain sends a carrier's frames in order; a failed send ends the carrier.
-// The stream copy drops a packet's frame that waited longer than
-// datagram.StaleAfter: it would come too late to be of use (v1.05).
-func (d *dupConn) drain(leg *dupLeg) {
-	for f := range leg.queue {
-		if leg.via == dup.ViaStream && !f.keep && time.Since(f.at) > datagram.StaleAfter {
-			d.mu.Lock()
-			d.staleStream++
-			d.mu.Unlock()
-			continue
-		}
-		if err := leg.send(f.b); err != nil {
-			d.legDown(leg, err)
-			break
-		}
-	}
-	for range leg.queue {
-	}
 }
 
 // WriteTo numbers the packet and queues it on the carriers of its lane. It
@@ -304,6 +189,7 @@ func (d *dupConn) write(p []byte, dest M.Socksaddr) (int, error) {
 	}
 	lanes := d.lanes.Load()
 	voiceSized := dup.IsVoiceSized(len(p))
+	active := d.c.Active()
 	d.mu.Lock()
 	d.seq++
 	seq := d.seq
@@ -315,29 +201,41 @@ func (d *dupConn) write(p []byte, dest M.Socksaddr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	d.steer(call, lanes)
-	if !d.send(frame, lanes && call && voiceSized) {
+	d.steer(call, lanes, active)
+	if !d.send(frame, lanes && call && voiceSized, lanes, active) {
 		return 0, errors.New("hikkari dup: no carrier")
 	}
 	return len(p), nil
 }
 
-// send queues frame on its carriers. A call's voice goes by both channels:
-// by the voice datagram carrier (the whole-lane one while it is not up) and by
-// the stream copy. Anything else goes on the whole lane: the datagram carrier,
-// and the stream copy only while it carries the whole lane. Without lanes (a
-// v1.02 relay) the stream copy, when on, carries everything.
-func (d *dupConn) send(frame []byte, voice bool) bool {
+// send queues frame on its carriers. A call's voice goes by every entry and
+// both channels of each: by the voice datagram carrier (the primary one while
+// it is not up) and by the stream copy. Anything else goes on the active
+// entry's whole lane: its datagram carrier, and its stream copy only while
+// that carries the whole lane; without lanes (a v1.02 relay) the stream copy,
+// when on, carries everything. While the active entry has no carrier for it
+// yet (it just became active), a frame goes by any whole-lane carrier left on
+// another entry.
+func (d *dupConn) send(frame []byte, voice, lanes bool, active int) bool {
 	d.mu.Lock()
 	var legs []*dupLeg
-	switch {
-	case voice && d.voice != nil:
-		legs = append(legs, d.voice)
-	case d.primary != nil:
-		legs = append(legs, d.primary)
+	for i := range d.paths {
+		p := &d.paths[i]
+		if i != active && !voice {
+			continue
+		}
+		switch {
+		case voice && p.voice != nil:
+			legs = append(legs, p.voice)
+		case p.primary != nil:
+			legs = append(legs, p.primary)
+		}
+		if p.mirror != nil && (voice || p.mirror.lane == dup.LaneAll || !lanes) {
+			legs = append(legs, p.mirror)
+		}
 	}
-	if d.mirror != nil && (voice || d.mirror.lane == dup.LaneAll || !d.lanes.Load()) {
-		legs = append(legs, d.mirror)
+	if len(legs) == 0 {
+		legs = d.wholeElsewhere(active)
 	}
 	d.mu.Unlock()
 	sent := false
@@ -360,189 +258,20 @@ func (d *dupConn) send(frame []byte, voice bool) bool {
 	return sent
 }
 
-// steer brings the carriers in line with the flow: the stream copy is on for
-// a call or while the datagram channel is down, on the voice lane only while
-// a lanes relay has the datagram channel for the rest; the voice datagram
-// carrier comes up for a call when the relay keeps lanes.
-func (d *dupConn) steer(call, lanes bool) {
-	d.mu.Lock()
-	wantMirror := call || d.primary == nil
-	lane := dup.LaneAll
-	if lanes && d.primary != nil {
-		lane = dup.LaneVoice
-	}
-	var drop *dupLeg
-	openMirror, openVoice := false, false
-	switch {
-	case !wantMirror && d.mirror != nil:
-		drop, d.mirror = d.mirror, nil
-	case wantMirror && d.mirror != nil && d.mirror.lane != lane:
-		if d.mirror.put(attachFrame(d.id, lane)) {
-			d.mirror.lane = lane
+// wholeElsewhere is the first whole-lane carrier on an entry other than
+// active; d.mu is held.
+func (d *dupConn) wholeElsewhere(active int) []*dupLeg {
+	for i := range d.paths {
+		if i == active {
+			continue
 		}
-	case wantMirror && d.mirror == nil && time.Since(d.mirrorErr) >= dupRedial:
-		d.mirrorErr = time.Now() // no second dial while this one runs
-		openMirror = true
-	}
-	if call && lanes && d.voice == nil && !d.voiceOpening && d.c.opts.VoiceDatagram != nil && time.Since(d.voiceErr) >= dupRedial {
-		d.voiceOpening = true
-		openVoice = true
-	}
-	d.mu.Unlock()
-	if drop != nil {
-		drop.close()
-		d.c.opts.Logger.DebugContext(d.ctx, "dup: stream copy off")
-	}
-	if openMirror {
-		go d.openMirror(lane)
-	}
-	if openVoice {
-		go d.openVoice()
-	}
-}
-
-func (d *dupConn) openMirror(lane uint8) {
-	ctx, cancel := context.WithTimeout(d.ctx, d.c.opts.ConnectTimeout)
-	conn, err := d.c.opts.Stream.DialContext(ctx, "tcp", dup.HostAddr())
-	cancel()
-	if err != nil {
-		d.c.opts.Logger.DebugContext(d.ctx, "dup: stream copy failed: ", err)
-		return
-	}
-	leg := newLeg(lane, dup.ViaStream, func(frame []byte) error { return dup.WriteStream(conn, frame) }, func() { _ = conn.Close() })
-	leg.put(attachFrame(d.id, lane))
-	d.mu.Lock()
-	if d.mirror != nil || d.ctx.Err() != nil {
-		d.mu.Unlock()
-		leg.close()
-		return
-	}
-	d.mirror = leg
-	d.mirrorErr = time.Time{}
-	d.mu.Unlock()
-	d.c.opts.Logger.DebugContext(d.ctx, "dup: stream copy on")
-	go d.drain(leg)
-	go d.readStream(leg, conn)
-}
-
-// openVoice brings up the voice datagram carrier. Its failure says nothing of
-// the datagram channel, so it does not mark the channel bad.
-func (d *dupConn) openVoice() {
-	ctx, cancel := context.WithTimeout(d.ctx, d.c.opts.ConnectTimeout)
-	p, err := d.c.opts.VoiceDatagram.ListenPacket(ctx, dup.HostAddr())
-	cancel()
-	d.mu.Lock()
-	d.voiceOpening = false
-	if err != nil {
-		d.voiceErr = time.Now()
-		d.mu.Unlock()
-		d.c.opts.Logger.DebugContext(d.ctx, "dup: voice carrier failed: ", err)
-		return
-	}
-	if d.voice != nil || d.ctx.Err() != nil {
-		d.mu.Unlock()
-		_ = p.Close()
-		return
-	}
-	// The voice connection carries nothing but calls: it must not hold one
-	// back for a long round trip (wire/datagram voiceSender).
-	if v, ok := p.(interface{ CarryVoice() }); ok {
-		v.CarryVoice()
-	}
-	d.voice = d.packetLeg(p, dup.LaneVoice)
-	d.mu.Unlock()
-	d.c.opts.Logger.DebugContext(d.ctx, "dup: voice carrier on")
-}
-
-func (d *dupConn) readStream(leg *dupLeg, conn net.Conn) {
-	b := make([]byte, dup.MaxFrame)
-	for {
-		data, err := dup.ReadStream(conn, b)
-		if err != nil {
-			d.legDown(leg, err)
-			return
-		}
-		d.deliver(data, dup.ViaStream)
-	}
-}
-
-func (d *dupConn) readPacket(leg *dupLeg, p net.PacketConn) {
-	b := make([]byte, 65535)
-	for {
-		n, _, err := p.ReadFrom(b)
-		if err != nil {
-			d.legDown(leg, err)
-			return
-		}
-		d.deliver(b[:n], dup.ViaDatagram)
-	}
-}
-
-// legDown drops a failed carrier. A lost datagram carrier puts the stream copy
-// on the whole lane while a new one is brought back under the same session.
-func (d *dupConn) legDown(leg *dupLeg, err error) {
-	d.mu.Lock()
-	primaryLost, redial := false, false
-	switch leg {
-	case d.primary:
-		d.absorb(leg)
-		d.primary = nil
-		primaryLost = true
-		redial = !d.redialing && d.ctx.Err() == nil
-		d.redialing = d.redialing || redial
-	case d.voice:
-		d.absorb(leg)
-		d.voice = nil
-		d.voiceErr = time.Now()
-	case d.mirror:
-		d.mirror = nil
-		d.mirrorErr = time.Now()
-	default:
-		d.mu.Unlock()
-		return
-	}
-	d.mu.Unlock()
-	leg.close()
-	if d.ctx.Err() != nil {
-		return
-	}
-	if !primaryLost {
-		return
-	}
-	d.c.opts.Logger.DebugContext(d.ctx, "dup: datagram carrier down: ", err)
-	d.steer(true, d.lanes.Load())
-	if redial {
-		go d.redialPrimary()
-	}
-}
-
-func (d *dupConn) redialPrimary() {
-	defer func() { d.mu.Lock(); d.redialing = false; d.mu.Unlock() }()
-	for d.ctx.Err() == nil {
-		if d.c.datagramUp() {
-			var p net.PacketConn
-			err := d.c.tryDatagram(d.ctx, func(ctx context.Context) (err error) {
-				p, err = d.c.opts.Datagram.ListenPacket(ctx, dup.HostAddr())
-				return
-			})
-			if err == nil {
-				d.mu.Lock()
-				if d.ctx.Err() != nil {
-					d.mu.Unlock()
-					_ = p.Close()
-					return
-				}
-				d.primary = d.packetLeg(p, dup.LaneAll)
-				d.mu.Unlock()
-				return
+		for _, leg := range []*dupLeg{d.paths[i].primary, d.paths[i].mirror} {
+			if leg != nil && leg.lane == dup.LaneAll {
+				return []*dupLeg{leg}
 			}
 		}
-		select {
-		case <-d.ctx.Done():
-			return
-		case <-time.After(dupRedial):
-		}
 	}
+	return nil
 }
 
 // deliver hands the first copy of an answer to the application. An attach
@@ -610,11 +339,14 @@ func (d *dupConn) ReadFrom(p []byte) (int, net.Addr, error) {
 func (d *dupConn) Close() error {
 	d.cancel()
 	d.mu.Lock()
-	legs := []*dupLeg{d.primary, d.voice, d.mirror}
-	for _, leg := range legs {
-		d.absorb(leg)
+	var legs []*dupLeg
+	for i := range d.paths {
+		p := &d.paths[i]
+		d.absorb(p.primary)
+		d.absorb(p.voice)
+		legs = append(legs, p.primary, p.voice, p.mirror)
+		p.primary, p.voice, p.mirror = nil, nil, nil
 	}
-	d.primary, d.voice, d.mirror = nil, nil, nil
 	first := !d.closed
 	if first {
 		d.closed = true
@@ -648,123 +380,16 @@ func (d *dupConn) SetReadDeadline(t time.Time) error {
 
 func (d *dupConn) SetWriteDeadline(time.Time) error { return nil }
 
-// MirrorState reports whether the stream copy is on.
+// MirrorState reports whether a stream copy is on.
 func (d *dupConn) MirrorState() Mirror {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.mirror != nil {
-		return MirrorOn
+	for i := range d.paths {
+		if d.paths[i].mirror != nil {
+			return MirrorOn
+		}
 	}
 	return MirrorOff
-}
-
-// detector tells a call from other UDP by the last whole second of packets
-// the application sent.
-type detector struct {
-	second    time.Time // start of the current second
-	packets   int
-	bytes     int
-	small     int // voice-sized packets
-	smallLen  int // their bytes
-	answers   int // packets delivered to the application in this second
-	voiceTill time.Time
-	// The call now, from its first voice-shaped second (v1.04).
-	in                      bool
-	start, last             time.Time // first and last voice-shaped second
-	up, upSmall, upSmallLen int
-	down                    int
-	done                    observe.Calls // calls ended since the book's last take
-}
-
-// ShortCall is the shortest call a person makes: a call detected for less is
-// likely something else (a game, a burst of small packets).
-const ShortCall = 10 * time.Second
-
-// add counts one packet and reports whether the flow is a call now. lanes
-// counts only voice-sized packets (v1.03), otherwise the whole flow must be
-// voice-shaped (v1.02).
-func (t *detector) add(now time.Time, size int, lanes bool) bool {
-	if t.second.IsZero() {
-		t.second = now
-	}
-	if now.Sub(t.second) >= time.Second {
-		t.settle(now)
-		if now.Sub(t.second) < 2*time.Second && t.call(lanes) {
-			t.voiceTill = now.Add(VoiceOff)
-			if !t.in {
-				// The call began with the second that showed it.
-				t.in, t.start = true, t.second
-				t.up, t.upSmall, t.upSmallLen, t.down = t.packets, t.small, t.smallLen, t.answers
-			}
-			t.last = t.second
-		}
-		t.second, t.packets, t.bytes, t.small, t.smallLen, t.answers = now, 0, 0, 0, 0, 0
-	}
-	t.packets++
-	t.bytes += size
-	small := dup.IsVoiceSized(size)
-	if small {
-		t.small++
-		t.smallLen += size
-	}
-	if t.in {
-		t.up++
-		if small {
-			t.upSmall++
-			t.upSmallLen += size
-		}
-	}
-	return now.Before(t.voiceTill)
-}
-
-// answer counts a packet delivered to the application during a call.
-func (t *detector) answer() {
-	t.answers++
-	if t.in {
-		t.down++
-	}
-}
-
-// settle ends the call when it is over by now.
-func (t *detector) settle(now time.Time) {
-	if t.in && !now.Before(t.voiceTill) {
-		t.finish()
-	}
-}
-
-// finish ends the call now, if there is one. A call lasts from its first
-// voice-shaped second to the end of its last one.
-func (t *detector) finish() {
-	if !t.in {
-		return
-	}
-	c := &t.done
-	t.in = false
-	length := t.last.Sub(t.start) + time.Second
-	secs := length.Seconds()
-	c.N++
-	if length < ShortCall {
-		c.Short++
-	}
-	if t.down*3 < t.up {
-		c.OneSided++
-	}
-	c.Seconds.Add(secs)
-	c.PPSUp.Add(float64(t.up) / secs)
-	c.PPSDown.Add(float64(t.down) / secs)
-	if t.upSmall > 0 {
-		c.BytesUp.Add(float64(t.upSmallLen) / float64(t.upSmall))
-	}
-	if t.up > 0 {
-		c.Voice.Add(float64(t.upSmall) * 100 / float64(t.up))
-	}
-}
-
-func (t *detector) call(lanes bool) bool {
-	if lanes {
-		return t.small >= VoiceMinPPS && t.small <= VoiceMaxPPS
-	}
-	return t.packets >= VoiceMinPPS && t.packets <= VoiceMaxPPS && t.bytes <= VoiceMaxBytes*t.packets
 }
 
 func stopTimer(t *time.Timer) {
