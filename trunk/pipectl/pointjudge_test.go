@@ -3,6 +3,7 @@ package pipectl
 import (
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -67,6 +68,9 @@ func TestTheJudgeTakesOffAPointLateAQuarterOfTheTime(t *testing.T) {
 	}
 	if took := at.Sub(start); took > 2*time.Minute {
 		t.Fatalf("riga left after %s", took)
+	}
+	if !strings.Contains(v.Why, "10.0.0.3 195ms = rtt 93ms + late 23/90") || !strings.Contains(v.Why, "10.0.0.1 62ms = rtt 62ms + late 0/90") {
+		t.Fatalf("why %q does not say every point's score", v.Why)
 	}
 }
 

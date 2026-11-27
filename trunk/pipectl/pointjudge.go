@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -296,11 +297,35 @@ func (j *PointJudge) worstOf(now time.Time, path []netip.Addr) (netip.Addr, stri
 		j.worseSince[worst] = now
 		since = now
 	}
-	why := fmt.Sprintf("%s scores %s against %s's %s", worst, worstS.Round(time.Millisecond), best, bestS.Round(time.Millisecond))
+	why := fmt.Sprintf("%s scores %s against %s's %s (%s)", worst, worstS.Round(time.Millisecond), best, bestS.Round(time.Millisecond), j.scores(path))
 	if now.Sub(since) < pointWorseFor {
 		return netip.Addr{}, why + ", not for long enough", false
 	}
 	return worst, why + " for " + now.Sub(since).Round(time.Second).String(), true
+}
+
+// scores says every point's score on path and what it is made of: the
+// median round trip and the share of late seconds, for the line the hub
+// keeps beside each change.
+func (j *PointJudge) scores(path []netip.Addr) string {
+	parts := make([]string, 0, len(path))
+	for _, ip := range path {
+		ss := j.seconds[ip]
+		s, ok := j.score(ip)
+		if !ok || len(ss) == 0 {
+			parts = append(parts, ip.String()+" unjudged")
+			continue
+		}
+		late := 0
+		for _, x := range ss {
+			if x.late {
+				late++
+			}
+		}
+		med := s - pointLateFine*time.Duration(late)/time.Duration(len(ss))
+		parts = append(parts, fmt.Sprintf("%s %s = rtt %s + late %d/%d", ip, s.Round(time.Millisecond), med.Round(time.Millisecond), late, len(ss)))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // change takes left off the path and brings back back: the members move,
