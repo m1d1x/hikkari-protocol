@@ -234,7 +234,7 @@ func goStreamEntry(t *testing.T, ctx context.Context, pool string, n int, port u
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", pool)
 	}
-	e, err := trunk.NewEntry(trunk.Config{}, n, dial, ports, t.Logf)
+	e, err := trunk.NewEntry(trunk.Config{}, n, dial, ports, entryLogf(t))
 	if err != nil {
 		t.Fatal(err)
 	}
