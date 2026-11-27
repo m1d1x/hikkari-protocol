@@ -35,6 +35,14 @@ type Entry struct {
 	Silences int64   `json:"silences"` // times it went silent
 	PingMS   Dist    `json:"ping_ms"`  // round trip of answered pings
 	Now      int64   `json:"now"`      // 1: the active entry at the period's end
+	// v1.08: the datagram probe, how the entry was judged, and why the client
+	// moved to it.
+	DgramPingMS  Dist  `json:"dgram_ping_ms"` // round trip of the datagram probe's answered pings
+	Pings        int64 `json:"pings"`         // pings of both fates that left the in-flight second
+	Late         int64 `json:"late"`          // of them, late
+	ScoreMS      Dist  `json:"score_ms"`      // the entry's score once a second, while it has one
+	MovesQuality int64 `json:"moves_quality"` // times new connections moved to it as the better entry
+	MovesSilence int64 `json:"moves_silence"` // times they moved to it from a silent one
 }
 
 // Merge adds o.
@@ -44,6 +52,12 @@ func (e *Entry) Merge(o *Entry) {
 	e.Silences += o.Silences
 	e.PingMS.Merge(&o.PingMS)
 	e.Now = max(e.Now, o.Now)
+	e.DgramPingMS.Merge(&o.DgramPingMS)
+	e.Pings += o.Pings
+	e.Late += o.Late
+	e.ScoreMS.Merge(&o.ScoreMS)
+	e.MovesQuality += o.MovesQuality
+	e.MovesSilence += o.MovesSilence
 }
 
 // Ends counts ends by reason (EndEOF and the rest).
