@@ -44,7 +44,7 @@ pub const P_OBSERVED: u8 = 0x88; // a report of a tester's stream or flow: see p
 pub const P_STATS: u8 = 0x89; // see put_stats
 pub const P_CLIENTS: u8 = 0x87; // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (NONE_MS: none)
 pub const P_RECEIVERS: u8 = 0x8a; // active u8, n u8 + n × (rx u8, ip [4], k u8 + k × (wire u8, members u8, up u8, proof_ago_ms u32)): see put_receivers
-pub const P_POINTS: u8 = 0x8b; // n u8 + n × (ip [4], members u8, up u8, proof_ago_ms u32): see put_points
+pub const P_POINTS: u8 = 0x8b; // n u8 + n × (ip [4], members u8, up u8, proof_ago_ms u32, rtt_ms u32): see put_points
 
 /// The bare UDP wire (trunk/udpwire): the brain's sockets, sealed frames.
 pub const FORM_UDP: u8 = 1;
@@ -508,18 +508,25 @@ pub fn put_receivers(out: &mut [u8], active: u8, rs: &[ReceiverTick]) -> usize {
 
 /// A border point in a tick (P_POINTS): every member of the current
 /// session's wires and pools at that point (member i at point i mod n),
-/// how many are up, and how long ago one of them last proved its round
-/// trip (NONE_MS: none ever did). A point whose members are all down is
-/// one the entry cannot reach the core through: dead, frozen, or cut.
+/// how many are up, how long ago one of them last proved its round
+/// trip (NONE_MS: none ever did), and the median smoothed round trip of
+/// those up (NONE_MS: none up has one), the path entry → point → core the
+/// brain judges the point by (spec/trunk.md, "Border points"). A point whose
+/// members are all down is one the entry cannot reach the core through:
+/// dead, frozen, or cut.
 #[derive(Clone, Copy)]
 pub struct PointTick {
     pub ip: std::net::Ipv4Addr,
     pub members: u8,
     pub up: u8,
     pub proof_ago_ms: u32,
+    pub rtt_ms: u32,
 }
 
-/// P_POINTS: each border point in order. out must hold 2 + 10 × points.
+/// The bytes of one border point in P_POINTS.
+pub const POINT_TICK_LEN: usize = 14;
+
+/// P_POINTS: each border point in order. out must hold 2 + 14 × points.
 pub fn put_points(out: &mut [u8], ps: &[PointTick]) -> usize {
     out[0] = P_POINTS;
     out[1] = ps.len() as u8;
@@ -529,7 +536,8 @@ pub fn put_points(out: &mut [u8], ps: &[PointTick]) -> usize {
         out[at + 4] = p.members;
         out[at + 5] = p.up;
         out[at + 6..at + 10].copy_from_slice(&p.proof_ago_ms.to_le_bytes());
-        at += 10;
+        out[at + 10..at + 14].copy_from_slice(&p.rtt_ms.to_le_bytes());
+        at += POINT_TICK_LEN;
     }
     at
 }
@@ -577,14 +585,15 @@ mod tests {
     const NAMED_POINTS_GOLDEN: &str = "15020a0000010e70312e6578616d706c652e636f6d0a00000200";
     const RECEIVERS_GOLDEN: &str = "8a0001010a0000020203060578000000000808ffffffff";
     /// trunk/pipectl msg_test.go TestPointTicksGolden: 10.0.0.1 with 6
-    /// members, 3 up, proof 100 ms ago; 10.0.0.2 with 6, none up, none ever.
-    const POINT_TICKS_GOLDEN: &str = "8b020a0000010603640000000a0000020600ffffffff";
+    /// members, 3 up, proof 100 ms ago, round trip 62 ms; 10.0.0.2 with 6,
+    /// none up, none ever, no round trip.
+    const POINT_TICKS_GOLDEN: &str = "8b020a0000010603640000003e0000000a0000020600ffffffffffffffff";
 
     #[test]
     fn puts_the_points_the_brain_reads() {
         let ps = [
-            PointTick { ip: "10.0.0.1".parse().unwrap(), members: 6, up: 3, proof_ago_ms: 100 },
-            PointTick { ip: "10.0.0.2".parse().unwrap(), members: 6, up: 0, proof_ago_ms: NONE_MS },
+            PointTick { ip: "10.0.0.1".parse().unwrap(), members: 6, up: 3, proof_ago_ms: 100, rtt_ms: 62 },
+            PointTick { ip: "10.0.0.2".parse().unwrap(), members: 6, up: 0, proof_ago_ms: NONE_MS, rtt_ms: NONE_MS },
         ];
         let mut out = [0u8; 32];
         let n = put_points(&mut out, &ps);

@@ -11,9 +11,11 @@ package pipectl
 // members; the pipe dials the pools and the QUIC wires itself.
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"slices"
+	"time"
 )
 
 // SetPoints gives the active receiver's border points, its own address
@@ -30,13 +32,29 @@ func (p *Pipe) SetPoints(ips []netip.Addr) error {
 	return p.SetBorderPoints(points)
 }
 
-// SetBorderPoints configures the addresses and TLS names in the same message.
+// SetBorderPoints gives the points the hub offers, their addresses and TLS
+// names in the same message. The pipe carries on those the point judge
+// keeps on the path (RunPoints): all of them until it judged otherwise.
 func (p *Pipe) SetBorderPoints(points []BorderPoint) error {
-	b, ips, err := putBorderPoints(points)
+	p.mu.Lock()
+	p.offered = slices.Clone(points)
+	p.mu.Unlock()
+	return p.givePath()
+}
+
+// givePath gives the pipe the offered points the judge keeps on the path.
+func (p *Pipe) givePath() error {
+	p.mu.Lock()
+	path := p.offered
+	if p.pointJudge != nil {
+		keep := p.pointJudge.Path(offeredIPs(p.offered))
+		path = slices.DeleteFunc(slices.Clone(p.offered), func(bp BorderPoint) bool { return !slices.Contains(keep, bp.IP) })
+	}
+	b, ips, err := putBorderPoints(path)
 	if err != nil {
+		p.mu.Unlock()
 		return err
 	}
-	p.mu.Lock()
 	if err := p.send(b); err != nil {
 		p.mu.Unlock()
 		return err
@@ -58,6 +76,81 @@ func (p *Pipe) SetBorderPoints(points []BorderPoint) error {
 		}
 	}
 	return nil
+}
+
+func offeredIPs(points []BorderPoint) []netip.Addr {
+	ips := make([]netip.Addr, len(points))
+	for i, bp := range points {
+		ips[i] = bp.IP
+	}
+	return ips
+}
+
+// PointChange is a change of the path the point judge made: the points on
+// it now, the point that left or came back, why, and what the pipe said.
+type PointChange struct {
+	Path       []netip.Addr
+	Left, Back []netip.Addr
+	Why        string
+	Err        error
+}
+
+// RunPoints judges the offered border points once a second until ctx ends,
+// by the pipe's point ticks aged to now, and gives the pipe the points the
+// judge keeps on the path (pointjudge.go); onChange hears every change.
+// Without RunPoints the pipe carries on every point offered.
+func (p *Pipe) RunPoints(ctx context.Context, onChange func(PointChange)) {
+	j := &PointJudge{}
+	p.mu.Lock()
+	p.pointJudge = j
+	p.mu.Unlock()
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.done:
+			return
+		case <-t.C:
+		}
+		ticks, at := p.Points()
+		now := time.Now()
+		p.mu.Lock()
+		offered := offeredIPs(p.offered)
+		resumed := p.resumed
+		p.mu.Unlock()
+		if at.IsZero() || now.Sub(at) > staleWord {
+			continue
+		}
+		paused := time.Duration(-1)
+		if !resumed.IsZero() {
+			paused = time.Since(resumed)
+		}
+		p.mu.Lock()
+		v := j.Step(now, offered, agedPoints(ticks, now.Sub(at)), paused)
+		p.mu.Unlock()
+		if !v.Change {
+			continue
+		}
+		err := p.givePath()
+		if onChange != nil {
+			onChange(PointChange{Path: v.Path, Left: v.Left, Back: v.Back, Why: v.Why, Err: err})
+		}
+	}
+}
+
+// agedPoints is ticks with their proofs older by d: what the pipe said d
+// ago.
+func agedPoints(ticks []PointTick, d time.Duration) []PointTick {
+	out := make([]PointTick, len(ticks))
+	for i, t := range ticks {
+		if t.ProofAgo >= 0 {
+			t.ProofAgo += d
+		}
+		out[i] = t
+	}
+	return out
 }
 
 // pointAddrLocked is where member i of a wire to exit goes: its border

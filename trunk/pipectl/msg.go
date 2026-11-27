@@ -82,7 +82,7 @@ const (
 	pStats     = 0x89 // see parseStats
 	pObserved  = 0x88 // a report of a tester's stream or flow: see parseObserved
 	pClients   = 0x87 // conns u32, closed u32, sending u32, segs u64, retrans u64, rtt_p50_us u32, rtt_p90_us u32 (noneMS: none)
-	pPoints    = 0x8b // n u8 + n × (ip [4], members u8, up u8, proof_ago_ms u32): see parsePoints
+	pPoints    = 0x8b // n u8 + n × (ip [4], members u8, up u8, proof_ago_ms u32, rtt_ms u32): see parsePoints
 	pReceivers = 0x8a // active u8, n u8 + n × (rx u8, ip [4], k u8 + k × (wire u8, members u8, up u8, proof_ago_ms u32)): see parseReceivers
 )
 
@@ -566,23 +566,32 @@ func parseReceivers(m []byte) (Receivers, error) {
 // PointTick is the pipe's word on one border point after each tick
 // (rust/pipe/src/pipe/points.rs point_ticks): every member of the current
 // session's wires and pools at that point (member i at point i mod n), how
-// many are up, and how long ago one of them last proved its round trip or
-// joined (negative: none ever did). No member up is a point the entry
+// many are up, how long ago one of them last proved its round trip or
+// joined (negative: none ever did), and the median smoothed round trip of
+// those up (negative: none has one), the path entry → point → core the
+// point judge reads (pointjudge.go). No member up is a point the entry
 // cannot reach the core through: dead, frozen or cut.
 type PointTick struct {
 	IP          netip.Addr
 	Members, Up int
 	ProofAgo    time.Duration
+	RTT         time.Duration
 }
 
+// pointTickLen is the bytes of one point in P_POINTS.
+const pointTickLen = 14
+
 func parsePoints(m []byte) ([]PointTick, error) {
-	if len(m) < 2 || len(m) != 2+10*int(m[1]) {
+	if len(m) < 2 || len(m) != 2+pointTickLen*int(m[1]) {
 		return nil, errTorn
 	}
 	out := make([]PointTick, 0, m[1])
-	for at := 2; at < len(m); at += 10 {
+	for at := 2; at < len(m); at += pointTickLen {
 		b := m[at:]
-		out = append(out, PointTick{IP: netip.AddrFrom4([4]byte(b[:4])), Members: int(b[4]), Up: int(b[5]), ProofAgo: ms(binary.LittleEndian.Uint32(b[6:]))})
+		out = append(out, PointTick{
+			IP: netip.AddrFrom4([4]byte(b[:4])), Members: int(b[4]), Up: int(b[5]),
+			ProofAgo: ms(binary.LittleEndian.Uint32(b[6:])), RTT: ms(binary.LittleEndian.Uint32(b[10:])),
+		})
 	}
 	return out, nil
 }

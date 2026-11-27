@@ -185,13 +185,13 @@ func TestStatsGolden(t *testing.T) {
 // TestPointTicksGolden: the brain reads the border points in the bytes of
 // rust/pipe/src/ctl.rs puts_the_points_the_brain_reads.
 func TestPointTicksGolden(t *testing.T) {
-	m, _ := hex.DecodeString("8b020a0000010603640000000a0000020600ffffffff")
+	m, _ := hex.DecodeString("8b020a0000010603640000003e0000000a0000020600ffffffffffffffff")
 	ps, err := parsePoints(m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []PointTick{{IP: netip.MustParseAddr("10.0.0.1"), Members: 6, Up: 3, ProofAgo: 100 * time.Millisecond},
-		{IP: netip.MustParseAddr("10.0.0.2"), Members: 6, Up: 0, ProofAgo: -1}}
+	want := []PointTick{{IP: netip.MustParseAddr("10.0.0.1"), Members: 6, Up: 3, ProofAgo: 100 * time.Millisecond, RTT: 62 * time.Millisecond},
+		{IP: netip.MustParseAddr("10.0.0.2"), Members: 6, Up: 0, ProofAgo: -1, RTT: -1}}
 	if !reflect.DeepEqual(ps, want) {
 		t.Fatalf("points %+v, want %+v", ps, want)
 	}
