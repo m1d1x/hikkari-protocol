@@ -31,6 +31,15 @@ pub(super) fn point(points: &[BorderPoint], i: usize) -> Option<Ipv4Addr> {
     endpoint(points, i).map(|p| p.ip)
 }
 
+/// The median of xs (the upper one of an even count), None when empty.
+fn median(xs: &mut [u64]) -> Option<u64> {
+    if xs.is_empty() {
+        return None;
+    }
+    xs.sort_unstable();
+    Some(xs[xs.len() / 2])
+}
+
 /// The wire's address at point p, on the wire's port.
 pub(super) fn at(exit: SocketAddrV4, p: Option<Ipv4Addr>) -> SocketAddrV4 {
     p.map_or(exit, |ip| SocketAddrV4::new(ip, exit.port()))
@@ -66,27 +75,35 @@ impl Pipe {
 
     /// The border points for the brain's tick (P_POINTS): per point, the
     /// members of the current session's wires and pools there (member i at
-    /// point i mod n), how many are up and the latest round trip one of
-    /// them proved (a member's join counts: the exit answered its hello). Members count up to 255 a point.
+    /// point i mod n), how many are up, the latest round trip one of them
+    /// proved (a member's join counts: the exit answered its hello), and the
+    /// median smoothed round trip of those up that measured one: the path
+    /// entry → point → core the brain judges the point by (pipectl
+    /// pointjudge.go). Members count up to 255 a point. Once a second, a
+    /// handful of points of a few dozen members: off the packets' path.
     pub(super) fn point_ticks(&self, now: u64) -> Vec<crate::ctl::PointTick> {
         let n = self.points.len();
         let (mut members, mut up, mut proof) = (vec![0u32; n], vec![0u32; n], vec![0u64; n]);
-        let mut add = |i: usize, is_up: bool, progress: u64| {
+        let mut rtts: Vec<Vec<u64>> = vec![Vec::new(); n];
+        let mut add = |i: usize, h: &hikkari_trunk::health::Health| {
             let k = i % n;
             members[k] += 1;
-            if is_up {
+            if h.up {
                 up[k] += 1;
+                if h.srtt > 0 {
+                    rtts[k].push(h.srtt);
+                }
             }
-            proof[k] = proof[k].max(progress);
+            proof[k] = proof[k].max(h.progress);
         };
         for w in self.wires.iter().filter(|w| w.sess == self.cur) {
             for (i, m) in w.members.iter().enumerate() {
-                add(i, m.h.up, m.h.progress);
+                add(i, &m.h);
             }
         }
         for w in self.swires.iter().filter(|w| w.sess == self.cur) {
             for (i, l) in w.links.iter().enumerate() {
-                add(i, l.h.up, l.h.progress);
+                add(i, &l.h);
             }
         }
         (0..n)
@@ -95,6 +112,7 @@ impl Pipe {
                 members: members[k].min(255) as u8,
                 up: up[k].min(255) as u8,
                 proof_ago_ms: if proof[k] == 0 { crate::ctl::NONE_MS } else { super::ms(now.saturating_sub(proof[k])) },
+                rtt_ms: median(&mut rtts[k]).map_or(crate::ctl::NONE_MS, super::ms),
             })
             .collect()
     }
@@ -195,5 +213,12 @@ mod tests {
         let to: Vec<SocketAddrV4> = (0..4).map(|i| at(exit, point(&ps, i))).collect();
         assert_eq!(to, ["10.0.0.1:20461", "10.0.0.2:20461", "10.0.0.1:20461", "10.0.0.2:20461"].map(|a| a.parse().unwrap()));
         assert_eq!(at(exit, point(&[], 3)), exit);
+    }
+
+    #[test]
+    fn a_points_round_trip_is_the_median_of_its_members() {
+        assert_eq!(median(&mut []), None);
+        assert_eq!(median(&mut [90, 60, 62]), Some(62));
+        assert_eq!(median(&mut [60, 62, 90, 400]), Some(90));
     }
 }

@@ -181,7 +181,7 @@ connection), so nothing changes on the exit. A point that freezes or dies takes 
 as above; the others carry the session and every stream and flow on it, and a member down dials its own point again, as any
 member does. A datagram's copies ("Datagrams") go to members at points it did not reach yet first, over every wire it goes
 on, then to the others: a point that freezes holds one copy of it at most while another point is up, so a call with two
-copies is not heard to pause. Nothing moves: there is no point to choose and no threshold. A Chromium member's TLS and QUIC are the core's
+copies is not heard to pause. Which of the points the members go to is the brain's ("Border points by quality" below): the pipe spreads them over the points it is given. A Chromium member's TLS and QUIC are the core's
   (its certificate): the entry's socket goes to the point, and the engine uses that point's TLS name
   for SNI, certificate verification and the proxy origin. An unnamed point uses the core's name.
   TCP CONNECT and CONNECT-UDP still target the trunk, with the same trunk credentials.
@@ -201,6 +201,24 @@ whose point changed: each is closed (what it carried goes again on the others) a
   from addresses that are not points (the hub's direct checks); from a point it may accept its own name during
   the transition. For H3 the exit wire's local message carries the original name,
   the transition flag and each point's address, name and certificate paths.
+
+## Border points by quality
+
+The hub offers the points; the brain keeps on the path, the points it gives the pipe, every one but a point clearly worse than
+the best (trunk/pipectl pointjudge.go; hikkari-client plans/2026-11-28-border-points-by-quality.md). After each tick the pipe
+says per point on the path its members, those up, how long ago one of them last proved a round trip, and the median smoothed
+round trip of those up: the path entry → point → core (local message 0x8b, 14 bytes a point: IPv4, members u8, up u8,
+proof_ago_ms u32, rtt_ms u32, `0xffffffff` for none). Once a second the brain counts a second of each point on the path, late
+when no member is up or the latest proof is older than 300 ms, over a window of 120 s. A point's score is the window's median
+round trip plus 400 ms times its share of late seconds, as a client scores its entries (spec/v1.md, v1.08): the quality of the
+whole window, not its worst moment. A point leaves the path when every point on it has 60 s counted, it scores worse than the
+best by 20 ms or a fifth of the best score, whichever is more, for 30 s on end, and at least two points stay: of two points
+none leaves, so a datagram's copies keep two points. After any change the path holds for 60 s and no second counts for the
+first 20 s, while the members that moved dial their new points. A point out comes back to be judged after 10 min, doubled each
+time it leaves again within an hour of coming back, up to 60 min; every point out comes back at once when fewer than two
+points on the path are alive (a member up, or a proof within 1.5 s). A pause of the entry's own counts nothing. Leaving or
+coming back is points given anew, as above: only the members whose point changed move, what they carried goes again on the
+others, and no stream or flow ends.
 
 ## Datagrams
 

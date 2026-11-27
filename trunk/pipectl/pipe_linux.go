@@ -115,7 +115,11 @@ type Pipe struct {
 	// came (pPoints, after each tick while points are given).
 	pointTicks   []PointTick
 	pointTicksAt time.Time
-	activeIP     netip.Addr
+	// offered is the points the hub offers (SetBorderPoints); the pipe
+	// carries on those pointJudge keeps on the path, all without it.
+	offered    []BorderPoint
+	pointJudge *PointJudge
+	activeIP   netip.Addr
 	// points is the active receiver's border points (points_linux.go):
 	// member i of a bare UDP wire dials points[i mod n].
 	points []netip.Addr
