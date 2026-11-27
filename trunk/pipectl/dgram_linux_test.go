@@ -133,11 +133,31 @@ func newGoEntry(t *testing.T, idle time.Duration) *trunk.Entry {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	e, err := trunk.NewEntry(trunk.Config{FlowIdle: idle}, 1, pool, ports, t.Logf)
+	e, err := trunk.NewEntry(trunk.Config{FlowIdle: idle}, 1, pool, ports, entryLogf(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return e
+}
+
+// entryLogf is t.Logf for a Go entry's goroutines, which outlive the test
+// by a moment after its context ends: a line after the test's cleanup is
+// dropped, never written to a finished test (a data race under -race).
+func entryLogf(t *testing.T) func(string, ...any) {
+	var mu sync.Mutex
+	done := false
+	t.Cleanup(func() {
+		mu.Lock()
+		done = true
+		mu.Unlock()
+	})
+	return func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !done {
+			t.Logf(format, args...)
+		}
+	}
 }
 
 // serveGoPort is trunkentry's udpPort: a flow per client address, opened on

@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -34,7 +35,21 @@ type entryForward struct {
 	tcp, udp string
 	cut      atomic.Bool
 	conns    atomic.Int64 // TCP connections forwarded
+	// slow holds back a share of what goes through, as aezamsk1 did on
+	// 26.11: nothing lost, now and then a packet or a TCP read late.
+	slow atomic.Bool
 }
+
+// slowShare and slowBy are how much of a slow entry's traffic is late and
+// by how much: 3% by 150-550 ms.
+const slowShare = 0.03
+
+func slowBy() time.Duration {
+	return 150*time.Millisecond + time.Duration(rand.Int64N(int64(400*time.Millisecond)))
+}
+
+// lateNow reports whether this packet or read of a slow entry comes late.
+func (e *entryForward) lateNow() bool { return e.slow.Load() && rand.Float64() < slowShare }
 
 func newEntryForward(t *testing.T, ctx context.Context, listen, tcpTo, udpTo string) *entryForward {
 	e := &entryForward{}
@@ -81,6 +96,9 @@ func (e *entryForward) pump(dst, src net.Conn) {
 		for e.cut.Load() {
 			time.Sleep(2 * time.Millisecond)
 		}
+		if e.lateNow() {
+			time.Sleep(slowBy())
+		}
 		if n > 0 {
 			if _, werr := dst.Write(b[:n]); werr != nil {
 				return
@@ -124,13 +142,23 @@ func (e *entryForward) forwardUDP(ctx context.Context, pc *net.UDPConn, to strin
 					if err != nil {
 						return
 					}
-					if !e.cut.Load() {
+					switch {
+					case e.cut.Load():
+					case e.lateNow():
+						late := append([]byte(nil), rb[:k]...)
+						time.AfterFunc(slowBy(), func() { _, _ = pc.WriteToUDP(late, from) })
+					default:
 						_, _ = pc.WriteToUDP(rb[:k], from)
 					}
 				}
 			}(up, from)
 		}
 		mu.Unlock()
+		if e.lateNow() {
+			late := append([]byte(nil), b[:n]...)
+			time.AfterFunc(slowBy(), func() { _, _ = up.Write(late) })
+			continue
+		}
 		_, _ = up.Write(b[:n])
 	}
 }
@@ -426,11 +454,11 @@ func runEntryCut(t *testing.T, ctx context.Context, s *entriesStand, cut func(on
 
 	time.Sleep(time.Until(cutAt.Add(cutFor)))
 	cut(false)
-	// Entry 0 answers again when its TCP retransmits, which backs off over
-	// a long silence: seconds after the entry came back, not at once.
-	back, ok := waitActive(s.client, 0, 20*time.Second)
-	if !ok {
-		t.Fatalf("entry 0 not active %v after it came back", back)
+	// Entry 0 answering again is no reason to go back (v1.08): new
+	// connections stay on entry 1 until entry 0 is the better path.
+	stayed, ok := waitActive(s.client, 0, 5*time.Second)
+	if ok {
+		t.Fatalf("the client went back to entry 0 %v after it answered, with entry 1 as good", stayed)
 	}
 
 	select {
@@ -440,8 +468,8 @@ func runEntryCut(t *testing.T, ctx context.Context, s *entriesStand, cut func(on
 	}
 	call := <-callDone
 	sources, _ := s.udpEcho.seen()
-	t.Logf("switch to entry 1 %v after the cut; new TCP echoed in %v; back on entry 0 %v after it answered",
-		switched.Round(time.Millisecond), newTook.Round(time.Millisecond), back.Round(time.Millisecond))
+	t.Logf("switch to entry 1 %v after the cut; new TCP echoed in %v; still on entry 1 after entry 0 answered",
+		switched.Round(time.Millisecond), newTook.Round(time.Millisecond))
 	t.Logf("call: %d/%d echoed, %d duplicates, longest pause %v; stream: %d MiB back at the cut, %d of %d bytes, first bad %d, longest wait %v",
 		call.got, callPackets(cutFor), call.dups, call.worst.Round(time.Millisecond), atCut>>20, streamGot.Load(), int64(size), streamBad.Load(),
 		time.Duration(streamStall.Load()).Round(time.Millisecond))
@@ -468,7 +496,8 @@ func runEntryCut(t *testing.T, ctx context.Context, s *entriesStand, cut func(on
 	e0, e1 := p.Entries["0"], p.Entries["1"]
 	t.Logf("period: entry 0 silences %d, silent %.1f s, active %.1f s; entry 1 active %.1f s, ping p50 %.1f ms",
 		e0.Silences, e0.SilentS, e0.ActiveS, e1.ActiveS, e1.PingMS.Quantile(0.5))
-	if e0.Silences != 1 || e0.SilentS < cutFor.Seconds()-3 || e1.ActiveS < cutFor.Seconds()-3 || e0.Now != 1 {
+	if e0.Silences != 1 || e0.SilentS < cutFor.Seconds()-3 || e1.ActiveS < cutFor.Seconds()-3 || e1.Now != 1 ||
+		e1.MovesSilence != 1 || e0.MovesQuality+e1.MovesQuality != 0 {
 		t.Errorf("period: entry 0 %+v, entry 1 %+v", *e0, *e1)
 	}
 }
