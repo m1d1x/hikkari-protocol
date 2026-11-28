@@ -40,7 +40,7 @@ func runPoints(j *PointJudge, start time.Time, d time.Duration, offered []netip.
 			}
 			ticks = append(ticks, t)
 		}
-		if v := j.Step(now, offered, ticks, -1); v.Change {
+		if v := j.Step(now, offered, ticks, 0, -1); v.Change {
 			return v, now
 		}
 	}
@@ -151,7 +151,7 @@ func TestTheJudgeHoldsThroughTheEntrysOwnPause(t *testing.T) {
 	offered := []netip.Addr{unl1, hkfi1, riga}
 	for s := 0; s < 600; s++ {
 		ticks := []PointTick{{IP: unl1, Up: 0, ProofAgo: time.Second}, {IP: hkfi1, Up: 0, ProofAgo: time.Second}, {IP: riga, Up: 0, ProofAgo: time.Second}}
-		if v := j.Step(now.Add(time.Duration(s)*time.Second), offered, ticks, 100*time.Millisecond); v.Change {
+		if v := j.Step(now.Add(time.Duration(s)*time.Second), offered, ticks, 0, 100*time.Millisecond); v.Change {
 			t.Fatalf("moved in a pause: %+v", v)
 		}
 	}
@@ -172,11 +172,62 @@ func TestAPointNoLongerOfferedIsForgotten(t *testing.T) {
 		riga:  {rtt: 93 * time.Millisecond, late: 4},
 	}
 	_, left := runPoints(&j, start, 5*time.Minute, offered, shapes)
-	j.Step(left.Add(time.Second), []netip.Addr{unl1, hkfi1}, nil, -1)
+	j.Step(left.Add(time.Second), []netip.Addr{unl1, hkfi1}, nil, 0, -1)
 	if _, ok := j.out[riga]; ok {
 		t.Fatal("a point no longer offered is still out")
 	}
 	if got := j.Path(offered); !slices.Equal(got, offered) {
 		t.Fatalf("offered again, path %v", got)
+	}
+}
+
+// TestTheWordsAgeMakesNoSecondLate: three alike points whose proofs the
+// pipe says at 80 ms, read by the judge up to 990 ms after the pipe said
+// them (two timers a second apart, drifting): no second is late and no
+// point leaves in an hour. Aged, every proof past 220 ms of age would be
+// late and the point leaving the phase's pick.
+func TestTheWordsAgeMakesNoSecondLate(t *testing.T) {
+	var j PointJudge
+	start := time.Unix(1_800_000_000, 0)
+	offered := []netip.Addr{unl1, hkfi1, riga}
+	for s := 0; s < 3600; s++ {
+		ticks := []PointTick{
+			{IP: unl1, Members: 14, Up: 14, ProofAgo: 80 * time.Millisecond, RTT: 55 * time.Millisecond},
+			{IP: hkfi1, Members: 13, Up: 13, ProofAgo: 80 * time.Millisecond, RTT: 70 * time.Millisecond},
+			{IP: riga, Members: 11, Up: 11, ProofAgo: 80 * time.Millisecond, RTT: 72 * time.Millisecond},
+		}
+		age := time.Duration(s*37%1000) * time.Millisecond
+		if v := j.Step(start.Add(time.Duration(s)*time.Second), offered, ticks, age, -1); v.Change {
+			t.Fatalf("a point moved at %d s: %+v", s, v)
+		}
+	}
+	for ip, ss := range j.seconds {
+		for _, x := range ss {
+			if x.late {
+				t.Fatalf("%s: a late second from the word's age alone", ip)
+			}
+		}
+	}
+}
+
+// TestADeadPointIsReadByItsAgedProof: with a point out, another's proof
+// said at 1 s and read 600 ms later is dead past DeadAfter: the point out
+// comes back.
+func TestADeadPointIsReadByItsAgedProof(t *testing.T) {
+	var j PointJudge
+	start := time.Unix(1_800_000_000, 0)
+	offered := []netip.Addr{unl1, hkfi1, riga}
+	shapes := map[netip.Addr]pointShape{
+		unl1:  {rtt: 62 * time.Millisecond},
+		hkfi1: {rtt: 63 * time.Millisecond},
+		riga:  {rtt: 93 * time.Millisecond, late: 4},
+	}
+	_, left := runPoints(&j, start, 5*time.Minute, offered, shapes)
+	ticks := []PointTick{{IP: unl1, Members: 14, Up: 14, ProofAgo: 50 * time.Millisecond}, {IP: hkfi1, Members: 13, Up: 0, ProofAgo: time.Second}}
+	if v := j.Step(left.Add(time.Second), offered, ticks, 0, -1); v.Change {
+		t.Fatalf("a point 1 s unheard is not dead yet: %+v", v)
+	}
+	if v := j.Step(left.Add(2*time.Second), offered, ticks, 600*time.Millisecond, -1); !slices.Equal(v.Back, []netip.Addr{riga}) {
+		t.Fatalf("verdict %+v, want riga back", v)
 	}
 }
