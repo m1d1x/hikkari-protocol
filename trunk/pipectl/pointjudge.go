@@ -124,10 +124,16 @@ func (j *PointJudge) Path(offered []netip.Addr) []netip.Addr {
 	return path
 }
 
-// Step judges the pipe's latest point ticks (the points on the path, their
-// proofs aged to now) at now. offered is the hub's points; paused is how
-// long ago the pipe or the brain came back from a pause (negative: none).
-func (j *PointJudge) Step(now time.Time, offered []netip.Addr, ticks []PointTick, paused time.Duration) PointVerdict {
+// Step judges the pipe's latest point ticks (the points on the path, as
+// the pipe said them age ago) at now. A second is late by the proof the
+// pipe measured at its tick, not aged: the word's own age (up to the
+// second between the pipe's tick and the judge's) would eat LatePoint and
+// make lateness the phase of two timers (27.11 night, aezamsk1: unl1 late
+// 2 of 80 seconds, then 16 of 79, with every minute's proof under 120 ms).
+// A point's death (DeadAfter) reads the proof aged by age. offered is the
+// hub's points; paused is how long ago the pipe or the brain came back from
+// a pause (negative: none).
+func (j *PointJudge) Step(now time.Time, offered []netip.Addr, ticks []PointTick, age, paused time.Duration) PointVerdict {
 	j.init()
 	j.forgetUnoffered(offered)
 	path := j.Path(offered)
@@ -136,7 +142,7 @@ func (j *PointJudge) Step(now time.Time, offered []netip.Addr, ticks []PointTick
 		v.Why = "a pause of the entry's own: every proof is old"
 		return v
 	}
-	if back := j.backForLife(path, ticks); len(back) > 0 {
+	if back := j.backForLife(path, ticks, age); len(back) > 0 {
 		return j.change(now, offered, nil, back, fmt.Sprintf("fewer than %d points alive", pointPathMin))
 	}
 	if back := j.backFromHold(now); len(back) > 0 {
@@ -177,14 +183,14 @@ func (j *PointJudge) forgetUnoffered(offered []netip.Addr) {
 
 // backForLife is every point out when fewer than pointPathMin points on the
 // path are alive: a point is alive while a member is up or one proved a
-// round trip within DeadAfter.
-func (j *PointJudge) backForLife(path []netip.Addr, ticks []PointTick) []netip.Addr {
+// round trip within DeadAfter, its proof aged by the word's age.
+func (j *PointJudge) backForLife(path []netip.Addr, ticks []PointTick, age time.Duration) []netip.Addr {
 	if len(j.out) == 0 {
 		return nil
 	}
 	alive := 0
 	for _, ip := range path {
-		if t, ok := tickOf(ticks, ip); !ok || t.Up > 0 || t.ProofAgo >= 0 && t.ProofAgo < DeadAfter {
+		if t, ok := tickOf(ticks, ip); !ok || t.Up > 0 || t.ProofAgo >= 0 && t.ProofAgo+age < DeadAfter {
 			alive++
 		}
 	}

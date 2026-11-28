@@ -96,7 +96,7 @@ type PointChange struct {
 }
 
 // RunPoints judges the offered border points once a second until ctx ends,
-// by the pipe's point ticks aged to now, and gives the pipe the points the
+// by the pipe's point ticks and their age, and gives the pipe the points the
 // judge keeps on the path (pointjudge.go); onChange hears every change.
 // Without RunPoints the pipe carries on every point offered.
 func (p *Pipe) RunPoints(ctx context.Context, onChange func(PointChange)) {
@@ -128,7 +128,7 @@ func (p *Pipe) RunPoints(ctx context.Context, onChange func(PointChange)) {
 			paused = time.Since(resumed)
 		}
 		p.mu.Lock()
-		v := j.Step(now, offered, agedPoints(ticks, now.Sub(at)), paused)
+		v := j.Step(now, offered, ticks, now.Sub(at), paused)
 		p.mu.Unlock()
 		if !v.Change {
 			continue
@@ -138,19 +138,6 @@ func (p *Pipe) RunPoints(ctx context.Context, onChange func(PointChange)) {
 			onChange(PointChange{Path: v.Path, Left: v.Left, Back: v.Back, Why: v.Why, Err: err})
 		}
 	}
-}
-
-// agedPoints is ticks with their proofs older by d: what the pipe said d
-// ago.
-func agedPoints(ticks []PointTick, d time.Duration) []PointTick {
-	out := make([]PointTick, len(ticks))
-	for i, t := range ticks {
-		if t.ProofAgo >= 0 {
-			t.ProofAgo += d
-		}
-		out[i] = t
-	}
-	return out
 }
 
 // pointAddrLocked is where member i of a wire to exit goes: its border
